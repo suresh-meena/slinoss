@@ -1,1 +1,1 @@
-"""SLinOSS reference operators and kernels."""
+"""SLinOSS reference operators, layers, and kernels."""

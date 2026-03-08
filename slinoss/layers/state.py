@@ -1,0 +1,91 @@
+"""Named state objects for SLinOSS streaming and backend interaction."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import torch
+
+
+def _maybe_detach(x: torch.Tensor | None) -> torch.Tensor | None:
+    return None if x is None else x.detach()
+
+
+def _maybe_to(
+    x: torch.Tensor | None,
+    *,
+    device: torch.device | str | None,
+    dtype: torch.dtype | None,
+) -> torch.Tensor | None:
+    if x is None:
+        return None
+    if device is not None and dtype is not None:
+        return x.to(device=device, dtype=dtype)
+    if device is not None:
+        return x.to(device=device)
+    if dtype is not None:
+        return x.to(dtype=dtype)
+    return x
+
+
+@dataclass
+class ScanState:
+    """Named recurrent state for the v2x2 scan backend.
+
+    All tensors use the canonical packed layout expected by ``v2x2ssd``:
+
+    - ``state``: ``(batch, heads, P, 2N)``
+    - ``b_prev``: ``(batch, heads, 2N)``
+    - ``u_prev``: ``(batch, heads, P)``
+    """
+
+    state: torch.Tensor | None = None
+    b_prev: torch.Tensor | None = None
+    u_prev: torch.Tensor | None = None
+
+    def detach(self) -> "ScanState":
+        return ScanState(
+            state=_maybe_detach(self.state),
+            b_prev=_maybe_detach(self.b_prev),
+            u_prev=_maybe_detach(self.u_prev),
+        )
+
+    def to(
+        self,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> "ScanState":
+        return ScanState(
+            state=_maybe_to(self.state, device=device, dtype=dtype),
+            b_prev=_maybe_to(self.b_prev, device=device, dtype=dtype),
+            u_prev=_maybe_to(self.u_prev, device=device, dtype=dtype),
+        )
+
+
+@dataclass
+class SLinOSSMixerState:
+    """Named streaming state for the full SLinOSS mixer."""
+
+    conv: torch.Tensor | None = None
+    scan: ScanState = field(default_factory=ScanState)
+
+    def detach(self) -> "SLinOSSMixerState":
+        return SLinOSSMixerState(
+            conv=_maybe_detach(self.conv),
+            scan=self.scan.detach(),
+        )
+
+    def to(
+        self,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> "SLinOSSMixerState":
+        return SLinOSSMixerState(
+            conv=_maybe_to(self.conv, device=device, dtype=dtype),
+            scan=self.scan.to(device=device, dtype=dtype),
+        )
+
+
+__all__ = ["ScanState", "SLinOSSMixerState"]
