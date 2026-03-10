@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import math
+from typing import Any, cast
 
 import torch
 
-from slinoss.layers import CuteScanBackend, ScanInputs, ScanState
+from slinoss.layers import AutoScanBackend, CuteScanBackend, ScanInputs, ScanState
 from slinoss.layers import backend as backend_mod
 
 
@@ -90,3 +91,91 @@ def test_cute_backend_preserves_scan_contract(monkeypatch) -> None:
     assert torch.equal(next_state.state, torch.full_like(state.state, 3.0))  # type: ignore[arg-type]
     assert torch.equal(next_state.b_prev, torch.full_like(state.b_prev, 5.0))  # type: ignore[arg-type]
     assert torch.equal(next_state.u_prev, torch.full_like(state.u_prev, 7.0))  # type: ignore[arg-type]
+
+
+def test_auto_backend_routes_cpu_inputs_to_reference() -> None:
+    inputs, state = _make_inputs()
+    backend = AutoScanBackend()
+    calls: list[str] = []
+
+    def fake_reference(
+        routed_inputs: ScanInputs,
+        *,
+        chunk_size: int,
+        state: ScanState | None = None,
+    ) -> tuple[torch.Tensor, ScanState]:
+        assert routed_inputs is inputs
+        assert chunk_size == 4
+        assert state is not None
+        calls.append("reference")
+        return torch.zeros_like(inputs.U), state
+
+    def fake_cute(
+        routed_inputs: ScanInputs,
+        *,
+        chunk_size: int,
+        state: ScanState | None = None,
+    ) -> tuple[torch.Tensor, ScanState]:
+        del routed_inputs, chunk_size, state
+        calls.append("cute")
+        raise AssertionError("CPU inputs should not route to the CuTe backend.")
+
+    backend_any = cast(Any, backend)
+    backend_any.reference = fake_reference
+    backend_any.cute = fake_cute
+
+    y, next_state = backend(inputs, chunk_size=4, state=state)
+
+    assert calls == ["reference"]
+    assert torch.equal(y, torch.zeros_like(inputs.U))
+    assert next_state is state
+
+
+def test_auto_backend_routes_cuda_inputs_to_cute() -> None:
+    backend = AutoScanBackend()
+    calls: list[str] = []
+    zeros = torch.zeros((1,), dtype=torch.float32)
+
+    class _CudaLikeTensor:
+        def __init__(self) -> None:
+            self.device = torch.device("cuda")
+
+    inputs = ScanInputs(
+        U=cast(torch.Tensor, _CudaLikeTensor()),
+        M=zeros,
+        K=zeros,
+        B=zeros,
+        C=zeros,
+    )
+
+    def fake_reference(
+        routed_inputs: ScanInputs,
+        *,
+        chunk_size: int,
+        state: ScanState | None = None,
+    ) -> tuple[torch.Tensor, ScanState]:
+        del routed_inputs, chunk_size, state
+        calls.append("reference")
+        raise AssertionError("CUDA inputs should not route to the reference backend.")
+
+    def fake_cute(
+        routed_inputs: ScanInputs,
+        *,
+        chunk_size: int,
+        state: ScanState | None = None,
+    ) -> tuple[torch.Tensor, ScanState]:
+        del chunk_size
+        assert routed_inputs is inputs
+        calls.append("cute")
+        next_state = ScanState() if state is None else state
+        return cast(torch.Tensor, routed_inputs.U), next_state
+
+    backend_any = cast(Any, backend)
+    backend_any.reference = fake_reference
+    backend_any.cute = fake_cute
+
+    y, next_state = backend(inputs, chunk_size=7, state=None)
+
+    assert calls == ["cute"]
+    assert y is inputs.U
+    assert isinstance(next_state, ScanState)

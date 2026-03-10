@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from slinoss.layers import SLinOSSMixer, ScanInputs, ScanState
+from slinoss.layers import AutoScanBackend, SLinOSSMixer, ScanInputs, ScanState
 
 
 class SpyBackend:
@@ -74,6 +74,11 @@ def test_mixer_calls_backend_with_canonical_scan_shapes() -> None:
     assert state.scan.state.shape == (2, 4, 6, 6)
     assert state.scan.b_prev.shape == (2, 4, 6)
     assert state.scan.u_prev.shape == (2, 4, 6)
+
+
+def test_mixer_defaults_to_auto_scan_backend() -> None:
+    mixer = _make_mixer()
+    assert isinstance(mixer.backend, AutoScanBackend)
 
 
 def test_mixer_step_matches_full_forward() -> None:
