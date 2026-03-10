@@ -805,7 +805,6 @@ class ChunkScanInnerAmpereTc:
         seqlen: cutlass.Int32,
     ):
         acc_S_mn = self._make_acc_tensor_mn_view(acc_S)
-        scale_buf = cute.make_rmem_tensor(acc_S_mn[0, None].layout, cutlass.Float32)
         for r in cutlass.range_constexpr(cute.size(acc_S_mn.shape[0])):
             row_idx = cutlass.Int32(tScS_mn[r, 0][1])
             row_scale = cutlass.Float32(1.0)
@@ -815,16 +814,15 @@ class ChunkScanInnerAmpereTc:
             col_limit = cutlass.min(row_idx + 1, seqlen)
             for c in cutlass.range_constexpr(cute.size(acc_S_mn.shape[1])):
                 col_idx = cutlass.Int32(tScS_mn[0, c][3])
+                # Apply the stable segment ratio directly per score instead of
+                # staging a full row of scale factors in registers.
                 if cute.elem_less(col_limit, col_idx + 1) or cute.elem_less(
                     seqlen, col_idx + 1
                 ):
-                    scale_buf[c] = 0.0
+                    acc_S_mn[r, c] = cutlass.Float32(0.0)
                 else:
                     key_scale = cutlass.Float32(sLpK[col_idx - n_tile_start])
-                    scale_buf[c] = row_scale * key_scale
-
-            acc_row = acc_S_mn[r, None].load()
-            acc_S_mn[r, None] = acc_row * scale_buf.load()
+                    acc_S_mn[r, c] = acc_S_mn[r, c] * (row_scale * key_scale)
 
 
 def _torch_to_cutlass_dtype(dt: torch.dtype) -> type[cutlass.Numeric]:
