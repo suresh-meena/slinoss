@@ -161,6 +161,101 @@ def _get_db_scratch(
     return scratch
 
 
+def _chunk_scan_bwd_dk_packed_cute(
+    Q_rev: torch.Tensor,
+    Vprev_rev: torch.Tensor,
+    Vcurr_rev: torch.Tensor,
+    neg_logprefix_half_rev: torch.Tensor,
+    d_out: torch.Tensor,
+    *,
+    batch_size: int,
+    n_heads: int,
+    T: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute packed ``dKprev/dKcurr`` on the cached reverse-time contract."""
+    BHC, L, _, D = map(int, Q_rev.shape)
+    P = int(Vprev_rev.shape[-1])
+    BH = int(batch_size) * int(n_heads)
+    if BH <= 0 or BHC % BH != 0:
+        raise ValueError(
+            f"Q_rev leading dim BHC={BHC} is not divisible by batch*heads={BH}."
+        )
+    n_chunks = BHC // BH
+    T_pad = n_chunks * L
+    if T > T_pad:
+        raise ValueError(
+            f"T={T} exceeds the cached padded length T_pad={T_pad} implied by Q_rev."
+        )
+
+    scratch = _get_db_scratch(vprev_rev=Vprev_rev, D=D)
+    if T_pad != T:
+        pad = T_pad - T
+        d_out = torch.cat(
+            [
+                d_out,
+                torch.zeros(
+                    (batch_size, n_heads, pad, P),
+                    device=d_out.device,
+                    dtype=d_out.dtype,
+                ),
+            ],
+            dim=2,
+        )
+    d_out_rev = torch.flip(
+        d_out.reshape(BHC, L, 1, P).to(dtype=Vprev_rev.dtype), dims=[1]
+    ).contiguous()
+    # The packed key-gradient contraction needs the same inner-kernel prefix
+    # renormalization as the packed ``dQ`` path: after reversing time, the
+    # stable segment ratio is represented by half of the negated half-logprefix.
+    half_neg_logprefix_half_rev = (0.5 * neg_logprefix_half_rev).contiguous()
+
+    compiled_prev = _get_compiled_chunk_scan(
+        Vprev_rev,
+        d_out_rev,
+        Q_rev,
+        scratch.K_zero,
+        scratch.V_zero,
+        half_neg_logprefix_half_rev,
+        scratch.Z0_zero,
+        scratch.dKprev_rev,
+    )
+    compiled_curr = _get_compiled_chunk_scan(
+        Vcurr_rev,
+        scratch.K_zero,
+        scratch.V_zero,
+        d_out_rev,
+        Q_rev,
+        half_neg_logprefix_half_rev,
+        scratch.Z0_zero,
+        scratch.dKcurr_rev,
+    )
+
+    compiled_prev(
+        from_dlpack(Vprev_rev, assumed_align=16),
+        from_dlpack(d_out_rev, assumed_align=16),
+        from_dlpack(Q_rev, assumed_align=16),
+        from_dlpack(scratch.K_zero, assumed_align=16),
+        from_dlpack(scratch.V_zero, assumed_align=16),
+        from_dlpack(half_neg_logprefix_half_rev, assumed_align=16),
+        from_dlpack(scratch.Z0_zero, assumed_align=16),
+        from_dlpack(scratch.dKprev_rev, assumed_align=16),
+    )
+    compiled_curr(
+        from_dlpack(Vcurr_rev, assumed_align=16),
+        from_dlpack(scratch.K_zero, assumed_align=16),
+        from_dlpack(scratch.V_zero, assumed_align=16),
+        from_dlpack(d_out_rev, assumed_align=16),
+        from_dlpack(Q_rev, assumed_align=16),
+        from_dlpack(half_neg_logprefix_half_rev, assumed_align=16),
+        from_dlpack(scratch.Z0_zero, assumed_align=16),
+        from_dlpack(scratch.dKcurr_rev, assumed_align=16),
+    )
+    return (
+        torch.flip(scratch.dKprev_rev.squeeze(2), dims=[1]).contiguous(),
+        torch.flip(scratch.dKcurr_rev.squeeze(2), dims=[1]).contiguous(),
+    )
+
+
 def chunk_scan_bwd_db_cute(
     Q_rev: torch.Tensor,
     Vprev_rev: torch.Tensor,
@@ -238,7 +333,6 @@ def chunk_scan_bwd_db_cute(
         )
 
     BHC, L, _, D = map(int, Q_rev.shape)
-    P = int(Vprev_rev.shape[-1])
     BH = int(batch_size) * int(n_heads)
     if BH <= 0 or BHC % BH != 0:
         raise ValueError(
@@ -251,80 +345,20 @@ def chunk_scan_bwd_db_cute(
             f"T={T} exceeds the cached padded length T_pad={T_pad} implied by Q_rev."
         )
 
-    scratch = _get_db_scratch(vprev_rev=Vprev_rev, D=D)
-
-    # This is the hot path in the eventual autograd wrapper. Like the other
-    # CuTe backward stages, it assumes forward saved sane finite tensors and
-    # avoids whole-tensor finite scans here.
-    if T_pad != T:
-        pad = T_pad - T
-        d_out = torch.cat(
-            [
-                d_out,
-                torch.zeros(
-                    (batch_size, n_heads, pad, P),
-                    device=d_out.device,
-                    dtype=d_out.dtype,
-                ),
-            ],
-            dim=2,
-        )
-    d_out_rev = torch.flip(
-        d_out.reshape(BHC, L, 1, P).to(dtype=Vprev_rev.dtype), dims=[1]
-    ).contiguous()
-    # The packed key-gradient contraction needs the same inner-kernel prefix
-    # renormalization as the packed ``dQ`` path: after reversing time, the
-    # stable segment ratio is represented by half of the negated half-logprefix.
-    half_neg_logprefix_half_rev = (0.5 * neg_logprefix_half_rev).contiguous()
-
-    compiled_prev = _get_compiled_chunk_scan(
-        Vprev_rev,
-        d_out_rev,
-        Q_rev,
-        scratch.K_zero,
-        scratch.V_zero,
-        half_neg_logprefix_half_rev,
-        scratch.Z0_zero,
-        scratch.dKprev_rev,
-    )
-    compiled_curr = _get_compiled_chunk_scan(
-        Vcurr_rev,
-        scratch.K_zero,
-        scratch.V_zero,
-        d_out_rev,
-        Q_rev,
-        half_neg_logprefix_half_rev,
-        scratch.Z0_zero,
-        scratch.dKcurr_rev,
-    )
-
-    compiled_prev(
-        from_dlpack(Vprev_rev, assumed_align=16),
-        from_dlpack(d_out_rev, assumed_align=16),
-        from_dlpack(Q_rev, assumed_align=16),
-        from_dlpack(scratch.K_zero, assumed_align=16),
-        from_dlpack(scratch.V_zero, assumed_align=16),
-        from_dlpack(half_neg_logprefix_half_rev, assumed_align=16),
-        from_dlpack(scratch.Z0_zero, assumed_align=16),
-        from_dlpack(scratch.dKprev_rev, assumed_align=16),
-    )
-    compiled_curr(
-        from_dlpack(Vcurr_rev, assumed_align=16),
-        from_dlpack(scratch.K_zero, assumed_align=16),
-        from_dlpack(scratch.V_zero, assumed_align=16),
-        from_dlpack(d_out_rev, assumed_align=16),
-        from_dlpack(Q_rev, assumed_align=16),
-        from_dlpack(half_neg_logprefix_half_rev, assumed_align=16),
-        from_dlpack(scratch.Z0_zero, assumed_align=16),
-        from_dlpack(scratch.dKcurr_rev, assumed_align=16),
-    )
-
     cplx_dtype = _complex_dtype_from_real(torch.float32)
     phase_c = (
         torch.view_as_complex(phase.contiguous()).to(dtype=cplx_dtype).unsqueeze(-1)
     )
-    dKprev_packed = torch.flip(scratch.dKprev_rev.squeeze(2), dims=[1]).contiguous()
-    dKcurr_packed = torch.flip(scratch.dKcurr_rev.squeeze(2), dims=[1]).contiguous()
+    dKprev_packed, dKcurr_packed = _chunk_scan_bwd_dk_packed_cute(
+        Q_rev,
+        Vprev_rev,
+        Vcurr_rev,
+        neg_logprefix_half_rev,
+        d_out,
+        batch_size=batch_size,
+        n_heads=n_heads,
+        T=T,
+    )
     dKprev_c = _as_complex_pairs(dKprev_packed, name="dKprev_packed").to(
         dtype=cplx_dtype
     )
