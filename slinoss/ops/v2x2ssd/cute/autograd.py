@@ -29,6 +29,7 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.state_passing import state_passing_bwd
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import chunk_increment_cute
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import (
     batched_sgemm_fp32_cute,
+    pair_sum_batched_sgemm_fp32_cute,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import (
     _get_compiled_chunk_scan,
@@ -342,10 +343,12 @@ def _chunk_scan_bwd_exact_packed(
         T=T,
     )
 
-    dQ = (
-        batched_sgemm_fp32_cute(d_out_flat * row_scale, Z0f)
-        + batched_sgemm_fp32_cute(dScore_prev, Kprevf)
-        + batched_sgemm_fp32_cute(dScore_curr, Kcurrf)
+    dQ = batched_sgemm_fp32_cute(d_out_flat * row_scale, Z0f)
+    dQ = dQ + pair_sum_batched_sgemm_fp32_cute(
+        dScore_prev,
+        Kprevf,
+        dScore_curr,
+        Kcurrf,
     )
     dK_prev_packed = batched_sgemm_fp32_cute(dScore_prev.transpose(1, 2), Qf)
     dK_curr_packed = batched_sgemm_fp32_cute(dScore_curr.transpose(1, 2), Qf)
