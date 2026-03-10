@@ -61,6 +61,20 @@ _CompiledKey = tuple[
     tuple[int, int, int],
 ]
 _COMPILED_GEMM: dict[_CompiledKey, Callable[..., object]] = {}
+_BatchBmmKey = tuple[
+    int,
+    torch.dtype,
+    tuple[int, int, int],
+    tuple[int, int, int],
+    tuple[int, int, int],
+    tuple[int, int, int],
+    int,
+    int,
+    tuple[int, int, int],
+    int,
+    int,
+]
+_COMPILED_BATCH_BMM: dict[_BatchBmmKey, Callable[..., object]] = {}
 
 
 class _BatchedSgemmFp32Ampere:
@@ -499,6 +513,14 @@ def _mark_prepared_input(t: torch.Tensor) -> cute.Tensor:
     )
 
 
+def _mark_prepared_input_rowmajor(t: torch.Tensor) -> cute.Tensor:
+    return (
+        from_dlpack(t, assumed_align=16)
+        .mark_layout_dynamic(leading_dim=1)
+        .mark_compact_shape_dynamic(mode=1, stride_order=(2, 0, 1), divisibility=4)
+    )
+
+
 def _mark_output(t: torch.Tensor) -> cute.Tensor:
     return (
         from_dlpack(t, assumed_align=16)
@@ -670,6 +692,181 @@ def _get_compiled_gemm(
     return compiled
 
 
+def _view_mode(view: torch.Tensor) -> int:
+    if int(view.stride()[0]) == 1:
+        return 0
+    if int(view.stride()[1]) == 1:
+        return 1
+    raise ValueError(
+        "Expected a view with a unit-stride leading dimension in mode 0 or 1. "
+        f"Got shape={tuple(view.shape)} stride={tuple(view.stride())}."
+    )
+
+
+def _mark_batched_view(view: torch.Tensor, *, mode: int) -> cute.Tensor:
+    if mode == 0:
+        return _mark_prepared_input(view)
+    if mode == 1:
+        return _mark_prepared_input_rowmajor(view)
+    raise ValueError(f"Unsupported batched GEMM mode {mode}.")
+
+
+def _batched_sgemm_config(M: int, N: int, K: int) -> tuple[tuple[int, int, int], int, int]:
+    tuned: dict[tuple[int, int, int], tuple[tuple[int, int, int], int, int]] = {
+        # Exact chunk_scan backward hot shapes.
+        (64, 64, 96): ((64, 64, 16), 3, 128),
+        (64, 64, 64): ((64, 64, 32), 3, 256),
+        (64, 96, 64): ((64, 64, 16), 3, 128),
+    }
+    return tuned.get((M, N, K), ((64, 64, 16), 3, 256))
+
+
+def _dummy_a_view(
+    *,
+    batch_size: int,
+    M: int,
+    K: int,
+    mode: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if mode == 0:
+        return torch.empty((batch_size, K, M), device=device, dtype=dtype).permute(2, 1, 0)
+    if mode == 1:
+        return torch.empty((batch_size, M, K), device=device, dtype=dtype).permute(1, 2, 0)
+    raise ValueError(f"Unsupported batched GEMM mode {mode}.")
+
+
+def _dummy_b_view(
+    *,
+    batch_size: int,
+    N: int,
+    K: int,
+    mode: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if mode == 0:
+        return torch.empty((batch_size, K, N), device=device, dtype=dtype).permute(2, 1, 0)
+    if mode == 1:
+        return torch.empty((batch_size, N, K), device=device, dtype=dtype).permute(1, 2, 0)
+    raise ValueError(f"Unsupported batched GEMM mode {mode}.")
+
+
+def _get_compiled_batch_bmm(
+    A_view: torch.Tensor,
+    B_view: torch.Tensor,
+    C_view: torch.Tensor,
+    *,
+    a_mode: int,
+    b_mode: int,
+    cta_tiler: tuple[int, int, int],
+    num_stages: int,
+    num_threads: int,
+) -> Callable[..., object]:
+    if A_view.device.type != "cuda":
+        raise ValueError("CuTe batched GEMM requires CUDA tensors.")
+
+    device_index = 0 if A_view.device.index is None else int(A_view.device.index)
+    key: _BatchBmmKey = (
+        device_index,
+        A_view.dtype,
+        tuple(int(x) for x in A_view.shape),
+        tuple(int(x) for x in A_view.stride()),
+        tuple(int(x) for x in B_view.shape),
+        tuple(int(x) for x in B_view.stride()),
+        a_mode,
+        b_mode,
+        cta_tiler,
+        int(num_stages),
+        int(num_threads),
+    )
+    compiled = _COMPILED_BATCH_BMM.get(key)
+    if compiled is not None:
+        return compiled
+
+    M, K, batch_size = map(int, A_view.shape)
+    N = int(B_view.shape[0])
+    kernel = _BatchedSgemmFp32Ampere(
+        cta_tiler=cta_tiler,
+        num_stages=num_stages,
+        num_threads=num_threads,
+    )
+    dummy_A = _dummy_a_view(
+        batch_size=batch_size,
+        M=M,
+        K=K,
+        mode=a_mode,
+        device=A_view.device,
+        dtype=A_view.dtype,
+    )
+    dummy_B = _dummy_b_view(
+        batch_size=batch_size,
+        N=N,
+        K=K,
+        mode=b_mode,
+        device=B_view.device,
+        dtype=B_view.dtype,
+    )
+    dummy_C = torch.empty((batch_size, M, N), device=A_view.device, dtype=A_view.dtype).permute(1, 2, 0)
+    compiled = cute.compile(
+        kernel,
+        _mark_batched_view(dummy_A, mode=a_mode),
+        _mark_batched_view(dummy_B, mode=b_mode),
+        _mark_output(dummy_C),
+    )
+    _COMPILED_BATCH_BMM[key] = compiled
+    return compiled
+
+
+def batched_sgemm_fp32_cute(A: torch.Tensor, B: torch.Tensor) -> torch.Tensor:
+    """Exact fp32 batched GEMM for ``(B, M, K) @ (B, K, N)`` on CUDA.
+
+    This reuses the CuTe fp32 SIMT GEMM from ``chunk_increment`` but consumes
+    batch-first backward tensors directly via layout marking instead of forcing
+    a repacking copy into feature-major buffers. That is what keeps the exact
+    ``chunk_scan`` backward hot path from giving back the raw GEMM win to host
+    layout churn.
+    """
+    if A.device.type != "cuda" or B.device.type != "cuda":
+        raise ValueError("CuTe batched GEMM requires CUDA tensors.")
+    if A.dtype != torch.float32 or B.dtype != torch.float32:
+        raise ValueError("CuTe batched GEMM expects float32 inputs.")
+    if A.ndim != 3 or B.ndim != 3:
+        raise ValueError("CuTe batched GEMM expects rank-3 tensors.")
+    if int(A.shape[0]) != int(B.shape[0]) or int(A.shape[2]) != int(B.shape[1]):
+        raise ValueError(
+            "Expected A=(B,M,K) and B=(B,K,N). Got "
+            f"{tuple(A.shape)} and {tuple(B.shape)}."
+        )
+
+    batch_size, M, K = map(int, A.shape)
+    _, _, N = map(int, B.shape)
+    A_view = A.permute(1, 2, 0)
+    B_view = B.permute(2, 1, 0)
+    a_mode = _view_mode(A_view)
+    b_mode = _view_mode(B_view)
+    cta_tiler, num_stages, num_threads = _batched_sgemm_config(M, N, K)
+    C = torch.empty((batch_size, M, N), device=A.device, dtype=torch.float32)
+    C_view = C.permute(1, 2, 0)
+    compiled = _get_compiled_batch_bmm(
+        A_view,
+        B_view,
+        C_view,
+        a_mode=a_mode,
+        b_mode=b_mode,
+        cta_tiler=cta_tiler,
+        num_stages=num_stages,
+        num_threads=num_threads,
+    )
+    compiled(
+        _mark_batched_view(A_view, mode=a_mode),
+        _mark_batched_view(B_view, mode=b_mode),
+        _mark_output(C_view),
+    )
+    return C
+
+
 def chunk_increment_cute(
     U: torch.Tensor,
     M: torch.Tensor,
@@ -731,4 +928,4 @@ def chunk_increment_cute(
     return inc, m_chunk_packed
 
 
-__all__ = ["chunk_increment_cute"]
+__all__ = ["batched_sgemm_fp32_cute", "chunk_increment_cute"]

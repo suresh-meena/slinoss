@@ -6,6 +6,9 @@ import pytest
 import torch
 
 from slinoss.ops.v2x2ssd import v2x2ssd, v2x2ssd_cute
+from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import (
+    batched_sgemm_fp32_cute,
+)
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import (
     _compiled_key,
     chunk_scan_cute,
@@ -104,6 +107,22 @@ def test_chunk_scan_compiled_key_distinguishes_full_operand_contract() -> None:
     )
 
     assert key_a != key_b
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_batched_sgemm_fp32_cute_matches_torch_bmm_mixed_layouts() -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    batch = 64
+    A = torch.randn((batch, 64, 96), device="cuda", dtype=torch.float32)
+    B_base = torch.randn((batch, 64, 96), device="cuda", dtype=torch.float32)
+    B = B_base.transpose(1, 2)
+
+    got = batched_sgemm_fp32_cute(A, B)
+    want = torch.bmm(A, B)
+
+    torch.testing.assert_close(got, want, atol=0.0, rtol=0.0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

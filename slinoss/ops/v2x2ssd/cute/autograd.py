@@ -27,6 +27,9 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.dlogprefix import (
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.state_passing import state_passing_bwd_cute
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import chunk_increment_cute
+from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import (
+    batched_sgemm_fp32_cute,
+)
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import (
     _get_compiled_chunk_scan,
     _pack_chunk_scan_inner_inputs,
@@ -305,16 +308,16 @@ def _chunk_scan_bwd_exact_packed(
     Z0f = Z0.squeeze(2).to(torch.float32)
 
     scale, row_scale = _packed_causal_scales(logprefix_half)
-    score_prev = torch.bmm(Qf, Kprevf.transpose(1, 2))
-    score_curr = torch.bmm(Qf, Kcurrf.transpose(1, 2))
+    score_prev = batched_sgemm_fp32_cute(Qf, Kprevf.transpose(1, 2))
+    score_curr = batched_sgemm_fp32_cute(Qf, Kcurrf.transpose(1, 2))
     Sprev = score_prev * scale
     Scurr = score_curr * scale
-    dSprev = torch.bmm(d_out_flat, Vprevf.transpose(1, 2))
-    dScurr = torch.bmm(d_out_flat, Vcurrf.transpose(1, 2))
+    dSprev = batched_sgemm_fp32_cute(d_out_flat, Vprevf.transpose(1, 2))
+    dScurr = batched_sgemm_fp32_cute(d_out_flat, Vcurrf.transpose(1, 2))
     dScore_prev = dSprev * scale
     dScore_curr = dScurr * scale
 
-    dZ0 = torch.bmm(
+    dZ0 = batched_sgemm_fp32_cute(
         (d_out_flat * row_scale).transpose(1, 2),
         Qf,
     )
@@ -329,8 +332,8 @@ def _chunk_scan_bwd_exact_packed(
         .contiguous()
     )
 
-    dVprev = torch.bmm(Sprev.transpose(1, 2), d_out_flat)
-    dVcurr = torch.bmm(Scurr.transpose(1, 2), d_out_flat)
+    dVprev = batched_sgemm_fp32_cute(Sprev.transpose(1, 2), d_out_flat)
+    dVcurr = batched_sgemm_fp32_cute(Scurr.transpose(1, 2), d_out_flat)
     dU, dU_prev = _scatter_value_grads(
         dVprev,
         dVcurr,
@@ -340,13 +343,13 @@ def _chunk_scan_bwd_exact_packed(
     )
 
     dQ = (
-        torch.bmm(d_out_flat * row_scale, Z0f)
-        + torch.bmm(dScore_prev, Kprevf)
-        + torch.bmm(dScore_curr, Kcurrf)
+        batched_sgemm_fp32_cute(d_out_flat * row_scale, Z0f)
+        + batched_sgemm_fp32_cute(dScore_prev, Kprevf)
+        + batched_sgemm_fp32_cute(dScore_curr, Kcurrf)
     )
-    dK_prev_packed = torch.bmm(dScore_prev.transpose(1, 2), Qf)
-    dK_curr_packed = torch.bmm(dScore_curr.transpose(1, 2), Qf)
-    y_off = torch.bmm(Qf, Z0f.transpose(1, 2)) * row_scale
+    dK_prev_packed = batched_sgemm_fp32_cute(dScore_prev.transpose(1, 2), Qf)
+    dK_curr_packed = batched_sgemm_fp32_cute(dScore_curr.transpose(1, 2), Qf)
+    y_off = batched_sgemm_fp32_cute(Qf, Z0f.transpose(1, 2)) * row_scale
     d_logprefix_half = chunk_scan_bwd_dlogprefix_exact_cute(
         score_prev,
         score_curr,
