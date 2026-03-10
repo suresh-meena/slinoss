@@ -81,8 +81,12 @@ def _quantized_packed_dc_reference(
     row_scale = torch.exp(2.0 * lp).unsqueeze(-1)
 
     y = torch.bmm(q, z0.transpose(1, 2)) * row_scale
-    y = y + torch.bmm((torch.bmm(q, kp.transpose(1, 2)) * scale).to(Q.dtype).to(torch.float32), vp)
-    y = y + torch.bmm((torch.bmm(q, kc.transpose(1, 2)) * scale).to(Q.dtype).to(torch.float32), vc)
+    y = y + torch.bmm(
+        (torch.bmm(q, kp.transpose(1, 2)) * scale).to(Q.dtype).to(torch.float32), vp
+    )
+    y = y + torch.bmm(
+        (torch.bmm(q, kc.transpose(1, 2)) * scale).to(Q.dtype).to(torch.float32), vc
+    )
 
     (dq_ref,) = torch.autograd.grad((y * d_out_flat).sum(), (q,), retain_graph=False)
 
