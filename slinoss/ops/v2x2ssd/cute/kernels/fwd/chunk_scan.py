@@ -342,7 +342,6 @@ class ChunkScanInnerAmpereTc:
         m = self.cfg.m_block_size
         n = self.cfg.n_block_size
         n_block_max = self.cfg.n_block_max
-
         gQ = cute.local_tile(mQ[bhc, None, 0, None], (m, Dp), (m_block, 0))
         gKprev = cute.local_tile(mKprev[bhc, None, 0, None], (n, Dp), (None, 0))
         gKcurr = cute.local_tile(mKcurr[bhc, None, 0, None], (n, Dp), (None, 0))
@@ -380,6 +379,9 @@ class ChunkScanInnerAmpereTc:
         mcQ = cute.make_identity_tensor(mQ.layout.shape)
         cQ = cute.local_tile(mcQ[bhc, None, 0, None], (m, Dp), (m_block, 0))
         tQcQ = gmem_thr_copy_D.partition_S(cQ)
+        # Predicates must carry both row and contiguous-axis bounds. Slice-level
+        # row checks happen to work for the current default tile, but they become
+        # a correctness footgun as soon as the thread/value partition changes.
         tQpQ = cute.make_rmem_tensor(
             cute.make_layout(
                 (
@@ -387,15 +389,21 @@ class ChunkScanInnerAmpereTc:
                     cute.size(tQsQ, mode=[1]),
                     cute.size(tQsQ, mode=[2]),
                 ),
-                stride=(cute.size(tQsQ, mode=[2]), 0, 1),
+                stride=(
+                    cute.size(tQsQ, mode=[1]) * cute.size(tQsQ, mode=[2]),
+                    cute.size(tQsQ, mode=[2]),
+                    1,
+                ),
             ),
             cutlass.Boolean,
         )
         for rest_v in cutlass.range_constexpr(tQpQ.shape[0]):
-            for rest_k in cutlass.range_constexpr(tQpQ.shape[2]):
-                tQpQ[rest_v, 0, rest_k] = cute.elem_less(
-                    tQcQ[(0, rest_v), 0, rest_k][3], mQ.layout.shape[3]
-                )
+            for mi in cutlass.range_constexpr(tQpQ.shape[1]):
+                for rest_k in cutlass.range_constexpr(tQpQ.shape[2]):
+                    coord_q = tQcQ[(0, rest_v), mi, rest_k]
+                    tQpQ[rest_v, mi, rest_k] = cute.elem_less(
+                        coord_q[1], mQ.layout.shape[1]
+                    ) and cute.elem_less(coord_q[3], mQ.layout.shape[3])
 
         mcK = cute.make_identity_tensor(mKprev.layout.shape)
         cK0 = cute.local_tile(mcK[bhc, None, 0, None], (n, Dp), (0, 0))
@@ -407,15 +415,21 @@ class ChunkScanInnerAmpereTc:
                     cute.size(tKsK, mode=[1]),
                     cute.size(tKsK, mode=[2]),
                 ),
-                stride=(cute.size(tKsK, mode=[2]), 0, 1),
+                stride=(
+                    cute.size(tKsK, mode=[1]) * cute.size(tKsK, mode=[2]),
+                    cute.size(tKsK, mode=[2]),
+                    1,
+                ),
             ),
             cutlass.Boolean,
         )
         for rest_v in cutlass.range_constexpr(tKpK.shape[0]):
-            for rest_k in cutlass.range_constexpr(tKpK.shape[2]):
-                tKpK[rest_v, 0, rest_k] = cute.elem_less(
-                    tKcK0[(0, rest_v), 0, rest_k][3], mKprev.layout.shape[3]
-                )
+            for ni in cutlass.range_constexpr(tKpK.shape[1]):
+                for rest_k in cutlass.range_constexpr(tKpK.shape[2]):
+                    coord_k = tKcK0[(0, rest_v), ni, rest_k]
+                    tKpK[rest_v, ni, rest_k] = cute.elem_less(
+                        coord_k[1], mKprev.layout.shape[1]
+                    ) and cute.elem_less(coord_k[3], mKprev.layout.shape[3])
 
         mcZ = cute.make_identity_tensor(mZ0.layout.shape)
         cZ = cute.local_tile(mcZ[bhc, None, 0, None], (Pp, Dp), (0, 0))
@@ -427,15 +441,21 @@ class ChunkScanInnerAmpereTc:
                     cute.size(tZsZ, mode=[1]),
                     cute.size(tZsZ, mode=[2]),
                 ),
-                stride=(cute.size(tZsZ, mode=[2]), 0, 1),
+                stride=(
+                    cute.size(tZsZ, mode=[1]) * cute.size(tZsZ, mode=[2]),
+                    cute.size(tZsZ, mode=[2]),
+                    1,
+                ),
             ),
             cutlass.Boolean,
         )
         for rest_v in cutlass.range_constexpr(tZpZ.shape[0]):
-            for rest_k in cutlass.range_constexpr(tZpZ.shape[2]):
-                tZpZ[rest_v, 0, rest_k] = cute.elem_less(
-                    tZcZ[(0, rest_v), 0, rest_k][3], mZ0.layout.shape[3]
-                )
+            for zi in cutlass.range_constexpr(tZpZ.shape[1]):
+                for rest_k in cutlass.range_constexpr(tZpZ.shape[2]):
+                    coord_z = tZcZ[(0, rest_v), zi, rest_k]
+                    tZpZ[rest_v, zi, rest_k] = cute.elem_less(
+                        coord_z[1], mZ0.layout.shape[1]
+                    ) and cute.elem_less(coord_z[3], mZ0.layout.shape[3])
 
         mcV = cute.make_identity_tensor(mVcurr.layout.shape)
         cV0 = cute.local_tile(mcV[bhc, None, 0, None], (n, Pp), (0, 0))
@@ -447,15 +467,21 @@ class ChunkScanInnerAmpereTc:
                     cute.size(tVsV, mode=[1]),
                     cute.size(tVsV, mode=[2]),
                 ),
-                stride=(cute.size(tVsV, mode=[2]), 0, 1),
+                stride=(
+                    cute.size(tVsV, mode=[1]) * cute.size(tVsV, mode=[2]),
+                    cute.size(tVsV, mode=[2]),
+                    1,
+                ),
             ),
             cutlass.Boolean,
         )
         for rest_v in cutlass.range_constexpr(tVpV.shape[0]):
-            for rest_k in cutlass.range_constexpr(tVpV.shape[2]):
-                tVpV[rest_v, 0, rest_k] = cute.elem_less(
-                    tVcV0[(0, rest_v), 0, rest_k][3], mVcurr.layout.shape[3]
-                )
+            for vi in cutlass.range_constexpr(tVpV.shape[1]):
+                for rest_k in cutlass.range_constexpr(tVpV.shape[2]):
+                    coord_v = tVcV0[(0, rest_v), vi, rest_k]
+                    tVpV[rest_v, vi, rest_k] = cute.elem_less(
+                        coord_v[1], mVcurr.layout.shape[1]
+                    ) and cute.elem_less(coord_v[3], mVcurr.layout.shape[3])
 
         thr_mma = tiled_mma.get_slice(tidx)
         tSrQ = thr_mma.make_fragment_A(thr_mma.partition_A(sQ))
@@ -497,33 +523,30 @@ class ChunkScanInnerAmpereTc:
         tOsVt = smem_thr_copy_V.partition_S(sVt)
         tOrVt_view = smem_thr_copy_V.retile(tOrVt)
 
-        q_row = m_block * m + tidx
-        if tidx < m:
-            lp = cutlass.Float32(0.0)
-            if cute.elem_less(q_row, mLogprefix.shape[1]):
-                lp = cutlass.Float32(mLogprefix[bhc, q_row])
-            sLpQ[tidx] = cute.math.exp2(lp * TWO_LOG2_E, fastmath=True)
+        fill_m_iters = (m + self.cfg.num_threads - 1) // self.cfg.num_threads
+        for fill_i in cutlass.range_constexpr(fill_m_iters):
+            q_row = m_block * m + tidx + fill_i * self.cfg.num_threads
+            smem_row = tidx + fill_i * self.cfg.num_threads
+            if cute.elem_less(smem_row, m):
+                lp = cutlass.Float32(0.0)
+                if cute.elem_less(q_row, mLogprefix.shape[1]):
+                    lp = cutlass.Float32(mLogprefix[bhc, q_row])
+                sLpQ[smem_row] = cute.math.exp2(lp * TWO_LOG2_E, fastmath=True)
 
         for mi in cutlass.range_constexpr(cute.size(tQsQ.shape[1])):
-            if cute.elem_less(tQcQ[0, mi, 0][1], mQ.layout.shape[1]):
-                cute.copy(
-                    gmem_tiled_copy_D,
-                    tQgQ[None, mi, None],
-                    tQsQ[None, mi, None],
-                    pred=tQpQ[None, mi, None],
-                )
-            else:
-                tQsQ[None, mi, None].fill(0)
+            cute.copy(
+                gmem_tiled_copy_D,
+                tQgQ[None, mi, None],
+                tQsQ[None, mi, None],
+                pred=tQpQ[None, mi, None],
+            )
         for zi in cutlass.range_constexpr(cute.size(tZsZ.shape[1])):
-            if cute.elem_less(tZcZ[0, zi, 0][1], mZ0.layout.shape[1]):
-                cute.copy(
-                    gmem_tiled_copy_D,
-                    tZgZ[None, zi, None],
-                    tZsZ[None, zi, None],
-                    pred=tZpZ[None, zi, None],
-                )
-            else:
-                tZsZ[None, zi, None].fill(0)
+            cute.copy(
+                gmem_tiled_copy_D,
+                tZgZ[None, zi, None],
+                tZsZ[None, zi, None],
+                pred=tZpZ[None, zi, None],
+            )
         cute.arch.cp_async_commit_group()
 
         cute.arch.cp_async_wait_group(0)
@@ -581,26 +604,26 @@ class ChunkScanInnerAmpereTc:
                 cute.arch.cp_async_wait_group(0)
                 cute.arch.barrier()
 
-                k_col = n_block * n + tidx
-                if tidx < n:
-                    if cute.elem_less(k_col, mLogprefix.shape[1]):
-                        lp_s = cutlass.Float32(mLogprefix[bhc, k_col])
-                        sLpK[tidx] = cute.math.exp2(-lp_s * TWO_LOG2_E, fastmath=True)
-                    else:
-                        sLpK[tidx] = 0.0
+                fill_n_iters = (n + self.cfg.num_threads - 1) // self.cfg.num_threads
+                for fill_i in cutlass.range_constexpr(fill_n_iters):
+                    k_col = n_block * n + tidx + fill_i * self.cfg.num_threads
+                    smem_col = tidx + fill_i * self.cfg.num_threads
+                    if cute.elem_less(smem_col, n):
+                        if cute.elem_less(k_col, mLogprefix.shape[1]):
+                            lp_s = cutlass.Float32(mLogprefix[bhc, k_col])
+                            sLpK[smem_col] = cute.math.exp2(
+                                -lp_s * TWO_LOG2_E, fastmath=True
+                            )
+                        else:
+                            sLpK[smem_col] = 0.0
 
-                cV = cute.local_tile(mcV[bhc, None, 0, None], (n, Pp), (n_block, 0))
-                tVcV = gmem_thr_copy_P.partition_S(cV)
                 for vi in cutlass.range_constexpr(cute.size(tVsV.shape[1])):
-                    if cute.elem_less(tVcV[0, vi, 0][1], mVcurr.layout.shape[1]):
-                        cute.copy(
-                            gmem_tiled_copy_P,
-                            tVgV[None, vi, None, n_block],
-                            tVsV[None, vi, None],
-                            pred=tVpV[None, vi, None],
-                        )
-                    else:
-                        tVsV[None, vi, None].fill(0)
+                    cute.copy(
+                        gmem_tiled_copy_P,
+                        tVgV[None, vi, None, n_block],
+                        tVsV[None, vi, None],
+                        pred=tVpV[None, vi, None],
+                    )
                 cute.arch.cp_async_commit_group()
 
                 acc_S = cute.make_rmem_tensor(acc_shape_S, cutlass.Float32)
@@ -650,22 +673,13 @@ class ChunkScanInnerAmpereTc:
                 cute.arch.barrier()
 
                 if cutlass.const_expr(n_block + 1 < n_block_max):
-                    cK_next = cute.local_tile(
-                        mcK[bhc, None, 0, None], (n, Dp), (n_block + 1, 0)
-                    )
-                    tKcK_next = gmem_thr_copy_D.partition_S(cK_next)
                     for ni in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
-                        if cute.elem_less(
-                            tKcK_next[0, ni, 0][1], mKprev.layout.shape[1]
-                        ):
-                            cute.copy(
-                                gmem_tiled_copy_D,
-                                tKgK[None, ni, None, n_block + 1],
-                                tKsK[None, ni, None],
-                                pred=tKpK[None, ni, None],
-                            )
-                        else:
-                            tKsK[None, ni, None].fill(0)
+                        cute.copy(
+                            gmem_tiled_copy_D,
+                            tKgK[None, ni, None, n_block + 1],
+                            tKsK[None, ni, None],
+                            pred=tKpK[None, ni, None],
+                        )
                     cute.arch.cp_async_commit_group()
 
                 rP = cute.make_rmem_tensor_like(acc_S, mQ.element_type)
@@ -731,24 +745,29 @@ class ChunkScanInnerAmpereTc:
         tOpOut = cute.make_rmem_tensor(
             cute.make_layout(
                 (tOgO.shape[0][1], tOgO.shape[1], tOgO.shape[2]),
-                stride=(tOgO.shape[2], 0, 1),
+                stride=(
+                    tOgO.shape[1] * tOgO.shape[2],
+                    tOgO.shape[2],
+                    1,
+                ),
             ),
             cutlass.Boolean,
         )
         for rest_v in cutlass.range_constexpr(tOpOut.shape[0]):
-            for rest_n in cutlass.range_constexpr(cute.size(tOpOut.shape[2])):
-                tOpOut[rest_v, 0, rest_n] = cute.elem_less(
-                    tOcOut[(0, rest_v), 0, rest_n][3], mOut.layout.shape[3]
-                )
+            for rest_m in cutlass.range_constexpr(cute.size(tOpOut.shape[1])):
+                for rest_n in cutlass.range_constexpr(cute.size(tOpOut.shape[2])):
+                    coord_out = tOcOut[(0, rest_v), rest_m, rest_n]
+                    tOpOut[rest_v, rest_m, rest_n] = cute.elem_less(
+                        coord_out[1], mOut.layout.shape[1]
+                    ) and cute.elem_less(coord_out[3], mOut.layout.shape[3])
 
         for rest_m in cutlass.range_constexpr(cute.size(tOpOut.shape[1])):
-            if cute.elem_less(tOcOut[0, rest_m, 0][1], mOut.layout.shape[1]):
-                cute.copy(
-                    gmem_tiled_copy_O,
-                    tOrO[None, rest_m, None],
-                    tOgO[None, rest_m, None],
-                    pred=tOpOut[None, rest_m, None],
-                )
+            cute.copy(
+                gmem_tiled_copy_O,
+                tOrO[None, rest_m, None],
+                tOgO[None, rest_m, None],
+                pred=tOpOut[None, rest_m, None],
+            )
 
     def _make_acc_tensor_mn_view(self, acc: cute.Tensor) -> cute.Tensor:
         acc_layout_col_major = cute.make_layout(acc.layout.shape)
