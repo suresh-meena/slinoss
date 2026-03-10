@@ -212,3 +212,34 @@ def test_v2x2ssd_cute_matches_reference_forward() -> None:
     torch.testing.assert_close(final_cute, final_ref, atol=2e-3, rtol=0.0)
     torch.testing.assert_close(b_last_cute, b_last_ref, atol=0.0, rtol=0.0)
     torch.testing.assert_close(u_last_cute, u_last_ref, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_v2x2ssd_cute_rejects_autograd_tracked_inputs() -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
+        batch=2,
+        heads=2,
+        T=64,
+        N=8,
+        P=16,
+        device=torch.device("cuda"),
+    )
+    U.requires_grad_(True)
+
+    with pytest.raises(ValueError, match="does not support autograd-tracked tensors"):
+        v2x2ssd_cute(
+            U,
+            M,
+            K,
+            B,
+            C,
+            chunk_size=32,
+            initial_states=initial_states,
+            B_prev=B_prev,
+            U_prev=U_prev,
+            compute_dtype=torch.float32,
+            output_dtype=torch.float32,
+        )
