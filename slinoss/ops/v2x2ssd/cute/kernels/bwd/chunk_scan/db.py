@@ -43,8 +43,10 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment.common import (
     _scalar_grad_from_vec,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import (
-    _get_compiled_chunk_scan,
+    ChunkScanConfig,
+    ChunkScanInnerAmpereTc,
     _get_compiled_phase,
+    _torch_to_cutlass_dtype,
 )
 from slinoss.ops.v2x2ssd.reference import (
     _as_complex_pairs,
@@ -64,6 +66,15 @@ class _ChunkScanBwdDBScratch:
 
 _ScratchKey = tuple[int, torch.dtype, int, int, int, int]
 _SCRATCH_DB: dict[_ScratchKey, _ChunkScanBwdDBScratch] = {}
+_CompiledRawKey = tuple[
+    int,
+    tuple[int, int, int, int],
+    tuple[int, int, int, int],
+    tuple[int, int, int, int],
+    tuple[int, int],
+    tuple[int, int, int, int],
+    tuple[int, int, int],
+]
 _CompiledScatterKey = tuple[int, bool, tuple[int, int, int], tuple[int, int, int]]
 _CompiledReduceKey = tuple[
     int,
@@ -72,6 +83,7 @@ _CompiledReduceKey = tuple[
     tuple[int, int],
     tuple[int, int, int, int],
 ]
+_COMPILED_DB_RAW: dict[_CompiledRawKey, object] = {}
 _COMPILED_DB_SCATTER: dict[_CompiledScatterKey, object] = {}
 _COMPILED_DK_REDUCE: dict[_CompiledReduceKey, object] = {}
 
@@ -240,6 +252,102 @@ class _ChunkScanBwdDBExactScatter:
                 kpi = cutlass.Float32(mKRaw[bhc, 0, 0, 1])
                 mDBPrev[bh, col + 0] = kpr * dbp_re + kpi * dbp_im
                 mDBPrev[bh, col + 1] = kpr * dbp_im - kpi * dbp_re
+
+
+def _db_raw_config(
+    query_dim: int,
+    value_dim: int,
+    L: int,
+    *,
+    dtype: torch.dtype,
+) -> tuple[int, int, int]:
+    candidates: list[tuple[int, int, int]]
+    if L <= 32:
+        candidates = [
+            (16, 16, 64),
+            (32, 16, 64),
+            (32, 32, 64),
+            (64, 32, 64),
+        ]
+    else:
+        candidates = [
+            (64, 32, 64),
+            (64, 64, 128),
+            (64, 32, 128),
+            (32, 32, 64),
+            (128, 64, 128),
+        ]
+
+    cutlass_in = _torch_to_cutlass_dtype(dtype)
+    cutlass_out = cutlass.Float32
+    for m_block_size, n_block_size, num_threads in candidates:
+        if L % n_block_size != 0:
+            continue
+        cfg = ChunkScanConfig(
+            D=query_dim,
+            P=value_dim,
+            L=L,
+            m_block_size=m_block_size,
+            n_block_size=n_block_size,
+            num_threads=num_threads,
+        )
+        if ChunkScanInnerAmpereTc.can_implement(cutlass_in, cutlass_out, cfg):
+            return m_block_size, n_block_size, num_threads
+
+    return 128, L, 128
+
+
+def _get_compiled_db_raw(
+    Q: torch.Tensor,
+    Kprev: torch.Tensor,
+    Vprev: torch.Tensor,
+    Kcurr: torch.Tensor,
+    Vcurr: torch.Tensor,
+    logprefix: torch.Tensor,
+    Z0: torch.Tensor,
+    out: torch.Tensor,
+) -> object:
+    device_index = 0 if Q.device.index is None else int(Q.device.index)
+    Dq = int(Q.shape[-1])
+    Dv = int(Vprev.shape[-1])
+    L = int(Q.shape[1])
+    config = _db_raw_config(Dq, Dv, L, dtype=Q.dtype)
+    key: _CompiledRawKey = (
+        device_index,
+        tuple(int(x) for x in Q.shape),
+        tuple(int(x) for x in Kprev.shape),
+        tuple(int(x) for x in Vprev.shape),
+        tuple(int(x) for x in logprefix.shape),
+        tuple(int(x) for x in Z0.shape),
+        config,
+    )
+    compiled = _COMPILED_DB_RAW.get(key)
+    if compiled is not None:
+        return compiled
+
+    m_block_size, n_block_size, num_threads = config
+    cfg = ChunkScanConfig(
+        D=Dq,
+        P=Dv,
+        L=L,
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+        num_threads=num_threads,
+    )
+    kernel = ChunkScanInnerAmpereTc(cfg)
+    compiled = cute.compile(
+        kernel,
+        from_dlpack(Q, assumed_align=16),
+        from_dlpack(Kprev, assumed_align=16),
+        from_dlpack(Vprev, assumed_align=16),
+        from_dlpack(Kcurr, assumed_align=16),
+        from_dlpack(Vcurr, assumed_align=16),
+        from_dlpack(logprefix, assumed_align=16),
+        from_dlpack(Z0, assumed_align=16),
+        from_dlpack(out, assumed_align=16),
+    )
+    _COMPILED_DB_RAW[key] = compiled
+    return compiled
 
 
 class _ChunkScanBwdDKExactReduce:
@@ -736,7 +844,7 @@ def _chunk_scan_bwd_dk_prepared_cute(
     # stable segment ratio is represented by half of the negated half-logprefix.
     half_neg_logprefix_half_rev = (0.5 * neg_logprefix_half_rev).contiguous()
 
-    compiled_prev = _get_compiled_chunk_scan(
+    compiled_prev = _get_compiled_db_raw(
         Vprev_rev,
         d_out_rev,
         Q_rev,
@@ -746,7 +854,7 @@ def _chunk_scan_bwd_dk_prepared_cute(
         scratch.Z0_zero,
         scratch.dKprev_rev,
     )
-    compiled_curr = _get_compiled_chunk_scan(
+    compiled_curr = _get_compiled_db_raw(
         Vcurr_rev,
         scratch.K_zero,
         scratch.V_zero,
