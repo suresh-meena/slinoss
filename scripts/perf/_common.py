@@ -16,9 +16,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from slinoss.ops.v2x2ssd import v2x2ssd, v2x2ssd_cute  # noqa: E402
-from slinoss.ops.v2x2ssd.cute.autograd import (  # noqa: E402
-    _chunk_scan_bwd_exact_packed,
-    _run_chunk_scan_forward_and_pack,
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.exact import (  # noqa: E402
+    chunk_scan_bwd_exact_packed,
+    run_chunk_scan_forward_and_pack,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment import (  # noqa: E402
     chunk_increment_bwd_cute,
@@ -609,7 +609,7 @@ def _build_chunk_scan_backward_callable(
         Vcurr,
         logprefix_half,
         Z0,
-    ) = _run_chunk_scan_forward_and_pack(
+    ) = run_chunk_scan_forward_and_pack(
         U,
         M,
         K,
@@ -624,7 +624,7 @@ def _build_chunk_scan_backward_callable(
     )
 
     def fn() -> None:
-        _chunk_scan_bwd_exact_packed(
+        chunk_scan_bwd_exact_packed(
             Q,
             Kprev,
             Vprev,

@@ -5,8 +5,10 @@ import math
 import pytest
 import torch
 
-from slinoss.ops.v2x2ssd.cute.autograd import _chunk_scan_bwd_exact_packed
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan import chunk_scan_bwd_cute
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.exact import (
+    chunk_scan_bwd_exact_packed,
+)
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import (
     _pack_chunk_scan_inner_inputs,
     _prepare_chunk_scan_small_operands,
@@ -140,7 +142,7 @@ def test_chunk_scan_bwd_stage_entrypoint_matches_packed_helper() -> None:
         U_head,
         B_head,
     )
-    want = _chunk_scan_bwd_exact_packed(
+    want = chunk_scan_bwd_exact_packed(
         Q,
         Kprev,
         Vprev,
