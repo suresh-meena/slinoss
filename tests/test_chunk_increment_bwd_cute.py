@@ -8,6 +8,7 @@ import torch
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment import (
     chunk_increment_bwd_cute,
     chunk_increment_bwd_prepared_cute,
+    compile_chunk_increment_bwd_kernels,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import (
     chunk_increment_with_prepared_cute,
@@ -189,4 +190,66 @@ def test_chunk_increment_bwd_prepared_entrypoint_matches_public_stage() -> None:
     )
 
     for got_tensor, want_tensor in zip(got_prepared, got_public, strict=True):
+        torch.testing.assert_close(got_tensor, want_tensor, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_chunk_increment_bwd_compile_entrypoint_matches_public_stage() -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    U, M, K, B, B_prev, U_prev = _make_inputs(
+        batch=2,
+        heads=2,
+        T=33,
+        N=8,
+        P=16,
+        device=torch.device("cuda"),
+    )
+
+    inc, m_chunk = reference_chunk_increment(
+        U,
+        M,
+        K,
+        B,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        T=U.shape[2],
+        chunk_size=32,
+        compute_dtype=torch.float32,
+    )
+    d_inc = torch.randn_like(inc)
+    d_m_chunk = torch.randn_like(m_chunk)
+
+    got_public = chunk_increment_bwd_cute(
+        U.detach(),
+        M.detach(),
+        K.detach(),
+        B.detach(),
+        d_inc=d_inc.detach(),
+        d_m_chunk=d_m_chunk.detach(),
+        chunk_size=32,
+        B_prev=B_prev.detach(),
+        U_prev=U_prev.detach(),
+        compute_dtype=torch.float32,
+    )
+
+    compiled = compile_chunk_increment_bwd_kernels(
+        U.detach(),
+        M.detach(),
+        K.detach(),
+        B.detach(),
+        d_inc=d_inc.detach(),
+        d_m_chunk=d_m_chunk.detach(),
+        chunk_size=32,
+        B_prev=B_prev.detach(),
+        U_prev=U_prev.detach(),
+        compute_dtype=torch.float32,
+        return_launchers=True,
+    )
+    got_compiled = compiled[:6]
+    launch_sequential = compiled[6]
+    launch_sequential()
+
+    for got_tensor, want_tensor in zip(got_compiled, got_public, strict=True):
         torch.testing.assert_close(got_tensor, want_tensor, atol=0.0, rtol=0.0)

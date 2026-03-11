@@ -1,25 +1,17 @@
-"""Exact CuTe helpers for the ``chunk_increment`` backward tail.
-
-Logical contract
-----------------
-- ``suffix`` / ``k_prev`` / ``k_curr`` / ``M``: ``(BHC, L, 2)``
-- ``B`` / ``d_alpha``: ``(BHC, L, D)`` with interleaved complex pairs
-- ``b_prev0`` / ``d_boundary``: ``(BHC, D)``
-- ``d_m_chunk``: ``(BHC, 2)``
-
-These kernels keep the public backward numerics exact while moving the hot
-short-sequence reductions off Torch:
-
-- per-row scalar reductions for ``dK_prev``, ``dK_curr``, and ``d_suffix``
-- the reverse scalar scan from ``d_suffix`` / ``d_m_chunk`` into ``dM``
-"""
+"""Parameter scan-backward for the CuTe ``v2x2ssd`` chunk-increment stage."""
 
 from __future__ import annotations
+
+from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass.cute.runtime import from_dlpack
+
+from slinoss.ops.v2x2ssd.reference import _pack_complex_pairs
+
+from .common import ChunkIncrementBwdContext
 
 _ReduceKey = tuple[
     int,
@@ -32,14 +24,14 @@ _COMPILED_REDUCE: dict[_ReduceKey, object] = {}
 _COMPILED_SCAN: dict[_ScanKey, object] = {}
 
 
-class _ChunkIncrementBwdReduce:
-    """Warp reduction for exact scalar tail contributions.
+@dataclass(frozen=True)
+class ChunkIncrementBwdParamScanResult:
+    dK: torch.Tensor
+    dM: torch.Tensor
 
-    Thread/value layout:
-    - one warp owns one ``(bhc, row)`` item
-    - lanes stride over the complex pair axis ``N = D / 2``
-    - outputs are packed ``(re, im)`` complex scalars
-    """
+
+class _ChunkIncrementBwdReduce:
+    """Warp reduction for exact scalar tail contributions."""
 
     def __init__(self, *, num_threads: int = 128) -> None:
         self.num_threads = int(num_threads)
@@ -75,7 +67,7 @@ class _ChunkIncrementBwdReduce:
                 == cutlass.Float32
             )
         ):
-            raise TypeError("chunk_increment tail reduce expects Float32 tensors.")
+            raise TypeError("chunk_increment param scan expects Float32 tensors.")
         if cutlass.const_expr(
             mSuffix.shape != mKPrev.shape
             or mSuffix.shape != mKCurr.shape
@@ -86,7 +78,9 @@ class _ChunkIncrementBwdReduce:
             raise ValueError("suffix/k/dK/dSuffix tensors must share shape.")
         if cutlass.const_expr(mSuffix.shape[2] != 2):
             raise ValueError("suffix/k/dK/dSuffix tensors must be (BHC, L, 2).")
-        if cutlass.const_expr(mB.shape[0] != mSuffix.shape[0] or mB.shape[1] != mSuffix.shape[1]):
+        if cutlass.const_expr(
+            mB.shape[0] != mSuffix.shape[0] or mB.shape[1] != mSuffix.shape[1]
+        ):
             raise ValueError("B and d_alpha must agree on (BHC, L).")
         if cutlass.const_expr(mB.shape != mDAlpha.shape):
             raise ValueError("B and d_alpha must share shape.")
@@ -204,12 +198,24 @@ class _ChunkIncrementBwdReduce:
             n += 32
 
         for offset in (16, 8, 4, 2, 1):
-            dkpr_re += cute.arch.shuffle_sync_bfly(dkpr_re, offset=offset, mask=-1, mask_and_clamp=31)
-            dkpr_im += cute.arch.shuffle_sync_bfly(dkpr_im, offset=offset, mask=-1, mask_and_clamp=31)
-            dkcr_re += cute.arch.shuffle_sync_bfly(dkcr_re, offset=offset, mask=-1, mask_and_clamp=31)
-            dkcr_im += cute.arch.shuffle_sync_bfly(dkcr_im, offset=offset, mask=-1, mask_and_clamp=31)
-            dsuf_re += cute.arch.shuffle_sync_bfly(dsuf_re, offset=offset, mask=-1, mask_and_clamp=31)
-            dsuf_im += cute.arch.shuffle_sync_bfly(dsuf_im, offset=offset, mask=-1, mask_and_clamp=31)
+            dkpr_re += cute.arch.shuffle_sync_bfly(
+                dkpr_re, offset=offset, mask=-1, mask_and_clamp=31
+            )
+            dkpr_im += cute.arch.shuffle_sync_bfly(
+                dkpr_im, offset=offset, mask=-1, mask_and_clamp=31
+            )
+            dkcr_re += cute.arch.shuffle_sync_bfly(
+                dkcr_re, offset=offset, mask=-1, mask_and_clamp=31
+            )
+            dkcr_im += cute.arch.shuffle_sync_bfly(
+                dkcr_im, offset=offset, mask=-1, mask_and_clamp=31
+            )
+            dsuf_re += cute.arch.shuffle_sync_bfly(
+                dsuf_re, offset=offset, mask=-1, mask_and_clamp=31
+            )
+            dsuf_im += cute.arch.shuffle_sync_bfly(
+                dsuf_im, offset=offset, mask=-1, mask_and_clamp=31
+            )
 
         if item_valid and lane == 0:
             mDKPrev[bhc, row, 0] = dkpr_re
@@ -248,7 +254,9 @@ class _ChunkIncrementBwdMScan:
             )
         ):
             raise TypeError("chunk_increment dM scan expects Float32 tensors.")
-        if cutlass.const_expr(mM.shape != mSuffix.shape or mM.shape != mDSuffix.shape or mM.shape != mDM.shape):
+        if cutlass.const_expr(
+            mM.shape != mSuffix.shape or mM.shape != mDSuffix.shape or mM.shape != mDM.shape
+        ):
             raise ValueError("M/suffix/d_suffix/dM tensors must share shape.")
         if cutlass.const_expr(mM.shape[2] != 2):
             raise ValueError("M/suffix/d_suffix/dM must be (BHC, L, 2).")
@@ -360,49 +368,54 @@ def _get_compiled_scan(
     return compiled
 
 
-def chunk_increment_bwd_tail_exact_cute(
-    suffix: torch.Tensor,
-    k_prev: torch.Tensor,
-    k_curr: torch.Tensor,
-    B: torch.Tensor,
-    b_prev0: torch.Tensor,
+def chunk_increment_bwd_param_scan_cute(
+    *,
     d_alpha: torch.Tensor,
     d_boundary: torch.Tensor,
-    M: torch.Tensor,
-    d_m_chunk: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Exact fp32 CuTe kernels for the scalar-heavy chunk_increment tail."""
-    tensors = (
-        ("suffix", suffix),
-        ("k_prev", k_prev),
-        ("k_curr", k_curr),
-        ("B", B),
-        ("b_prev0", b_prev0),
-        ("d_alpha", d_alpha),
-        ("d_boundary", d_boundary),
-        ("M", M),
-        ("d_m_chunk", d_m_chunk),
+    d_m_chunk_flat: torch.Tensor,
+    ctx: ChunkIncrementBwdContext,
+) -> ChunkIncrementBwdParamScanResult:
+    """Run the scalar-heavy parameter scan-backward and pack final outputs."""
+    suffix = (
+        torch.view_as_real(ctx.suffix_after.reshape(ctx.BHC, ctx.L))
+        .to(dtype=ctx.rdtype)
+        .contiguous()
     )
-    if any(t.device.type != "cuda" for _name, t in tensors):
-        raise ValueError("chunk_increment tail CuTe helpers require CUDA tensors.")
-    if any(not t.is_contiguous() for _name, t in tensors):
-        raise ValueError("chunk_increment tail CuTe helpers expect contiguous tensors.")
-    if any(t.dtype != torch.float32 for _name, t in tensors):
-        raise ValueError("chunk_increment tail CuTe helpers expect float32 tensors.")
-    if suffix.shape != k_prev.shape or suffix.shape != k_curr.shape or suffix.shape != M.shape:
-        raise ValueError("suffix, k_prev, k_curr, and M must share shape.")
-    if suffix.shape[2] != 2:
-        raise ValueError("suffix/k/M must be (BHC, L, 2).")
-    if B.shape != d_alpha.shape:
-        raise ValueError("B and d_alpha must share shape.")
-    if B.shape[:2] != suffix.shape[:2]:
-        raise ValueError("B and suffix must agree on (BHC, L).")
-    if b_prev0.shape != (suffix.shape[0], B.shape[2]):
-        raise ValueError("b_prev0 must be (BHC, D).")
-    if d_boundary.shape != b_prev0.shape:
-        raise ValueError("d_boundary must match b_prev0.")
-    if d_m_chunk.shape != (suffix.shape[0], 2):
-        raise ValueError("d_m_chunk must be (BHC, 2).")
+    k_prev = (
+        torch.view_as_real(ctx.k_prev_blk.reshape(ctx.BHC, ctx.L))
+        .to(dtype=ctx.rdtype)
+        .contiguous()
+    )
+    k_curr = (
+        torch.view_as_real(ctx.k_curr_blk.reshape(ctx.BHC, ctx.L))
+        .to(dtype=ctx.rdtype)
+        .contiguous()
+    )
+    B = (
+        _pack_complex_pairs(ctx.b_blk.reshape(ctx.BHC, ctx.L, ctx.N), real_dtype=ctx.rdtype)
+        .reshape(ctx.BHC, ctx.L, ctx.D)
+        .contiguous()
+    )
+    b_prev0 = (
+        _pack_complex_pairs(ctx.b_prev_chunk0.reshape(ctx.BHC, ctx.N), real_dtype=ctx.rdtype)
+        .reshape(ctx.BHC, ctx.D)
+        .contiguous()
+    )
+    d_alpha_packed = (
+        _pack_complex_pairs(d_alpha.reshape(ctx.BHC, ctx.L, ctx.N), real_dtype=ctx.rdtype)
+        .reshape(ctx.BHC, ctx.L, ctx.D)
+        .contiguous()
+    )
+    d_boundary_packed = (
+        _pack_complex_pairs(d_boundary.reshape(ctx.BHC, ctx.N), real_dtype=ctx.rdtype)
+        .reshape(ctx.BHC, ctx.D)
+        .contiguous()
+    )
+    m = (
+        torch.view_as_real(ctx.m_blk.reshape(ctx.BHC, ctx.L))
+        .to(dtype=ctx.rdtype)
+        .contiguous()
+    )
 
     dK_prev = torch.empty_like(suffix)
     dK_curr = torch.empty_like(suffix)
@@ -414,23 +427,41 @@ def chunk_increment_bwd_tail_exact_cute(
         from_dlpack(k_curr, assumed_align=k_curr.element_size()),
         from_dlpack(B, assumed_align=B.element_size()),
         from_dlpack(b_prev0, assumed_align=b_prev0.element_size()),
-        from_dlpack(d_alpha, assumed_align=d_alpha.element_size()),
-        from_dlpack(d_boundary, assumed_align=d_boundary.element_size()),
+        from_dlpack(d_alpha_packed, assumed_align=d_alpha_packed.element_size()),
+        from_dlpack(d_boundary_packed, assumed_align=d_boundary_packed.element_size()),
         from_dlpack(dK_prev, assumed_align=dK_prev.element_size()),
         from_dlpack(dK_curr, assumed_align=dK_curr.element_size()),
         from_dlpack(d_suffix, assumed_align=d_suffix.element_size()),
     )
 
-    dM = torch.empty_like(M)
-    compiled_scan = _get_compiled_scan(M, d_m_chunk)
+    dM = torch.empty_like(m)
+    compiled_scan = _get_compiled_scan(m, d_m_chunk_flat)
     compiled_scan(
-        from_dlpack(M, assumed_align=M.element_size()),
+        from_dlpack(m, assumed_align=m.element_size()),
         from_dlpack(suffix, assumed_align=suffix.element_size()),
         from_dlpack(d_suffix, assumed_align=d_suffix.element_size()),
-        from_dlpack(d_m_chunk, assumed_align=d_m_chunk.element_size()),
+        from_dlpack(d_m_chunk_flat, assumed_align=d_m_chunk_flat.element_size()),
         from_dlpack(dM, assumed_align=dM.element_size()),
     )
-    return dK_prev, dK_curr, d_suffix, dM
+
+    dK_prev_blk = torch.view_as_complex(dK_prev.contiguous()).reshape(
+        ctx.batch_size, ctx.n_heads, ctx.n_chunks, ctx.L
+    )
+    dK_curr_blk = torch.view_as_complex(dK_curr.contiguous()).reshape(
+        ctx.batch_size, ctx.n_heads, ctx.n_chunks, ctx.L
+    )
+    dK_blk = torch.stack((dK_prev_blk, dK_curr_blk), dim=-1)
+    dK = torch.view_as_real(
+        dK_blk.reshape(ctx.batch_size, ctx.n_heads, ctx.T_pad, 2)
+    )
+    dK = dK.reshape(ctx.batch_size, ctx.n_heads, ctx.T_pad, 2, 2).to(dtype=ctx.rdtype)
+    dK = dK[:, :, : ctx.T, :, :].contiguous()
+
+    dM_blk = torch.view_as_complex(dM.contiguous()).reshape_as(ctx.m_blk)
+    dM_out = torch.view_as_real(dM_blk.reshape(ctx.batch_size, ctx.n_heads, ctx.T_pad))
+    dM_out = dM_out.to(dtype=ctx.rdtype)[:, :, : ctx.T, :].contiguous()
+
+    return ChunkIncrementBwdParamScanResult(dK=dK, dM=dM_out)
 
 
-__all__ = ["chunk_increment_bwd_tail_exact_cute"]
+__all__ = ["ChunkIncrementBwdParamScanResult", "chunk_increment_bwd_param_scan_cute"]
