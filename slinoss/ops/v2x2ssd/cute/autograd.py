@@ -45,6 +45,7 @@ from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import (
     _get_compiled_chunk_scan,
     _pack_chunk_scan_inner_inputs,
     _prepare_chunk_scan_small_operands,
+    chunk_scan_cute,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.state_passing import state_passing_cute
 
@@ -493,31 +494,18 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
             initial_states=initial_states_d,
             compute_dtype=compute_dtype,
         )
-        (
-            Y,
-            M_raw,
-            K_raw,
-            B_raw,
-            B_head,
-            Q,
-            Kprev,
-            Vprev,
-            Kcurr,
-            Vcurr,
-            logprefix_half,
-            Z0,
-        ) = _run_chunk_scan_forward_and_pack(
+        Y = chunk_scan_cute(
             U_d,
             M_d,
             K_d,
             B_d,
             C_d,
             chunk_starts,
-            chunk_size=ctx.chunk_size,
             B_prev=B_prev_d,
             U_prev=U_prev_d,
-            compute_dtype=compute_dtype,
             output_dtype=output_dtype,
+            chunk_size=ctx.chunk_size,
+            compute_dtype=compute_dtype,
         )
 
         saved: list[torch.Tensor] = [
@@ -528,17 +516,6 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
             C_d,
             m_chunk,
             chunk_starts,
-            M_raw,
-            K_raw,
-            B_raw,
-            B_head,
-            Q,
-            Kprev,
-            Vprev,
-            Kcurr,
-            Vcurr,
-            logprefix_half,
-            Z0,
         ]
         if initial_states_d is not None:
             saved.append(initial_states_d)
@@ -584,9 +561,6 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
         idx += 1
         chunk_starts = saved[idx]
         idx += 1
-        # Packed chunk-scan forward artifacts are still in the save-set for now,
-        # but the hot backward path no longer binds them directly.
-        idx += 11
 
         initial_states = None
         if ctx.has_initial_states:
