@@ -16,6 +16,7 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment.common import (
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.param import (
     _chunk_scan_bwd_param_from_intermediates,
 )
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan import chunk_scan_bwd_cute
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.dc import (
     chunk_scan_bwd_dc_packed_cute,
     chunk_scan_bwd_dc_exact_cute,
@@ -583,28 +584,9 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
         idx += 1
         chunk_starts = saved[idx]
         idx += 1
-        M_raw = saved[idx]
-        idx += 1
-        K_raw = saved[idx]
-        idx += 1
-        B_raw = saved[idx]
-        idx += 1
-        B_head = saved[idx]
-        idx += 1
-        Q = saved[idx]
-        idx += 1
-        Kprev = saved[idx]
-        idx += 1
-        Vprev = saved[idx]
-        idx += 1
-        Kcurr = saved[idx]
-        idx += 1
-        Vcurr = saved[idx]
-        idx += 1
-        logprefix_half = saved[idx]
-        idx += 1
-        Z0 = saved[idx]
-        idx += 1
+        # Packed chunk-scan forward artifacts are still in the save-set for now,
+        # but the hot backward path no longer binds them directly.
+        idx += 11
 
         initial_states = None
         if ctx.has_initial_states:
@@ -642,22 +624,18 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
                 d_chunk_starts,
                 dB_prev_scan_raw,
                 dU_prev_scan_raw,
-            ) = _chunk_scan_bwd_exact_packed(
-                Q,
-                Kprev,
-                Vprev,
-                Kcurr,
-                Vcurr,
-                logprefix_half,
-                Z0,
-                M_raw,
-                K_raw,
-                B_raw,
-                B_head,
+            ) = chunk_scan_bwd_cute(
+                U,
+                M,
+                K,
+                B,
+                C,
+                chunk_starts,
                 dY,
-                batch_size=batch_size,
-                n_heads=n_heads,
-                T=T,
+                chunk_size=ctx.chunk_size,
+                B_prev=B_prev,
+                U_prev=U_prev,
+                compute_dtype=ctx.compute_dtype,
             )
             if dU_prev_scan is not None:
                 dU_prev_scan = dU_prev_scan_raw
