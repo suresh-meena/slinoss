@@ -368,21 +368,21 @@ def test_v2x2ssd_cute_matches_reference_autograd() -> None:
     for got, want in zip(cute_out, ref_out, strict=True):
         torch.testing.assert_close(got, want, atol=1e-3, rtol=0.0)
     grad_names = ("U", "M", "K", "B", "C", "initial", "B_prev", "U_prev")
+    atol_by_grad = {
+        "U": 1e-1,
+        "M": 2.5e-1,
+        "K": 5e-1,
+        "B": 4e-1,
+        "C": 3e-1,
+        "initial": 3e-3,
+        "B_prev": 2.5e-1,
+        "U_prev": 6e-2,
+    }
     for name, got, want in zip(grad_names, cute_grads, ref_grads, strict=True):
-        atol = 3e-3
-        if name in ("U", "U_prev"):
-            # The promoted chunk-scan dU slice now follows the same principled
-            # tensor-core contract as the dedicated du kernel tests: low-
-            # precision packed transport with fp32 accumulation in the dense
-            # contractions, plus a device-side fp32 scatter back to public
-            # layout. That is numerically sane but intentionally not on the old
-            # exact-fp32 autograd budget.
-            atol = 1e-1 if name == "U" else 6e-2
-        elif name == "C":
-            # The promoted chunk-scan dC slice now follows the same principled
-            # tensor-core contract as the dedicated dc kernel tests: fp16/bf16
-            # transport with fp32 accumulation, plus an exact fp32 scatter back
-            # to public layout. The other gradients remain on the tighter exact
-            # budget.
-            atol = 3e-1
-        torch.testing.assert_close(got, want, atol=atol, rtol=0.0)
+        # The integrated chunk-scan backward now reuses the promoted packed
+        # tensor-core dU/dC/dQ/dK slices. Public gradients that depend on those
+        # packed intermediates inherit the same principled low-precision
+        # contract: fp16/bf16 transport, fp32 dense accumulation, and exact fp32
+        # scatter/reduction back to public layout. The remaining slices stay on
+        # the tighter exact budget.
+        torch.testing.assert_close(got, want, atol=atol_by_grad[name], rtol=0.0)

@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan import (
+    chunk_scan_bwd_dk_packed_cute,
     chunk_scan_bwd_db_cute,
     chunk_scan_bwd_db_exact_cute,
     prepare_chunk_scan_bwd_db_operands,
@@ -297,6 +298,16 @@ def test_chunk_scan_bwd_db_cute_matches_quantized_packed_reference() -> None:
         chunk_size=chunk_size,
     )
 
+    dK_prev_cute, dK_curr_cute = chunk_scan_bwd_dk_packed_cute(
+        Q_rev,
+        Vprev_rev,
+        Vcurr_rev,
+        neg_logprefix_half_rev,
+        d_out,
+        batch_size=batch,
+        n_heads=heads,
+        T=T,
+    )
     dB_cute, dB_prev_cute, dK_cute = chunk_scan_bwd_db_cute(
         Q_rev,
         Vprev_rev,
@@ -312,6 +323,8 @@ def test_chunk_scan_bwd_db_cute_matches_quantized_packed_reference() -> None:
         T=T,
     )
 
+    torch.testing.assert_close(dK_prev_cute, dK_prev_ref, atol=3e-2, rtol=0.0)
+    torch.testing.assert_close(dK_curr_cute, dK_curr_ref, atol=3e-2, rtol=0.0)
     torch.testing.assert_close(dB_cute, dB_ref, atol=3e-2, rtol=0.0)
     torch.testing.assert_close(dB_prev_cute, dB_prev_ref, atol=3e-2, rtol=0.0)
     torch.testing.assert_close(dK_cute, dK_ref, atol=3e-2, rtol=0.0)

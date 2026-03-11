@@ -590,7 +590,7 @@ def _get_db_scratch(
     return scratch
 
 
-def _chunk_scan_bwd_dk_packed_cute(
+def chunk_scan_bwd_dk_packed_cute(
     Q_rev: torch.Tensor,
     Vprev_rev: torch.Tensor,
     Vcurr_rev: torch.Tensor,
@@ -778,7 +778,7 @@ def chunk_scan_bwd_db_cute(
     phase_c = (
         torch.view_as_complex(phase.contiguous()).to(dtype=cplx_dtype).unsqueeze(-1)
     )
-    dKprev_packed, dKcurr_packed = _chunk_scan_bwd_dk_packed_cute(
+    dKprev_packed, dKcurr_packed = chunk_scan_bwd_dk_packed_cute(
         Q_rev,
         Vprev_rev,
         Vcurr_rev,
@@ -856,6 +856,7 @@ def chunk_scan_bwd_db_cute(
 
 __all__ = [
     "prepare_chunk_scan_bwd_db_operands",
+    "chunk_scan_bwd_dk_packed_cute",
     "chunk_scan_bwd_db_cute",
     "chunk_scan_bwd_db_exact_cute",
 ]

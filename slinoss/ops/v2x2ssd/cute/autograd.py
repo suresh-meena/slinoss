@@ -21,7 +21,9 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.dc import (
     chunk_scan_bwd_dc_exact_cute,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.db import (
+    chunk_scan_bwd_dk_packed_cute,
     chunk_scan_bwd_db_exact_cute,
+    prepare_chunk_scan_bwd_db_operands,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.du import (
     chunk_scan_bwd_du_cute,
@@ -37,7 +39,6 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.state_passing import state_passing_bwd
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import chunk_increment_cute
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import (
     batched_sgemm_fp32_cute,
-    pair_sum_batched_sgemm_fp32_cute,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import (
     _get_compiled_chunk_scan,
@@ -324,8 +325,6 @@ def _chunk_scan_bwd_exact_packed(
     score_curr = batched_sgemm_fp32_cute(Qf, Kcurrf.transpose(1, 2))
     dSprev = batched_sgemm_fp32_cute(d_out_flat, Vprevf.transpose(1, 2))
     dScurr = batched_sgemm_fp32_cute(d_out_flat, Vcurrf.transpose(1, 2))
-    dScore_prev = dSprev * scale
-    dScore_curr = dScurr * scale
 
     dZ0 = chunk_scan_bwd_dz0_packed_cute(
         Q.contiguous(),
@@ -362,15 +361,6 @@ def _chunk_scan_bwd_exact_packed(
         T=T,
     )
 
-    dQ = batched_sgemm_fp32_cute(d_out_flat * row_scale, Z0f)
-    dQ = dQ + pair_sum_batched_sgemm_fp32_cute(
-        dScore_prev,
-        Kprevf,
-        dScore_curr,
-        Kcurrf,
-    )
-    dK_prev_packed = batched_sgemm_fp32_cute(dScore_prev.transpose(1, 2), Qf)
-    dK_curr_packed = batched_sgemm_fp32_cute(dScore_curr.transpose(1, 2), Qf)
     y_off = batched_sgemm_fp32_cute(Qf, Z0f.transpose(1, 2)) * row_scale
     d_logprefix_half = chunk_scan_bwd_dlogprefix_exact_cute(
         score_prev,
@@ -382,23 +372,42 @@ def _chunk_scan_bwd_exact_packed(
         d_out_flat,
     )
 
-    phase = _packed_phase_prefix(M_raw)
-    phase_real = torch.view_as_real(phase).to(dtype=torch.float32).contiguous()
-    z0_q = Z0.squeeze(2).transpose(1, 2).unsqueeze(2).contiguous()
-    dC = chunk_scan_bwd_dc_exact_cute(
-        chunk_scan_bwd_dc_packed_cute(
+    Q_rev_db, Vprev_rev, Vcurr_rev, neg_logprefix_half_rev_db, phase_real = (
+        prepare_chunk_scan_bwd_db_operands(
+            Q.contiguous(),
             Vprev.contiguous(),
-            Kprev.contiguous(),
             Vcurr.contiguous(),
-            Kcurr.contiguous(),
             logprefix_half.contiguous(),
-            z0_q,
-            d_out,
-            batch_size=batch_size,
-            n_heads=n_heads,
-            T=T,
-        ),
+            M_raw.contiguous(),
+        )
+    )
+    phase = torch.view_as_complex(phase_real.contiguous())
+    z0_q = Z0.squeeze(2).transpose(1, 2).unsqueeze(2).contiguous()
+    dQ = chunk_scan_bwd_dc_packed_cute(
+        Vprev.contiguous(),
+        Kprev.contiguous(),
+        Vcurr.contiguous(),
+        Kcurr.contiguous(),
+        logprefix_half.contiguous(),
+        z0_q,
+        d_out,
+        batch_size=batch_size,
+        n_heads=n_heads,
+        T=T,
+    )
+    dC = chunk_scan_bwd_dc_exact_cute(
+        dQ,
         phase_real,
+        batch_size=batch_size,
+        n_heads=n_heads,
+        T=T,
+    )
+    dK_prev_packed, dK_curr_packed = chunk_scan_bwd_dk_packed_cute(
+        Q_rev_db,
+        Vprev_rev,
+        Vcurr_rev,
+        neg_logprefix_half_rev_db,
+        d_out_public.contiguous(),
         batch_size=batch_size,
         n_heads=n_heads,
         T=T,
