@@ -196,7 +196,6 @@ def _run_chunk_scan_bwd_pipeline_prepared(
         P=ctx.P,
         D=ctx.D,
     )
-
     dU, dU_prev = _chunk_scan_bwd_du_prepared_cute(
         Q_rev,
         Kprev_rev,
@@ -228,7 +227,7 @@ def _run_chunk_scan_bwd_pipeline_prepared(
         T=ctx.T,
     )
 
-    dK_prev_packed, dK_curr_packed = _chunk_scan_bwd_dk_prepared_cute(
+    dK_prev_packed_rev, dK_curr_packed_rev = _chunk_scan_bwd_dk_prepared_cute(
         Q_rev_db,
         Vprev_rev,
         Vcurr_rev,
@@ -236,10 +235,11 @@ def _run_chunk_scan_bwd_pipeline_prepared(
         d_out_rev,
         batch_size=ctx.batch_size,
         n_heads=ctx.n_heads,
+        reverse_time=True,
     )
     dB, dB_prev, dK = chunk_scan_bwd_db_exact_cute(
-        dK_prev_packed.contiguous(),
-        dK_curr_packed.contiguous(),
+        dK_prev_packed_rev,
+        dK_curr_packed_rev,
         phase,
         K_raw,
         B_raw,
@@ -247,6 +247,7 @@ def _run_chunk_scan_bwd_pipeline_prepared(
         batch_size=ctx.batch_size,
         n_heads=ctx.n_heads,
         T=ctx.T,
+        reverse_time=True,
     )
     dM = chunk_scan_bwd_param_scan_packed_cute(
         Q,
@@ -259,12 +260,13 @@ def _run_chunk_scan_bwd_pipeline_prepared(
         M_raw,
         d_out_flat,
         dQ,
-        dK_prev_packed,
-        dK_curr_packed,
+        dK_prev_packed_rev,
+        dK_curr_packed_rev,
         phase,
         batch_size=ctx.batch_size,
         n_heads=ctx.n_heads,
         T_pad=ctx.T_pad,
+        dK_reverse_time=True,
     )
     return dU, dM[:, :, : ctx.T, :].contiguous(), dK, dB, dC, d_chunk_starts, dB_prev, dU_prev
 

@@ -14,6 +14,7 @@ from .du import prepare_chunk_scan_bwd_du_operands
 
 _CompiledPhaseReduceKey = tuple[
     int,
+    bool,
     torch.dtype,
     torch.dtype,
     tuple[int, int, int],
@@ -285,8 +286,9 @@ class _ChunkScanParamReduce:
     packed backward intermediates.
     """
 
-    def __init__(self, *, num_threads: int = 128) -> None:
+    def __init__(self, *, num_threads: int = 128, reverse_time: bool = False) -> None:
         self.num_threads = int(num_threads)
+        self.reverse_time = bool(reverse_time)
         if self.num_threads <= 0 or self.num_threads % 32 != 0:
             raise ValueError("num_threads must be a positive multiple of 32.")
 
@@ -382,6 +384,11 @@ class _ChunkScanParamReduce:
         item_safe = cutlass.min(item, total_items - cutlass.Int32(1))
         bhc = item_safe // L
         t = item_safe - bhc * L
+        src_t = (
+            (L - cutlass.Int32(1)) - t
+            if cutlass.const_expr(self.reverse_time)
+            else t
+        )
 
         pr = cutlass.Float32(mPhase[bhc, t, 0])
         pi = cutlass.Float32(mPhase[bhc, t, 1])
@@ -404,10 +411,10 @@ class _ChunkScanParamReduce:
 
             dqr = cutlass.Float32(mDQ[bhc, t, col + 0])
             dqi = cutlass.Float32(mDQ[bhc, t, col + 1])
-            dkpr = cutlass.Float32(mDKprev[bhc, t, col + 0])
-            dkpi = cutlass.Float32(mDKprev[bhc, t, col + 1])
-            dkcr = cutlass.Float32(mDKcurr[bhc, t, col + 0])
-            dkci = cutlass.Float32(mDKcurr[bhc, t, col + 1])
+            dkpr = cutlass.Float32(mDKprev[bhc, src_t, col + 0])
+            dkpi = cutlass.Float32(mDKprev[bhc, src_t, col + 1])
+            dkcr = cutlass.Float32(mDKcurr[bhc, src_t, col + 0])
+            dkci = cutlass.Float32(mDKcurr[bhc, src_t, col + 1])
 
             qbr = qr * pr + qi * pi
             qbi = qi * pr - qr * pi
@@ -609,10 +616,13 @@ def _get_compiled_phase_reduce(
     phase: torch.Tensor,
     d_phase: torch.Tensor,
     d_logprefix_half: torch.Tensor,
+    *,
+    reverse_time: bool = False,
 ) -> object:
     device_index = 0 if Q.device.index is None else int(Q.device.index)
     key: _CompiledPhaseReduceKey = (
         device_index,
+        bool(reverse_time),
         Q.dtype,
         dQ.dtype,
         tuple(int(x) for x in Q.shape),
@@ -624,7 +634,7 @@ def _get_compiled_phase_reduce(
     if compiled is not None:
         return compiled
 
-    kernel = _ChunkScanParamReduce()
+    kernel = _ChunkScanParamReduce(reverse_time=reverse_time)
     compiled = cute.compile(
         kernel,
         from_dlpack(Q, assumed_align=Q.element_size()),
@@ -720,6 +730,7 @@ def _chunk_scan_bwd_param_from_intermediates(
     *,
     batch_size: int,
     n_heads: int,
+    dK_reverse_time: bool = False,
 ) -> torch.Tensor:
     """Map packed metadata intermediates onto public ``dM``."""
     BHC, L, _ = map(int, Q_packed.shape)
@@ -738,6 +749,7 @@ def _chunk_scan_bwd_param_from_intermediates(
         phase_real,
         d_phase,
         d_logprefix_half,
+        reverse_time=dK_reverse_time,
     )
     compiled_reduce(
         from_dlpack(Q_packed, assumed_align=Q_packed.element_size()),
@@ -784,6 +796,7 @@ def chunk_scan_bwd_param_scan_packed_cute(
     batch_size: int,
     n_heads: int,
     T_pad: int,
+    dK_reverse_time: bool = False,
 ) -> torch.Tensor:
     """Consume packed ``dQ/dK`` intermediates and produce public ``dM``."""
 
@@ -869,6 +882,7 @@ def chunk_scan_bwd_param_scan_packed_cute(
         d_logprefix_half,
         batch_size=batch_size,
         n_heads=n_heads,
+        dK_reverse_time=dK_reverse_time,
     )
     return dM
 

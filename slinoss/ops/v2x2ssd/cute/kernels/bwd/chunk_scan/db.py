@@ -64,8 +64,14 @@ class _ChunkScanBwdDBScratch:
 
 _ScratchKey = tuple[int, torch.dtype, int, int, int, int]
 _SCRATCH_DB: dict[_ScratchKey, _ChunkScanBwdDBScratch] = {}
-_CompiledScatterKey = tuple[int, tuple[int, int, int], tuple[int, int, int]]
-_CompiledReduceKey = tuple[int, tuple[int, int, int], tuple[int, int], tuple[int, int, int, int]]
+_CompiledScatterKey = tuple[int, bool, tuple[int, int, int], tuple[int, int, int]]
+_CompiledReduceKey = tuple[
+    int,
+    bool,
+    tuple[int, int, int],
+    tuple[int, int],
+    tuple[int, int, int, int],
+]
 _COMPILED_DB_SCATTER: dict[_CompiledScatterKey, object] = {}
 _COMPILED_DK_REDUCE: dict[_CompiledReduceKey, object] = {}
 
@@ -87,9 +93,16 @@ class _ChunkScanBwdDBExactScatter:
       into the final row
     """
 
-    def __init__(self, *, pair_tile: int, num_threads: int = 128) -> None:
+    def __init__(
+        self,
+        *,
+        pair_tile: int,
+        num_threads: int = 128,
+        reverse_time: bool = False,
+    ) -> None:
         self.pair_tile = int(pair_tile)
         self.num_threads = int(num_threads)
+        self.reverse_time = bool(reverse_time)
         if self.pair_tile <= 0 or self.num_threads % self.pair_tile != 0:
             raise ValueError("num_threads must be divisible by pair_tile.")
         self.row_tile = self.num_threads // self.pair_tile
@@ -159,13 +172,18 @@ class _ChunkScanBwdDBExactScatter:
             chunk = bhc - bh * n_chunks
             global_t = chunk * mDKPrev.shape[1] + row
             col = pair_idx * 2
+            src_row = (
+                (mDKPrev.shape[1] - cutlass.Int32(1)) - row
+                if cutlass.const_expr(self.reverse_time)
+                else row
+            )
 
             pr = cutlass.Float32(mPhase[bhc, row, 0])
             pi = cutlass.Float32(mPhase[bhc, row, 1])
-            dkp_re = cutlass.Float32(mDKPrev[bhc, row, col + 0])
-            dkp_im = cutlass.Float32(mDKPrev[bhc, row, col + 1])
-            dkc_re = cutlass.Float32(mDKCurr[bhc, row, col + 0])
-            dkc_im = cutlass.Float32(mDKCurr[bhc, row, col + 1])
+            dkp_re = cutlass.Float32(mDKPrev[bhc, src_row, col + 0])
+            dkp_im = cutlass.Float32(mDKPrev[bhc, src_row, col + 1])
+            dkc_re = cutlass.Float32(mDKCurr[bhc, src_row, col + 0])
+            dkc_im = cutlass.Float32(mDKCurr[bhc, src_row, col + 1])
 
             dbp_re = pr * dkp_re + pi * dkp_im
             dbp_im = pi * dkp_re - pr * dkp_im
@@ -179,10 +197,15 @@ class _ChunkScanBwdDBExactScatter:
 
             next_row = row + 1
             if cute.elem_less(next_row, mDKPrev.shape[1]):
+                next_src_row = (
+                    (mDKPrev.shape[1] - cutlass.Int32(1)) - next_row
+                    if cutlass.const_expr(self.reverse_time)
+                    else next_row
+                )
                 npr = cutlass.Float32(mPhase[bhc, next_row, 0])
                 npi = cutlass.Float32(mPhase[bhc, next_row, 1])
-                ndkp_re = cutlass.Float32(mDKPrev[bhc, next_row, col + 0])
-                ndkp_im = cutlass.Float32(mDKPrev[bhc, next_row, col + 1])
+                ndkp_re = cutlass.Float32(mDKPrev[bhc, next_src_row, col + 0])
+                ndkp_im = cutlass.Float32(mDKPrev[bhc, next_src_row, col + 1])
                 ndbp_re = npr * ndkp_re + npi * ndkp_im
                 ndbp_im = npi * ndkp_re - npr * ndkp_im
                 nkpr = cutlass.Float32(mKRaw[bhc, next_row, 0, 0])
@@ -193,10 +216,15 @@ class _ChunkScanBwdDBExactScatter:
                 next_chunk = chunk + 1
                 if cute.elem_less(next_chunk, n_chunks):
                     next_bhc = bhc + 1
+                    next_src_row = (
+                        mDKPrev.shape[1] - cutlass.Int32(1)
+                        if cutlass.const_expr(self.reverse_time)
+                        else cutlass.Int32(0)
+                    )
                     npr = cutlass.Float32(mPhase[next_bhc, 0, 0])
                     npi = cutlass.Float32(mPhase[next_bhc, 0, 1])
-                    ndkp_re = cutlass.Float32(mDKPrev[next_bhc, 0, col + 0])
-                    ndkp_im = cutlass.Float32(mDKPrev[next_bhc, 0, col + 1])
+                    ndkp_re = cutlass.Float32(mDKPrev[next_bhc, next_src_row, col + 0])
+                    ndkp_im = cutlass.Float32(mDKPrev[next_bhc, next_src_row, col + 1])
                     ndbp_re = npr * ndkp_re + npi * ndkp_im
                     ndbp_im = npi * ndkp_re - npr * ndkp_im
                     nkpr = cutlass.Float32(mKRaw[next_bhc, 0, 0, 0])
@@ -217,8 +245,9 @@ class _ChunkScanBwdDBExactScatter:
 class _ChunkScanBwdDKExactReduce:
     """Warp reduction from exact packed intermediates into public tap gradients."""
 
-    def __init__(self, *, num_threads: int = 128) -> None:
+    def __init__(self, *, num_threads: int = 128, reverse_time: bool = False) -> None:
         self.num_threads = int(num_threads)
+        self.reverse_time = bool(reverse_time)
         if self.num_threads <= 0 or self.num_threads % 32 != 0:
             raise ValueError("num_threads must be a positive multiple of 32.")
 
@@ -289,6 +318,11 @@ class _ChunkScanBwdDKExactReduce:
         bh = bhc // n_chunks
         chunk = bhc - bh * n_chunks
         global_t = chunk * L + row
+        src_row = (
+            (L - cutlass.Int32(1)) - row
+            if cutlass.const_expr(self.reverse_time)
+            else row
+        )
         N = cute.size(mDKPrev.shape[2]) // 2
 
         pr = cutlass.Float32(mPhase[bhc, row, 0])
@@ -301,10 +335,10 @@ class _ChunkScanBwdDKExactReduce:
         n = lane
         while n < N:
             col = n * 2
-            dkp_re = cutlass.Float32(mDKPrev[bhc, row, col + 0])
-            dkp_im = cutlass.Float32(mDKPrev[bhc, row, col + 1])
-            dkc_re = cutlass.Float32(mDKCurr[bhc, row, col + 0])
-            dkc_im = cutlass.Float32(mDKCurr[bhc, row, col + 1])
+            dkp_re = cutlass.Float32(mDKPrev[bhc, src_row, col + 0])
+            dkp_im = cutlass.Float32(mDKPrev[bhc, src_row, col + 1])
+            dkc_re = cutlass.Float32(mDKCurr[bhc, src_row, col + 0])
+            dkc_im = cutlass.Float32(mDKCurr[bhc, src_row, col + 1])
             dbp_re = pr * dkp_re + pi * dkp_im
             dbp_im = pi * dkp_re - pr * dkp_im
             dbc_re = pr * dkc_re + pi * dkc_im
@@ -347,10 +381,13 @@ def _get_compiled_db_exact_scatter(
     K_raw: torch.Tensor,
     dB_pad: torch.Tensor,
     dB_prev: torch.Tensor,
+    *,
+    reverse_time: bool = False,
 ) -> object:
     device_index = 0 if dKprev.device.index is None else int(dKprev.device.index)
     key: _CompiledScatterKey = (
         device_index,
+        bool(reverse_time),
         tuple(int(x) for x in dKprev.shape),
         tuple(int(x) for x in dB_pad.shape),
     )
@@ -358,7 +395,7 @@ def _get_compiled_db_exact_scatter(
     if compiled is not None:
         return compiled
 
-    kernel = _ChunkScanBwdDBExactScatter(pair_tile=16)
+    kernel = _ChunkScanBwdDBExactScatter(pair_tile=16, reverse_time=reverse_time)
     compiled = cute.compile(
         kernel,
         from_dlpack(dKprev, assumed_align=dKprev.element_size()),
@@ -378,10 +415,13 @@ def _get_compiled_dk_exact_reduce(
     phase: torch.Tensor,
     B_head: torch.Tensor,
     dK_pad: torch.Tensor,
+    *,
+    reverse_time: bool = False,
 ) -> object:
     device_index = 0 if dKprev.device.index is None else int(dKprev.device.index)
     key: _CompiledReduceKey = (
         device_index,
+        bool(reverse_time),
         tuple(int(x) for x in dKprev.shape),
         tuple(int(x) for x in B_head.shape),
         tuple(int(x) for x in dK_pad.shape),
@@ -390,7 +430,7 @@ def _get_compiled_dk_exact_reduce(
     if compiled is not None:
         return compiled
 
-    kernel = _ChunkScanBwdDKExactReduce()
+    kernel = _ChunkScanBwdDKExactReduce(reverse_time=reverse_time)
     compiled = cute.compile(
         kernel,
         from_dlpack(dKprev, assumed_align=dKprev.element_size()),
@@ -416,6 +456,7 @@ def chunk_scan_bwd_db_exact_cute(
     batch_size: int,
     n_heads: int,
     T: int,
+    reverse_time: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Exact fp32 CuTe scatter from packed key grads into public ``dB/dB_prev/dK``."""
     tensors = (
@@ -461,12 +502,14 @@ def chunk_scan_bwd_db_exact_cute(
         K_raw,
         dB_pad,
         dB_prev,
+        reverse_time=reverse_time,
     )
     compiled_reduce = _get_compiled_dk_exact_reduce(
         dK_prev_packed,
         phase,
         B_head,
         dK_pad,
+        reverse_time=reverse_time,
     )
 
     compiled_scatter(
@@ -618,6 +661,7 @@ def chunk_scan_bwd_dk_packed_cute(
     batch_size: int,
     n_heads: int,
     T: int,
+    reverse_time: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute packed ``dKprev/dKcurr`` on the cached reverse-time contract."""
     BHC, L, _, D = map(int, Q_rev.shape)
@@ -660,6 +704,7 @@ def chunk_scan_bwd_dk_packed_cute(
         d_out_rev,
         batch_size=batch_size,
         n_heads=n_heads,
+        reverse_time=reverse_time,
     )
 
 
@@ -672,6 +717,7 @@ def _chunk_scan_bwd_dk_prepared_cute(
     *,
     batch_size: int,
     n_heads: int,
+    reverse_time: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute packed ``dKprev/dKcurr`` from already padded reverse-time ``d_out``."""
     if not d_out_rev.is_contiguous():
@@ -710,7 +756,6 @@ def _chunk_scan_bwd_dk_prepared_cute(
         scratch.Z0_zero,
         scratch.dKcurr_rev,
     )
-
     compiled_prev(
         from_dlpack(Vprev_rev, assumed_align=16),
         from_dlpack(d_out_rev, assumed_align=16),
@@ -731,6 +776,8 @@ def _chunk_scan_bwd_dk_prepared_cute(
         from_dlpack(scratch.Z0_zero, assumed_align=16),
         from_dlpack(scratch.dKcurr_rev, assumed_align=16),
     )
+    if reverse_time:
+        return scratch.dKprev_rev.squeeze(2), scratch.dKcurr_rev.squeeze(2)
     return (
         torch.flip(scratch.dKprev_rev.squeeze(2), dims=[1]).contiguous(),
         torch.flip(scratch.dKcurr_rev.squeeze(2), dims=[1]).contiguous(),
