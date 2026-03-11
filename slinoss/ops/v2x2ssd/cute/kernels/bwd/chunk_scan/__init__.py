@@ -97,12 +97,65 @@ def _run_chunk_scan_bwd_pipeline(
         ctx=ctx,
         tc_dtype=ctx.Q.dtype,
     )
+    Q = ctx.Q.contiguous()
+    Kprev = ctx.Kprev.contiguous()
+    Vprev = ctx.Vprev.contiguous()
+    Kcurr = ctx.Kcurr.contiguous()
+    Vcurr = ctx.Vcurr.contiguous()
+    logprefix_half = ctx.logprefix_half.contiguous()
+    M_raw = ctx.M_raw.contiguous()
+    K_raw = ctx.K_raw.to(dtype=torch.float32).contiguous()
+    B_raw = ctx.B_raw.to(dtype=torch.float32).contiguous()
+    B_head = ctx.B_head.to(dtype=torch.float32).contiguous()
+    z0_q = ctx.Z0.squeeze(2).transpose(1, 2).unsqueeze(2).contiguous()
 
-    dZ0 = chunk_scan_bwd_dz0_packed_cute(
-        ctx.Q.contiguous(),
-        ctx.logprefix_half.contiguous(),
-        d_out_flat,
+    return _run_chunk_scan_bwd_pipeline_prepared(
+        ctx=ctx,
+        Q=Q,
+        Kprev=Kprev,
+        Vprev=Vprev,
+        Kcurr=Kcurr,
+        Vcurr=Vcurr,
+        logprefix_half=logprefix_half,
+        M_raw=M_raw,
+        K_raw=K_raw,
+        B_raw=B_raw,
+        B_head=B_head,
+        z0_q=z0_q,
+        d_out_padded=d_out_padded,
+        d_out_flat=d_out_flat,
+        d_out_rev=d_out_rev,
     )
+
+
+def _run_chunk_scan_bwd_pipeline_prepared(
+    *,
+    ctx,
+    Q: torch.Tensor,
+    Kprev: torch.Tensor,
+    Vprev: torch.Tensor,
+    Kcurr: torch.Tensor,
+    Vcurr: torch.Tensor,
+    logprefix_half: torch.Tensor,
+    M_raw: torch.Tensor,
+    K_raw: torch.Tensor,
+    B_raw: torch.Tensor,
+    B_head: torch.Tensor,
+    z0_q: torch.Tensor,
+    d_out_padded: torch.Tensor,
+    d_out_flat: torch.Tensor,
+    d_out_rev: torch.Tensor,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    dZ0 = chunk_scan_bwd_dz0_packed_cute(Q, logprefix_half, d_out_flat)
     d_chunk_starts = _chunk_scan_dz0_to_chunk_starts(
         dZ0,
         batch_size=ctx.batch_size,
@@ -113,18 +166,18 @@ def _run_chunk_scan_bwd_pipeline(
     )
 
     Q_rev, Kprev_rev, Kcurr_rev, neg_logprefix_half_rev = prepare_chunk_scan_bwd_du_operands(
-        ctx.Q.contiguous(),
-        ctx.Kprev.contiguous(),
-        ctx.Kcurr.contiguous(),
-        ctx.logprefix_half.contiguous(),
+        Q,
+        Kprev,
+        Kcurr,
+        logprefix_half,
     )
     Q_rev_db, Vprev_rev, Vcurr_rev, neg_logprefix_half_rev_db, phase = (
         prepare_chunk_scan_bwd_db_operands(
-            ctx.Q.contiguous(),
-            ctx.Vprev.contiguous(),
-            ctx.Vcurr.contiguous(),
-            ctx.logprefix_half.contiguous(),
-            ctx.M_raw.contiguous(),
+            Q,
+            Vprev,
+            Vcurr,
+            logprefix_half,
+            M_raw,
             Q_rev=Q_rev,
             neg_logprefix_half_rev=neg_logprefix_half_rev,
         )
@@ -141,13 +194,12 @@ def _run_chunk_scan_bwd_pipeline(
         T=ctx.T,
     )
 
-    z0_q = ctx.Z0.squeeze(2).transpose(1, 2).unsqueeze(2).contiguous()
     dQ = chunk_scan_bwd_dc_packed_cute(
-        ctx.Vprev.contiguous(),
-        ctx.Kprev.contiguous(),
-        ctx.Vcurr.contiguous(),
-        ctx.Kcurr.contiguous(),
-        ctx.logprefix_half.contiguous(),
+        Vprev,
+        Kprev,
+        Vcurr,
+        Kcurr,
+        logprefix_half,
         z0_q,
         d_out_padded,
         batch_size=ctx.batch_size,
@@ -175,22 +227,22 @@ def _run_chunk_scan_bwd_pipeline(
         dK_prev_packed.contiguous(),
         dK_curr_packed.contiguous(),
         phase,
-        ctx.K_raw.to(dtype=torch.float32).contiguous(),
-        ctx.B_raw.to(dtype=torch.float32).contiguous(),
-        ctx.B_head.to(dtype=torch.float32).contiguous(),
+        K_raw,
+        B_raw,
+        B_head,
         batch_size=ctx.batch_size,
         n_heads=ctx.n_heads,
         T=ctx.T,
     )
     dM = chunk_scan_bwd_param_scan_packed_cute(
-        ctx.Q,
-        ctx.Kprev,
-        ctx.Vprev,
-        ctx.Kcurr,
-        ctx.Vcurr,
-        ctx.logprefix_half,
+        Q,
+        Kprev,
+        Vprev,
+        Kcurr,
+        Vcurr,
+        logprefix_half,
         ctx.Z0,
-        ctx.M_raw,
+        M_raw,
         d_out_flat,
         dQ,
         dK_prev_packed,
@@ -246,20 +298,52 @@ def compile_chunk_scan_bwd_kernels(
         if U_prev is not None
         else torch.empty((U.shape[0], U.shape[1], U.shape[-1]), device=U.device, dtype=torch.float32)
     )
+    ctx = prepare_chunk_scan_bwd_packed_context(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_starts,
+        chunk_size=chunk_size,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        compute_dtype=compute_dtype,
+    )
+    d_out_padded, d_out_flat, d_out_rev = prepare_chunk_scan_bwd_dout(
+        d_out,
+        ctx=ctx,
+        tc_dtype=ctx.Q.dtype,
+    )
+    Q = ctx.Q.contiguous()
+    Kprev = ctx.Kprev.contiguous()
+    Vprev = ctx.Vprev.contiguous()
+    Kcurr = ctx.Kcurr.contiguous()
+    Vcurr = ctx.Vcurr.contiguous()
+    logprefix_half = ctx.logprefix_half.contiguous()
+    M_raw = ctx.M_raw.contiguous()
+    K_raw = ctx.K_raw.to(dtype=torch.float32).contiguous()
+    B_raw = ctx.B_raw.to(dtype=torch.float32).contiguous()
+    B_head = ctx.B_head.to(dtype=torch.float32).contiguous()
+    z0_q = ctx.Z0.squeeze(2).transpose(1, 2).unsqueeze(2).contiguous()
 
     def launch_sequential() -> None:
-        got = _run_chunk_scan_bwd_pipeline(
-            U,
-            M,
-            K,
-            B,
-            C,
-            chunk_starts,
-            d_out,
-            chunk_size=chunk_size,
-            B_prev=B_prev,
-            U_prev=U_prev,
-            compute_dtype=compute_dtype,
+        got = _run_chunk_scan_bwd_pipeline_prepared(
+            ctx=ctx,
+            Q=Q,
+            Kprev=Kprev,
+            Vprev=Vprev,
+            Kcurr=Kcurr,
+            Vcurr=Vcurr,
+            logprefix_half=logprefix_half,
+            M_raw=M_raw,
+            K_raw=K_raw,
+            B_raw=B_raw,
+            B_head=B_head,
+            z0_q=z0_q,
+            d_out_padded=d_out_padded,
+            d_out_flat=d_out_flat,
+            d_out_rev=d_out_rev,
         )
         for out, value in zip(
             (dU, dM, dK, dB, dC, d_chunk_starts, dB_prev_out, dU_prev_out),

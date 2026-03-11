@@ -16,9 +16,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from slinoss.ops.v2x2ssd import v2x2ssd, v2x2ssd_cute  # noqa: E402
-from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.exact import (  # noqa: E402
-    chunk_scan_bwd_exact_packed,
-    run_chunk_scan_forward_and_pack,
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan import (  # noqa: E402
+    compile_chunk_scan_bwd_kernels,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment import (  # noqa: E402
     chunk_increment_bwd_cute,
@@ -596,51 +595,24 @@ def _build_chunk_scan_backward_callable(
         initial_states=initial_states,
         compute_dtype=torch.float32,
     )
-    (
-        _Y,
-        M_raw,
-        K_raw,
-        B_raw,
-        B_head,
-        Q,
-        Kprev,
-        Vprev,
-        Kcurr,
-        Vcurr,
-        logprefix_half,
-        Z0,
-    ) = run_chunk_scan_forward_and_pack(
+    compiled = compile_chunk_scan_bwd_kernels(
         U,
         M,
         K,
         B,
         C,
         starts_cute,
+        dY,
         chunk_size=cfg.chunk_size,
         B_prev=B_prev,
         U_prev=U_prev,
         compute_dtype=torch.float32,
-        output_dtype=torch.float32,
+        return_launchers=True,
     )
+    launch_sequential = compiled[8]
 
     def fn() -> None:
-        chunk_scan_bwd_exact_packed(
-            Q,
-            Kprev,
-            Vprev,
-            Kcurr,
-            Vcurr,
-            logprefix_half,
-            Z0,
-            M_raw,
-            K_raw,
-            B_raw,
-            B_head,
-            dY,
-            batch_size=cfg.batch,
-            n_heads=cfg.heads,
-            T=cfg.T,
-        )
+        launch_sequential()
 
     fn()
     return fn
