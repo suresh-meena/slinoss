@@ -2,7 +2,10 @@
 
 import torch
 
-from .stage import chunk_increment_bwd_stage_cute
+from .stage import (
+    _chunk_increment_bwd_from_prepared_operands,
+    chunk_increment_bwd_stage_cute,
+)
 
 
 def chunk_increment_bwd_cute(
@@ -40,4 +43,47 @@ def chunk_increment_bwd_cute(
     )
 
 
-__all__ = ["chunk_increment_bwd_cute"]
+def chunk_increment_bwd_prepared_cute(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    A_main: torch.Tensor,
+    B_main: torch.Tensor,
+    u_head: torch.Tensor,
+    b_head: torch.Tensor,
+    d_inc: torch.Tensor,
+    d_m_chunk: torch.Tensor,
+    chunk_size: int,
+    B_prev: torch.Tensor | None = None,
+    U_prev: torch.Tensor | None = None,
+    compute_dtype: torch.dtype | None = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Canonical backward entrypoint when forward-prepared operands are available."""
+    return _chunk_increment_bwd_from_prepared_operands(
+        U,
+        M,
+        K,
+        B,
+        A_main=A_main,
+        B_main=B_main,
+        u_head=u_head,
+        b_head=b_head,
+        d_inc=d_inc,
+        d_m_chunk=d_m_chunk,
+        chunk_size=chunk_size,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        compute_dtype=compute_dtype,
+    )
+
+
+__all__ = ["chunk_increment_bwd_cute", "chunk_increment_bwd_prepared_cute"]

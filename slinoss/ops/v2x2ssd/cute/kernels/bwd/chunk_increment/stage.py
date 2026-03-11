@@ -106,12 +106,16 @@ def _prepared_dB_main_cute(
     return dB_main
 
 
-def chunk_increment_bwd_stage_cute(
+def _chunk_increment_bwd_from_prepared_operands(
     U: torch.Tensor,
     M: torch.Tensor,
     K: torch.Tensor,
     B: torch.Tensor,
     *,
+    A_main: torch.Tensor,
+    B_main: torch.Tensor,
+    u_head: torch.Tensor,
+    b_head: torch.Tensor,
     d_inc: torch.Tensor,
     d_m_chunk: torch.Tensor,
     chunk_size: int,
@@ -121,7 +125,7 @@ def chunk_increment_bwd_stage_cute(
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
-    """Low-level stage implementation for ``chunk_increment`` backward."""
+    """Low-level chunk-increment backward using prepared forward operands."""
     batch_size, n_heads, T, N, P = _validate_chunk_increment_inputs(
         U, M, K, B, B_prev, U_prev, int(U.shape[2])
     )
@@ -164,16 +168,6 @@ def chunk_increment_bwd_stage_cute(
             f"{(batch_size, n_heads, n_chunks, 2)}. Got {tuple(d_m_chunk.shape)}."
         )
 
-    A_main, B_main, u_head, b_head, _, _, _, _, _ = _prepare_chunk_increment_operands(
-        U,
-        M,
-        K,
-        B,
-        chunk_size=chunk_size,
-        B_prev=B_prev,
-        U_prev=U_prev,
-        compute_dtype=rdtype,
-    )
     BHC = int(A_main.shape[0])
     d_inc_flat = d_inc.reshape(BHC, P, D).contiguous()
 
@@ -315,4 +309,48 @@ def chunk_increment_bwd_stage_cute(
     return dU, dM, dK, dB, dB_prev, dU_prev.to(dtype=rdtype).contiguous()
 
 
-__all__ = ["chunk_increment_bwd_stage_cute"]
+def chunk_increment_bwd_stage_cute(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    *,
+    d_inc: torch.Tensor,
+    d_m_chunk: torch.Tensor,
+    chunk_size: int,
+    B_prev: torch.Tensor | None = None,
+    U_prev: torch.Tensor | None = None,
+    compute_dtype: torch.dtype | None = None,
+) -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    """Low-level stage implementation for ``chunk_increment`` backward."""
+    A_main, B_main, u_head, b_head, _, _, _, _, _ = _prepare_chunk_increment_operands(
+        U,
+        M,
+        K,
+        B,
+        chunk_size=chunk_size,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        compute_dtype=compute_dtype,
+    )
+    return _chunk_increment_bwd_from_prepared_operands(
+        U,
+        M,
+        K,
+        B,
+        A_main=A_main,
+        B_main=B_main,
+        u_head=u_head,
+        b_head=b_head,
+        d_inc=d_inc,
+        d_m_chunk=d_m_chunk,
+        chunk_size=chunk_size,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        compute_dtype=compute_dtype,
+    )
+
+
+__all__ = ["chunk_increment_bwd_stage_cute", "_chunk_increment_bwd_from_prepared_operands"]
