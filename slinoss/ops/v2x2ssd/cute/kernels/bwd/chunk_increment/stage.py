@@ -50,7 +50,6 @@ from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import (
 )
 from slinoss.ops.v2x2ssd.reference import (
     _as_complex_pairs,
-    _check_finite,
     _complex_dtype_from_real,
     _pack_complex_pairs,
     _pad_time_partial,
@@ -152,7 +151,6 @@ def chunk_increment_bwd_cute(
             raise ValueError(
                 f"{name} must be contiguous; got strides {tensor.stride()}."
             )
-        _check_finite(name, tensor)
 
     n_chunks = (T + int(chunk_size) - 1) // int(chunk_size)
     if d_inc.shape != (batch_size, n_heads, n_chunks, P, D):
