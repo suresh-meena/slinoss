@@ -33,7 +33,8 @@ def chunk_increment_bwd_boundary_cute(
 
     d_b_prev_chunk0 = (
         torch.conj(
-            ctx.suffix_after[..., 0].unsqueeze(-1) * ctx.k_prev_blk[..., 0].unsqueeze(-1)
+            ctx.suffix_after[..., 0].unsqueeze(-1)
+            * ctx.k_prev_blk[..., 0].unsqueeze(-1)
         )
         * d_boundary
     )

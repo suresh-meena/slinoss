@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import cast
+
 import math
 
 import pytest
@@ -169,14 +172,15 @@ def test_compile_state_passing_bwd_kernels_matches_wrapper() -> None:
         m_chunk.detach(),
     )
 
-    _, _, d_inc, d_m_chunk, d_initial, launch_pipeline = (
+    _, _, d_inc, d_m_chunk, d_initial, launch_pipeline = cast(
+        tuple[object, object, torch.Tensor, torch.Tensor, torch.Tensor, Callable[[], None]],
         compile_state_passing_bwd_kernels(
             chunk_starts.detach().to(dtype=torch.float16),
             m_chunk.detach(),
             d_chunk_starts=d_chunk_starts.detach(),
             d_final=d_final.detach(),
             return_launchers=True,
-        )
+        ),
     )
     launch_pipeline()
 

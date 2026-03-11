@@ -40,16 +40,26 @@ def compile_chunk_increment_bwd_prepared_kernels(
     U_prev: torch.Tensor | None = None,
     compute_dtype: torch.dtype | None = None,
     return_launchers: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    Callable[[], None],
-    Callable[[], None],
-]:
+) -> (
+    tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]
+    | tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Callable[[], None],
+        Callable[[], None],
+    ]
+):
     """Compile the split chunk-increment backward pipeline from prepared state."""
     ctx = prepare_chunk_increment_bwd_context(
         U,
@@ -71,12 +81,24 @@ def compile_chunk_increment_bwd_prepared_kernels(
     d_inc_flat = reshape_d_inc(d_inc, ctx)
     d_m_chunk_flat = validate_d_m_chunk(d_m_chunk, ctx)
 
-    dU = torch.empty((ctx.batch_size, ctx.n_heads, ctx.T, ctx.P), device=ctx.device, dtype=ctx.rdtype)
-    dM = torch.empty((ctx.batch_size, ctx.n_heads, ctx.T, 2), device=ctx.device, dtype=ctx.rdtype)
-    dK = torch.empty((ctx.batch_size, ctx.n_heads, ctx.T, 2, 2), device=ctx.device, dtype=ctx.rdtype)
-    dB = torch.empty((ctx.batch_size, ctx.n_heads, ctx.T, ctx.D), device=ctx.device, dtype=ctx.rdtype)
-    dB_prev_out = torch.empty((ctx.batch_size, ctx.n_heads, ctx.D), device=ctx.device, dtype=ctx.rdtype)
-    dU_prev_out = torch.empty((ctx.batch_size, ctx.n_heads, ctx.P), device=ctx.device, dtype=ctx.rdtype)
+    dU = torch.empty(
+        (ctx.batch_size, ctx.n_heads, ctx.T, ctx.P), device=ctx.device, dtype=ctx.rdtype
+    )
+    dM = torch.empty(
+        (ctx.batch_size, ctx.n_heads, ctx.T, 2), device=ctx.device, dtype=ctx.rdtype
+    )
+    dK = torch.empty(
+        (ctx.batch_size, ctx.n_heads, ctx.T, 2, 2), device=ctx.device, dtype=ctx.rdtype
+    )
+    dB = torch.empty(
+        (ctx.batch_size, ctx.n_heads, ctx.T, ctx.D), device=ctx.device, dtype=ctx.rdtype
+    )
+    dB_prev_out = torch.empty(
+        (ctx.batch_size, ctx.n_heads, ctx.D), device=ctx.device, dtype=ctx.rdtype
+    )
+    dU_prev_out = torch.empty(
+        (ctx.batch_size, ctx.n_heads, ctx.P), device=ctx.device, dtype=ctx.rdtype
+    )
 
     db_result = None
     du_result = None
@@ -120,8 +142,15 @@ def compile_chunk_increment_bwd_prepared_kernels(
         )
 
     def _assemble_outputs() -> None:
-        if db_result is None or du_result is None or boundary_result is None or param_result is None:
-            raise RuntimeError("chunk_increment backward pipeline was not fully launched.")
+        if (
+            db_result is None
+            or du_result is None
+            or boundary_result is None
+            or param_result is None
+        ):
+            raise RuntimeError(
+                "chunk_increment backward pipeline was not fully launched."
+            )
         dB_blk = db_result.dB_blk.clone()
         if ctx.n_chunks > 1:
             dB_blk[:, :, :-1, -1, :] += boundary_result.d_b_prev_chunk0[:, :, 1:, :]
@@ -177,7 +206,16 @@ def compile_chunk_increment_bwd_prepared_kernels(
         _assemble_outputs()
 
     if return_launchers:
-        return dU, dM, dK, dB, dB_prev_out, dU_prev_out, launch_sequential, launch_overlapped
+        return (
+            dU,
+            dM,
+            dK,
+            dB,
+            dB_prev_out,
+            dU_prev_out,
+            launch_sequential,
+            launch_overlapped,
+        )
 
     launch_sequential()
     return dU, dM, dK, dB, dB_prev_out, dU_prev_out
@@ -196,16 +234,26 @@ def compile_chunk_increment_bwd_kernels(
     U_prev: torch.Tensor | None = None,
     compute_dtype: torch.dtype | None = None,
     return_launchers: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    Callable[[], None],
-    Callable[[], None],
-]:
+) -> (
+    tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]
+    | tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Callable[[], None],
+        Callable[[], None],
+    ]
+):
     """Compile the split chunk-increment backward pipeline from the public contract."""
     A_main, B_main, u_head, b_head, _, _, _, _, _ = _prepare_chunk_increment_operands(
         U,

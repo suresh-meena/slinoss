@@ -186,7 +186,9 @@ def validate_prepared_state(
                 f"{name} must be contiguous; got strides {tensor.stride()}."
             )
         if tuple(tensor.shape) != expected[name]:
-            raise ValueError(f"{name} must be {expected[name]}. Got {tuple(tensor.shape)}.")
+            raise ValueError(
+                f"{name} must be {expected[name]}. Got {tuple(tensor.shape)}."
+            )
 
 
 def validate_d_m_chunk(

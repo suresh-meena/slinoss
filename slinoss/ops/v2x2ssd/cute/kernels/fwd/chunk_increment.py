@@ -1246,7 +1246,9 @@ def _mark_batched_view(view: torch.Tensor, *, mode: int) -> cute.Tensor:
     raise ValueError(f"Unsupported batched GEMM mode {mode}.")
 
 
-def _batched_sgemm_config(M: int, N: int, K: int) -> tuple[tuple[int, int, int], int, int]:
+def _batched_sgemm_config(
+    M: int, N: int, K: int
+) -> tuple[tuple[int, int, int], int, int]:
     tuned: dict[tuple[int, int, int], tuple[tuple[int, int, int], int, int]] = {
         (32, 32, 32): ((32, 32, 16), 3, 128),
         # Exact chunk_scan backward hot shapes.
@@ -1267,9 +1269,13 @@ def _dummy_a_view(
     dtype: torch.dtype,
 ) -> torch.Tensor:
     if mode == 0:
-        return torch.empty((batch_size, K, M), device=device, dtype=dtype).permute(2, 1, 0)
+        return torch.empty((batch_size, K, M), device=device, dtype=dtype).permute(
+            2, 1, 0
+        )
     if mode == 1:
-        return torch.empty((batch_size, M, K), device=device, dtype=dtype).permute(1, 2, 0)
+        return torch.empty((batch_size, M, K), device=device, dtype=dtype).permute(
+            1, 2, 0
+        )
     raise ValueError(f"Unsupported batched GEMM mode {mode}.")
 
 
@@ -1283,9 +1289,13 @@ def _dummy_b_view(
     dtype: torch.dtype,
 ) -> torch.Tensor:
     if mode == 0:
-        return torch.empty((batch_size, K, N), device=device, dtype=dtype).permute(2, 1, 0)
+        return torch.empty((batch_size, K, N), device=device, dtype=dtype).permute(
+            2, 1, 0
+        )
     if mode == 1:
-        return torch.empty((batch_size, N, K), device=device, dtype=dtype).permute(1, 2, 0)
+        return torch.empty((batch_size, N, K), device=device, dtype=dtype).permute(
+            1, 2, 0
+        )
     raise ValueError(f"Unsupported batched GEMM mode {mode}.")
 
 
@@ -1344,7 +1354,9 @@ def _get_compiled_batch_bmm(
         device=B_view.device,
         dtype=B_view.dtype,
     )
-    dummy_C = torch.empty((batch_size, M, N), device=A_view.device, dtype=A_view.dtype).permute(1, 2, 0)
+    dummy_C = torch.empty(
+        (batch_size, M, N), device=A_view.device, dtype=A_view.dtype
+    ).permute(1, 2, 0)
     compiled = cute.compile(
         kernel,
         _mark_batched_view(dummy_A, mode=a_mode),

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from typing import cast
+
 import math
 
 import pytest
@@ -234,18 +237,30 @@ def test_chunk_increment_bwd_compile_entrypoint_matches_public_stage() -> None:
         compute_dtype=torch.float32,
     )
 
-    compiled = compile_chunk_increment_bwd_kernels(
-        U.detach(),
-        M.detach(),
-        K.detach(),
-        B.detach(),
-        d_inc=d_inc.detach(),
-        d_m_chunk=d_m_chunk.detach(),
-        chunk_size=32,
-        B_prev=B_prev.detach(),
-        U_prev=U_prev.detach(),
-        compute_dtype=torch.float32,
-        return_launchers=True,
+    compiled = cast(
+        tuple[
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            torch.Tensor,
+            Callable[[], None],
+            Callable[[], None],
+        ],
+        compile_chunk_increment_bwd_kernels(
+            U.detach(),
+            M.detach(),
+            K.detach(),
+            B.detach(),
+            d_inc=d_inc.detach(),
+            d_m_chunk=d_m_chunk.detach(),
+            chunk_size=32,
+            B_prev=B_prev.detach(),
+            U_prev=U_prev.detach(),
+            compute_dtype=torch.float32,
+            return_launchers=True,
+        ),
     )
     got_compiled = compiled[:6]
     launch_sequential = compiled[6]

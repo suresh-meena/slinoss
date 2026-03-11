@@ -255,7 +255,9 @@ class _ChunkIncrementBwdMScan:
         ):
             raise TypeError("chunk_increment dM scan expects Float32 tensors.")
         if cutlass.const_expr(
-            mM.shape != mSuffix.shape or mM.shape != mDSuffix.shape or mM.shape != mDM.shape
+            mM.shape != mSuffix.shape
+            or mM.shape != mDSuffix.shape
+            or mM.shape != mDM.shape
         ):
             raise ValueError("M/suffix/d_suffix/dM tensors must share shape.")
         if cutlass.const_expr(mM.shape[2] != 2):
@@ -392,17 +394,23 @@ def chunk_increment_bwd_param_scan_cute(
         .contiguous()
     )
     B = (
-        _pack_complex_pairs(ctx.b_blk.reshape(ctx.BHC, ctx.L, ctx.N), real_dtype=ctx.rdtype)
+        _pack_complex_pairs(
+            ctx.b_blk.reshape(ctx.BHC, ctx.L, ctx.N), real_dtype=ctx.rdtype
+        )
         .reshape(ctx.BHC, ctx.L, ctx.D)
         .contiguous()
     )
     b_prev0 = (
-        _pack_complex_pairs(ctx.b_prev_chunk0.reshape(ctx.BHC, ctx.N), real_dtype=ctx.rdtype)
+        _pack_complex_pairs(
+            ctx.b_prev_chunk0.reshape(ctx.BHC, ctx.N), real_dtype=ctx.rdtype
+        )
         .reshape(ctx.BHC, ctx.D)
         .contiguous()
     )
     d_alpha_packed = (
-        _pack_complex_pairs(d_alpha.reshape(ctx.BHC, ctx.L, ctx.N), real_dtype=ctx.rdtype)
+        _pack_complex_pairs(
+            d_alpha.reshape(ctx.BHC, ctx.L, ctx.N), real_dtype=ctx.rdtype
+        )
         .reshape(ctx.BHC, ctx.L, ctx.D)
         .contiguous()
     )
@@ -451,9 +459,7 @@ def chunk_increment_bwd_param_scan_cute(
         ctx.batch_size, ctx.n_heads, ctx.n_chunks, ctx.L
     )
     dK_blk = torch.stack((dK_prev_blk, dK_curr_blk), dim=-1)
-    dK = torch.view_as_real(
-        dK_blk.reshape(ctx.batch_size, ctx.n_heads, ctx.T_pad, 2)
-    )
+    dK = torch.view_as_real(dK_blk.reshape(ctx.batch_size, ctx.n_heads, ctx.T_pad, 2))
     dK = dK.reshape(ctx.batch_size, ctx.n_heads, ctx.T_pad, 2, 2).to(dtype=ctx.rdtype)
     dK = dK[:, :, : ctx.T, :, :].contiguous()
 

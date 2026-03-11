@@ -325,7 +325,9 @@ def test_v2x2ssd_cute_matches_reference_autograd() -> None:
         torch.randn((2, 2, 16), device="cuda", dtype=torch.float32),
     )
 
-    def run(op, tensors: tuple[torch.Tensor, ...]) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+    def run(
+        op, tensors: tuple[torch.Tensor, ...]
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
         U_i, M_i, K_i, B_i, C_i, init_i, Bp_i, Up_i = tensors
         Y, final_state, b_last, u_last = op(
             U_i,

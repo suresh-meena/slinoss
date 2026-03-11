@@ -18,14 +18,17 @@ def compile_state_passing_bwd_kernels(
     d_chunk_starts: torch.Tensor,
     d_final: torch.Tensor,
     return_launchers: bool = False,
-) -> tuple[object, object, torch.Tensor, torch.Tensor, torch.Tensor] | tuple[
-    object,
-    object,
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor,
-    Callable[[], None],
-]:
+) -> (
+    tuple[object, object, torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[
+        object,
+        object,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        Callable[[], None],
+    ]
+):
     """Compile and allocate the staged ``state_passing`` backward pipeline.
 
     Returns ``(compiled_state, compiled_m, d_inc, d_m_chunk, d_initial)`` and,
@@ -68,7 +71,9 @@ def compile_state_passing_bwd_kernels(
 
     d_inc = torch.empty_like(d_chunk_starts_c)
     d_initial = torch.empty_like(d_final_c)
-    d_m_chunk = torch.empty((B, H, C, 2), device=chunk_starts.device, dtype=torch.float32)
+    d_m_chunk = torch.empty(
+        (B, H, C, 2), device=chunk_starts.device, dtype=torch.float32
+    )
 
     compiled_state = _get_compiled_state_kernel(
         d_chunk_starts_c,

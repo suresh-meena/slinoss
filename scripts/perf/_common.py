@@ -16,18 +16,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from slinoss.ops.v2x2ssd import v2x2ssd, v2x2ssd_cute  # noqa: E402
-from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.__init__ import (  # noqa: E402
-    _run_chunk_scan_bwd_pipeline_prepared,
-)
-from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.common import (  # noqa: E402
-    prepare_chunk_scan_bwd_dout,
-    prepare_chunk_scan_bwd_packed_context,
-)
-from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.db import (  # noqa: E402
-    prepare_chunk_scan_bwd_db_operands,
-)
-from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.du import (  # noqa: E402
-    prepare_chunk_scan_bwd_du_operands,
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan import (  # noqa: E402
+    compile_chunk_scan_bwd_kernels,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment import (  # noqa: E402
     chunk_increment_bwd_cute,
@@ -170,12 +160,8 @@ def make_inputs(cfg: PerfConfig) -> dict[str, torch.Tensor]:
     K = torch.view_as_real(K_complex).to(torch.float32).contiguous()
 
     U = torch.randn((batch, heads, T, P), device=device, dtype=cfg.dtype)
-    B = (
-        torch.randn((batch, heads, T, 2 * N), device=device, dtype=cfg.dtype) * 0.1
-    )
-    C = (
-        torch.randn((batch, heads, T, 2 * N), device=device, dtype=cfg.dtype) * 0.1
-    )
+    B = torch.randn((batch, heads, T, 2 * N), device=device, dtype=cfg.dtype) * 0.1
+    C = torch.randn((batch, heads, T, 2 * N), device=device, dtype=cfg.dtype) * 0.1
     initial_states = torch.randn(
         (batch, heads, P, 2 * N), device=device, dtype=cfg.dtype
     )
@@ -369,7 +355,9 @@ def _build_backward_callable(
             cfg, tensors=tensors, backend=backend
         )
     if stage == "chunk_scan":
-        return _build_chunk_scan_backward_callable(cfg, tensors=tensors, backend=backend)
+        return _build_chunk_scan_backward_callable(
+            cfg, tensors=tensors, backend=backend
+        )
     raise ValueError(f"Unsupported backward stage: {stage}")
 
 
@@ -401,6 +389,7 @@ def _build_chunk_increment_backward_callable(
     d_m_chunk = torch.randn_like(m_chunk)
 
     if backend == "reference":
+
         def fn() -> None:
             U_ref = _clone_requires_grad(U)
             M_ref = _clone_requires_grad(M)
@@ -480,6 +469,7 @@ def _build_state_passing_backward_callable(
     d_final = torch.randn_like(final_ref)
 
     if backend == "reference":
+
         def fn() -> None:
             inc_ref = _clone_requires_grad(inc)
             m_ref = _clone_requires_grad(m_chunk)
@@ -490,7 +480,9 @@ def _build_state_passing_backward_callable(
                 initial_states=initial_ref,
                 compute_dtype=torch.float32,
             )
-            loss = (starts_ref * d_chunk_starts).sum() + (final_state_ref * d_final).sum()
+            loss = (starts_ref * d_chunk_starts).sum() + (
+                final_state_ref * d_final
+            ).sum()
             torch.autograd.grad(loss, (inc_ref, m_ref, initial_ref))
 
         fn()
@@ -545,9 +537,12 @@ def _build_chunk_scan_backward_callable(
         initial_states=initial_states.to(dtype=torch.float32),
         compute_dtype=torch.float32,
     )
-    dY = torch.randn((cfg.batch, cfg.heads, cfg.T, cfg.P), device=U.device, dtype=torch.float32)
+    dY = torch.randn(
+        (cfg.batch, cfg.heads, cfg.T, cfg.P), device=U.device, dtype=torch.float32
+    )
 
     if backend == "reference":
+
         def fn() -> None:
             U_ref = _clone_requires_grad(U)
             M_ref = _clone_requires_grad(M)
@@ -605,76 +600,24 @@ def _build_chunk_scan_backward_callable(
         initial_states=initial_states,
         compute_dtype=torch.float32,
     )
-    ctx = prepare_chunk_scan_bwd_packed_context(
+    compiled = compile_chunk_scan_bwd_kernels(
         U,
         M,
         K,
         B,
         C,
         starts_cute,
+        dY,
         chunk_size=cfg.chunk_size,
         B_prev=B_prev,
         U_prev=U_prev,
         compute_dtype=torch.float32,
+        return_launchers=True,
     )
-    d_out_padded, d_out_flat, d_out_rev = prepare_chunk_scan_bwd_dout(
-        dY,
-        ctx=ctx,
-        tc_dtype=ctx.Q.dtype,
-    )
-    Q = ctx.Q.contiguous()
-    Kprev = ctx.Kprev.contiguous()
-    Vprev = ctx.Vprev.contiguous()
-    Kcurr = ctx.Kcurr.contiguous()
-    Vcurr = ctx.Vcurr.contiguous()
-    logprefix_half = ctx.logprefix_half.contiguous()
-    M_raw = ctx.M_raw.contiguous()
-    K_raw = ctx.K_raw.to(dtype=torch.float32).contiguous()
-    B_raw = ctx.B_raw.to(dtype=torch.float32).contiguous()
-    B_head = ctx.B_head.to(dtype=torch.float32).contiguous()
-    z0_q = ctx.Z0.squeeze(2).transpose(1, 2).unsqueeze(2).contiguous()
-    Q_rev, Kprev_rev, Kcurr_rev, neg_logprefix_half_rev = (
-        prepare_chunk_scan_bwd_du_operands(Q, Kprev, Kcurr, logprefix_half)
-    )
-    Q_rev_db, Vprev_rev, Vcurr_rev, neg_logprefix_half_rev_db, phase = (
-        prepare_chunk_scan_bwd_db_operands(
-            Q,
-            Vprev,
-            Vcurr,
-            logprefix_half,
-            M_raw,
-            Q_rev=Q_rev,
-            neg_logprefix_half_rev=neg_logprefix_half_rev,
-        )
-    )
+    launch_sequential = compiled[-2]
 
     def fn() -> None:
-        _run_chunk_scan_bwd_pipeline_prepared(
-            ctx=ctx,
-            Q=Q,
-            Kprev=Kprev,
-            Vprev=Vprev,
-            Kcurr=Kcurr,
-            Vcurr=Vcurr,
-            logprefix_half=logprefix_half,
-            M_raw=M_raw,
-            K_raw=K_raw,
-            B_raw=B_raw,
-            B_head=B_head,
-            z0_q=z0_q,
-            Q_rev=Q_rev,
-            Kprev_rev=Kprev_rev,
-            Kcurr_rev=Kcurr_rev,
-            neg_logprefix_half_rev=neg_logprefix_half_rev,
-            Q_rev_db=Q_rev_db,
-            Vprev_rev=Vprev_rev,
-            Vcurr_rev=Vcurr_rev,
-            neg_logprefix_half_rev_db=neg_logprefix_half_rev_db,
-            phase=phase,
-            d_out_padded=d_out_padded,
-            d_out_flat=d_out_flat,
-            d_out_rev=d_out_rev,
-        )
+        launch_sequential()
 
     fn()
     return fn
@@ -686,10 +629,22 @@ def _build_full_backward_callable(
     tensors: dict[str, torch.Tensor],
     backend: str,
 ) -> Callable[[], None]:
-    dY = torch.randn((cfg.batch, cfg.heads, cfg.T, cfg.P), device=cfg.torch_device, dtype=torch.float32)
-    d_final = torch.randn((cfg.batch, cfg.heads, cfg.P, cfg.D), device=cfg.torch_device, dtype=torch.float32)
-    dB_last = torch.randn((cfg.batch, cfg.heads, cfg.D), device=cfg.torch_device, dtype=torch.float32)
-    dU_last = torch.randn((cfg.batch, cfg.heads, cfg.P), device=cfg.torch_device, dtype=torch.float32)
+    dY = torch.randn(
+        (cfg.batch, cfg.heads, cfg.T, cfg.P),
+        device=cfg.torch_device,
+        dtype=torch.float32,
+    )
+    d_final = torch.randn(
+        (cfg.batch, cfg.heads, cfg.P, cfg.D),
+        device=cfg.torch_device,
+        dtype=torch.float32,
+    )
+    dB_last = torch.randn(
+        (cfg.batch, cfg.heads, cfg.D), device=cfg.torch_device, dtype=torch.float32
+    )
+    dU_last = torch.randn(
+        (cfg.batch, cfg.heads, cfg.P), device=cfg.torch_device, dtype=torch.float32
+    )
 
     op = v2x2ssd if backend == "reference" else v2x2ssd_cute
 

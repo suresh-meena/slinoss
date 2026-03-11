@@ -99,7 +99,9 @@ def main() -> int:
         for stage in stages:
             by_backend: dict[str, dict[str, float | list[float]]] = {}
             for backend in backends:
-                fn = build_callable(cfg, stage=stage, direction=direction, backend=backend)
+                fn = build_callable(
+                    cfg, stage=stage, direction=direction, backend=backend
+                )
                 stats = benchmark(
                     fn,
                     warmup=args.warmup,

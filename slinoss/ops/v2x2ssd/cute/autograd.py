@@ -18,7 +18,9 @@ from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import chunk_scan_cute
 from slinoss.ops.v2x2ssd.cute.kernels.fwd.state_passing import state_passing_cute
 
 
-def _zero_like_optional(tensor: torch.Tensor | None, *, dtype: torch.dtype) -> torch.Tensor | None:
+def _zero_like_optional(
+    tensor: torch.Tensor | None, *, dtype: torch.dtype
+) -> torch.Tensor | None:
     if tensor is None:
         return None
     return torch.zeros_like(tensor, dtype=dtype)
@@ -51,7 +53,9 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
         K_d = K.detach()
         B_d = B.detach()
         C_d = C.detach()
-        initial_states_d = initial_states.detach() if initial_states is not None else None
+        initial_states_d = (
+            initial_states.detach() if initial_states is not None else None
+        )
         B_prev_d = B_prev.detach() if B_prev is not None else None
         U_prev_d = U_prev.detach() if U_prev is not None else None
 
@@ -107,7 +111,12 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
             saved.append(B_prev_d)
             saved.append(U_prev_d)  # type: ignore[arg-type]
         ctx.save_for_backward(*saved)
-        return Y, final_state.to(dtype=output_dtype or U.dtype).contiguous(), B_last, U_last
+        return (
+            Y,
+            final_state.to(dtype=output_dtype or U.dtype).contiguous(),
+            B_last,
+            U_last,
+        )
 
     @staticmethod
     def backward(  # type: ignore[override]
@@ -279,9 +288,15 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
             dK_total.to(dtype=K.dtype),
             dB_total.to(dtype=B.dtype),
             dC_total.to(dtype=C.dtype),
-            None if initial_states is None or d_initial is None else d_initial.to(dtype=initial_states.dtype),
-            None if B_prev is None or dB_prev_total is None else dB_prev_total.to(dtype=B_prev.dtype),
-            None if U_prev is None or dU_prev_total is None else dU_prev_total.to(dtype=U_prev.dtype),
+            None
+            if initial_states is None or d_initial is None
+            else d_initial.to(dtype=initial_states.dtype),
+            None
+            if B_prev is None or dB_prev_total is None
+            else dB_prev_total.to(dtype=B_prev.dtype),
+            None
+            if U_prev is None or dU_prev_total is None
+            else dU_prev_total.to(dtype=U_prev.dtype),
             None,
             None,
             None,

@@ -12,6 +12,40 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan import (
 from slinoss.ops.v2x2ssd.reference import chunk_increment, state_passing
 
 
+def _public_from_chunked(x: torch.Tensor, *, T: int) -> torch.Tensor:
+    B, H, C, L, F = map(int, x.shape)
+    return x.reshape(B, H, C * L, F)[:, :, :T, :].to(dtype=torch.float32).contiguous()
+
+
+def _fold_chunk_boundary_carries(x: torch.Tensor, x_prev: torch.Tensor) -> torch.Tensor:
+    out = x.clone()
+    if int(out.shape[2]) > 1:
+        out[:, :, :-1, -1, :] = out[:, :, :-1, -1, :] + x_prev[:, :, 1:, :]
+    return out
+
+
+def _public_from_param_scan(x: torch.Tensor, *, T: int) -> torch.Tensor:
+    B, H, C, S, L, F = map(int, x.shape)
+    assert S == 1
+    return (
+        x[:, :, :, 0, :, :]
+        .reshape(B, H, C * L, F)[:, :, :T, :]
+        .to(dtype=torch.float32)
+        .contiguous()
+    )
+
+
+def _public_dk_from_parts(
+    dKprev: torch.Tensor,
+    dKcurr: torch.Tensor,
+    *,
+    T: int,
+) -> torch.Tensor:
+    dKprev_public = _public_from_param_scan(dKprev, T=T)
+    dKcurr_public = _public_from_param_scan(dKcurr, T=T)
+    return torch.stack((dKprev_public, dKcurr_public), dim=3).contiguous()
+
+
 def _make_inputs(
     *,
     batch: int,
@@ -113,9 +147,31 @@ def test_chunk_scan_bwd_compile_entrypoint_matches_public_stage() -> None:
         compute_dtype=torch.float32,
         return_launchers=True,
     )
-    got_compiled = compiled[:8]
-    launch_sequential = compiled[8]
+    dZ0 = compiled[5]
+    dU = compiled[6]
+    dB = compiled[7]
+    dU_prev = compiled[8]
+    dB_prev = compiled[9]
+    dC = compiled[11]
+    dM = compiled[13]
+    dKprev = compiled[14]
+    dKcurr = compiled[15]
+    launch_sequential = compiled[-2]
     launch_sequential()
+
+    dU_public = _fold_chunk_boundary_carries(dU, dU_prev)
+    dB_public = _fold_chunk_boundary_carries(dB, dB_prev)
+
+    got_compiled = (
+        _public_from_chunked(dU_public, T=T),
+        _public_from_param_scan(dM, T=T),
+        _public_dk_from_parts(dKprev, dKcurr, T=T),
+        _public_from_chunked(dB_public, T=T),
+        _public_from_chunked(dC, T=T),
+        dZ0.to(dtype=torch.float32).contiguous(),
+        dB_prev[:, :, 0, :].to(dtype=torch.float32).contiguous(),
+        dU_prev[:, :, 0, :].to(dtype=torch.float32).contiguous(),
+    )
 
     atol_by_slot = (
         0.0,
@@ -127,5 +183,7 @@ def test_chunk_scan_bwd_compile_entrypoint_matches_public_stage() -> None:
         2e-7,
         0.0,
     )
-    for got_tensor, want_tensor, atol in zip(got_compiled, got_public, atol_by_slot, strict=True):
+    for got_tensor, want_tensor, atol in zip(
+        got_compiled, got_public, atol_by_slot, strict=True
+    ):
         torch.testing.assert_close(got_tensor, want_tensor, atol=atol, rtol=0.0)

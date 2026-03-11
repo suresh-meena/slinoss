@@ -98,13 +98,17 @@ def main() -> int:
         device=args.device,
         seed=args.seed,
     )
-    fn = build_callable(cfg, stage=args.stage, direction=args.direction, backend=args.backend)
+    fn = build_callable(
+        cfg, stage=args.stage, direction=args.direction, backend=args.backend
+    )
 
     activities = [torch.profiler.ProfilerActivity.CPU]
     if torch.cuda.is_available():
         activities.append(torch.profiler.ProfilerActivity.CUDA)
 
-    schedule = torch.profiler.schedule(wait=0, warmup=int(args.warmup), active=int(args.active), repeat=1)
+    schedule = torch.profiler.schedule(
+        wait=0, warmup=int(args.warmup), active=int(args.active), repeat=1
+    )
     total_steps = int(args.warmup) + int(args.active)
     with torch.profiler.profile(
         activities=activities,
