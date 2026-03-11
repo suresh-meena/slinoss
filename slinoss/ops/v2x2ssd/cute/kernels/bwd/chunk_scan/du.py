@@ -1055,6 +1055,42 @@ def chunk_scan_bwd_du_cute(
     d_out_rev = torch.flip(
         d_out.reshape(BHC, L, 1, P).to(dtype=Q_rev.dtype), dims=[1]
     ).contiguous()
+    return _chunk_scan_bwd_du_prepared_cute(
+        Q_rev,
+        Kprev_rev,
+        Kcurr_rev,
+        neg_logprefix_half_rev,
+        d_out_rev,
+        batch_size=batch_size,
+        n_heads=n_heads,
+        T=T,
+    )
+
+
+def _chunk_scan_bwd_du_prepared_cute(
+    Q_rev: torch.Tensor,
+    Kprev_rev: torch.Tensor,
+    Kcurr_rev: torch.Tensor,
+    neg_logprefix_half_rev: torch.Tensor,
+    d_out_rev: torch.Tensor,
+    *,
+    batch_size: int,
+    n_heads: int,
+    T: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute ``(dU, dU_prev)`` from already padded reverse-time ``d_out``."""
+    if not d_out_rev.is_contiguous():
+        raise ValueError("d_out_rev must be contiguous.")
+
+    BHC, L, _, _ = map(int, Q_rev.shape)
+    P = int(d_out_rev.shape[-1])
+    BH = int(batch_size) * int(n_heads)
+    if BH <= 0 or BHC % BH != 0:
+        raise ValueError(
+            f"Q_rev leading dim BHC={BHC} is not divisible by batch*heads={BH}."
+        )
+    n_chunks = BHC // BH
+    T_pad = n_chunks * L
 
     scratch = _get_du_scratch(
         q_rev=Q_rev,

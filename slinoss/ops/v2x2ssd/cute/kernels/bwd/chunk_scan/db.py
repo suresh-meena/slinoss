@@ -499,6 +499,9 @@ def prepare_chunk_scan_bwd_db_operands(
     Vcurr: torch.Tensor,
     logprefix_half: torch.Tensor,
     M_raw: torch.Tensor,
+    *,
+    Q_rev: torch.Tensor | None = None,
+    neg_logprefix_half_rev: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build cached reverse-time operands plus phase metadata for the ``dB`` slice."""
     if Q.ndim != 4 or Vprev.ndim != 4 or Vcurr.ndim != 4:
@@ -542,11 +545,26 @@ def prepare_chunk_scan_bwd_db_operands(
         from_dlpack(M_raw, assumed_align=M_raw.element_size()),
         from_dlpack(phase, assumed_align=phase.element_size()),
     )
+    if Q_rev is None:
+        Q_rev = torch.flip(Q, dims=[1]).contiguous()
+    elif not Q_rev.is_contiguous() or Q_rev.shape != Q.shape:
+        raise ValueError("Q_rev must be contiguous and match Q when provided.")
+    if neg_logprefix_half_rev is None:
+        neg_logprefix_half_rev = (-torch.flip(logprefix_half, dims=[1])).contiguous()
+    elif (
+        not neg_logprefix_half_rev.is_contiguous()
+        or neg_logprefix_half_rev.shape != logprefix_half.shape
+    ):
+        raise ValueError(
+            "neg_logprefix_half_rev must be contiguous and match logprefix_half "
+            "when provided."
+        )
+
     return (
-        torch.flip(Q, dims=[1]).contiguous(),
+        Q_rev,
         torch.flip(Vprev, dims=[1]).contiguous(),
         torch.flip(Vcurr, dims=[1]).contiguous(),
-        (-torch.flip(logprefix_half, dims=[1])).contiguous(),
+        neg_logprefix_half_rev,
         phase,
     )
 
@@ -615,8 +633,9 @@ def chunk_scan_bwd_dk_packed_cute(
         raise ValueError(
             f"T={T} exceeds the cached padded length T_pad={T_pad} implied by Q_rev."
         )
+    if not d_out.is_contiguous():
+        raise ValueError("d_out must be contiguous.")
 
-    scratch = _get_db_scratch(vprev_rev=Vprev_rev, D=D)
     if T_pad != T:
         pad = T_pad - T
         d_out = torch.cat(
@@ -633,6 +652,39 @@ def chunk_scan_bwd_dk_packed_cute(
     d_out_rev = torch.flip(
         d_out.reshape(BHC, L, 1, P).to(dtype=Vprev_rev.dtype), dims=[1]
     ).contiguous()
+    return _chunk_scan_bwd_dk_prepared_cute(
+        Q_rev,
+        Vprev_rev,
+        Vcurr_rev,
+        neg_logprefix_half_rev,
+        d_out_rev,
+        batch_size=batch_size,
+        n_heads=n_heads,
+    )
+
+
+def _chunk_scan_bwd_dk_prepared_cute(
+    Q_rev: torch.Tensor,
+    Vprev_rev: torch.Tensor,
+    Vcurr_rev: torch.Tensor,
+    neg_logprefix_half_rev: torch.Tensor,
+    d_out_rev: torch.Tensor,
+    *,
+    batch_size: int,
+    n_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute packed ``dKprev/dKcurr`` from already padded reverse-time ``d_out``."""
+    if not d_out_rev.is_contiguous():
+        raise ValueError("d_out_rev must be contiguous.")
+
+    BHC, _, _, D = map(int, Q_rev.shape)
+    BH = int(batch_size) * int(n_heads)
+    if BH <= 0 or BHC % BH != 0:
+        raise ValueError(
+            f"Q_rev leading dim BHC={BHC} is not divisible by batch*heads={BH}."
+        )
+
+    scratch = _get_db_scratch(vprev_rev=Vprev_rev, D=D)
     # The packed key-gradient contraction needs the same inner-kernel prefix
     # renormalization as the packed ``dQ`` path: after reversing time, the
     # stable segment ratio is represented by half of the negated half-logprefix.

@@ -21,12 +21,12 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.dc import (
     chunk_scan_bwd_dc_exact_cute,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.db import (
-    chunk_scan_bwd_dk_packed_cute,
+    _chunk_scan_bwd_dk_prepared_cute,
     chunk_scan_bwd_db_exact_cute,
     prepare_chunk_scan_bwd_db_operands,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.du import (
-    chunk_scan_bwd_du_cute,
+    _chunk_scan_bwd_du_prepared_cute,
     prepare_chunk_scan_bwd_du_operands,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.dlogprefix import (
@@ -299,7 +299,6 @@ def _chunk_scan_bwd_exact_packed(
     T_pad = n_chunks * L
     N = D // 2
 
-    d_out_public = d_out
     if T_pad != T:
         d_out = torch.cat(
             [
@@ -350,12 +349,15 @@ def _chunk_scan_bwd_exact_packed(
             logprefix_half.contiguous(),
         )
     )
-    dU, dU_prev = chunk_scan_bwd_du_cute(
+    d_out_rev = torch.flip(
+        d_out.reshape(BHC, L, 1, P).to(dtype=Q_rev.dtype), dims=[1]
+    ).contiguous()
+    dU, dU_prev = _chunk_scan_bwd_du_prepared_cute(
         Q_rev,
         Kprev_rev,
         Kcurr_rev,
         neg_logprefix_half_rev,
-        d_out_public.contiguous(),
+        d_out_rev,
         batch_size=batch_size,
         n_heads=n_heads,
         T=T,
@@ -379,6 +381,8 @@ def _chunk_scan_bwd_exact_packed(
             Vcurr.contiguous(),
             logprefix_half.contiguous(),
             M_raw.contiguous(),
+            Q_rev=Q_rev,
+            neg_logprefix_half_rev=neg_logprefix_half_rev,
         )
     )
     phase = torch.view_as_complex(phase_real.contiguous())
@@ -402,15 +406,14 @@ def _chunk_scan_bwd_exact_packed(
         n_heads=n_heads,
         T=T,
     )
-    dK_prev_packed, dK_curr_packed = chunk_scan_bwd_dk_packed_cute(
+    dK_prev_packed, dK_curr_packed = _chunk_scan_bwd_dk_prepared_cute(
         Q_rev_db,
         Vprev_rev,
         Vcurr_rev,
         neg_logprefix_half_rev_db,
-        d_out_public.contiguous(),
+        d_out_rev,
         batch_size=batch_size,
         n_heads=n_heads,
-        T=T,
     )
     dB, dB_prev, dK = chunk_scan_bwd_db_exact_cute(
         dK_prev_packed.contiguous(),
