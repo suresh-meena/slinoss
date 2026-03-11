@@ -9,7 +9,7 @@ from cutlass.cute.runtime import from_dlpack
 
 from .common import prepare_chunk_scan_bwd_dout, prepare_chunk_scan_bwd_packed_context
 from .db import _chunk_scan_bwd_dk_prepared_cute, prepare_chunk_scan_bwd_db_operands
-from .dc import chunk_scan_bwd_dc_packed_cute
+from .dcdr import chunk_scan_bwd_dc_packed_cute
 from .du import prepare_chunk_scan_bwd_du_operands
 
 _CompiledPhaseReduceKey = tuple[

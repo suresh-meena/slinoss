@@ -15,7 +15,7 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.db import (
     chunk_scan_bwd_db_exact_cute,
     prepare_chunk_scan_bwd_db_operands,
 )
-from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.dc import (
+from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan.dcdr import (
     chunk_scan_bwd_dc_exact_cute,
     chunk_scan_bwd_dc_packed_cute,
 )

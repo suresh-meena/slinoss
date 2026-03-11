@@ -12,7 +12,7 @@ from .db import (
     chunk_scan_bwd_db_exact_with_meta_cute,
     prepare_chunk_scan_bwd_db_operands,
 )
-from .dc import (
+from .dcdr import (
     chunk_scan_bwd_dc_exact_with_meta_cute,
     chunk_scan_bwd_dc_packed_cute,
 )

@@ -1,4 +1,4 @@
-"""CuTe backward slice for ``chunk_scan`` gradients into ``C``.
+"""CuTe backward ``dcdr`` slice for ``chunk_scan``.
 
 There are two surfaces here:
 
