@@ -23,7 +23,6 @@ class StatePassingBwdMAmpere:
         self,
         chunk_starts: cute.Tensor,  # (B,H,C,P,D) fp32
         d_inc: cute.Tensor,  # (B,H,C,P,D) fp32
-        m_chunk: cute.Tensor,  # (B,H,C,2) fp32
         d_m_chunk: cute.Tensor,  # (B,H,C,2) fp32
     ):
         B, H, C, P, D = chunk_starts.shape
@@ -31,11 +30,10 @@ class StatePassingBwdMAmpere:
         S = P * D
 
         layout_bcs = cute.make_layout((BH, C, S), stride=(C * S, S, 1))
-        layout_bcm = cute.make_layout((BH, C, 2), stride=(C * 2, 2, 1))
 
         starts_flat = cute.make_tensor(chunk_starts.iterator, layout_bcs)
         dinc_flat = cute.make_tensor(d_inc.iterator, layout_bcs)
-        m_flat = cute.make_tensor(m_chunk.iterator, layout_bcm)
+        layout_bcm = cute.make_layout((BH, C, 2), stride=(C * 2, 2, 1))
         dm_flat = cute.make_tensor(d_m_chunk.iterator, layout_bcm)
 
         tv_layout = cute.make_layout(
@@ -50,7 +48,6 @@ class StatePassingBwdMAmpere:
         self.kernel(
             starts_flat,
             dinc_flat,
-            m_flat,
             dm_flat,
             cS,
             tv_layout,
@@ -64,7 +61,6 @@ class StatePassingBwdMAmpere:
         self,
         starts_flat: cute.Tensor,  # (BH, C, S)
         dinc_flat: cute.Tensor,  # (BH, C, S)
-        m_flat: cute.Tensor,  # (BH, C, 2)
         dm_flat: cute.Tensor,  # (BH, C, 2)
         cS: cute.Tensor,
         tv_layout: cute.Layout,
@@ -75,16 +71,6 @@ class StatePassingBwdMAmpere:
         warp = cute.arch.warp_idx()
 
         S = starts_flat.shape[2]
-
-        copy_m = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            m_flat.element_type,
-            num_bits_per_copy=m_flat.element_type.width * 2,
-        )
-        gM = m_flat[bh, c, None]
-        frgM = cute.make_rmem_tensor_like(gM)
-        cute.copy(copy_m, gM, frgM)
-        frgM.load().to(cutlass.Float32)
 
         copy_vec = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),

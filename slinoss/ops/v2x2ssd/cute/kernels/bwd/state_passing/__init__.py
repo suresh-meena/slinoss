@@ -142,7 +142,7 @@ def compile_state_passing_bwd_kernels(
         )
         k_m = StatePassingBwdMAmpere(cfg, copy_bits_in=copy_bits_state)
         compiled_state = cute.compile(k_state, mDStarts, mDFinal, mM, mDInc, mDInit)
-        compiled_m = cute.compile(k_m, mStarts, mDInc, mM, mDM)
+        compiled_m = cute.compile(k_m, mStarts, mDInc, mDM)
         cached = (compiled_state, compiled_m)
         _COMPILED_CACHE[cache_key] = cached
     else:
@@ -150,7 +150,7 @@ def compile_state_passing_bwd_kernels(
 
     def launch_sequential() -> None:
         compiled_state(mDStarts, mDFinal, mM, mDInc, mDInit)
-        compiled_m(mStarts, mDInc, mM, mDM)
+        compiled_m(mStarts, mDInc, mDM)
 
     def launch_overlapped() -> None:
         launch_sequential()
