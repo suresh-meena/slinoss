@@ -1939,6 +1939,42 @@ class ChunkScanBwdDCDRAmpere:
                         sQZ_tile[t_local, d0 + 1] = out1
             cute.arch.barrier()
 
+            gC_dR = cute.local_tile(
+                mC[bidz, None, 0, None], (kv_tile, Dp), (m_tile, 0)
+            )
+            tCg_dR_async = gmem_thr_copy_D_async.partition_S(gC_dR)
+            tCs_dR_async = gmem_thr_copy_D_async.partition_D(sZ0)
+            if cutlass.const_expr(self.D == Dp):
+                cute.copy(gmem_tiled_copy_D_async, tCg_dR_async, tCs_dR_async)
+            else:
+                cC_dR = cute.local_tile(mcKD_full, (kv_tile, Dp), (m_tile, 0))
+                tCc_dR_async = gmem_thr_copy_D_async.partition_S(cC_dR)
+                tCp_dR_async = cute.make_rmem_tensor(
+                    cute.make_layout(
+                        (
+                            tCs_dR_async.shape[0][1],
+                            cute.size(tCs_dR_async, mode=[1]),
+                            cute.size(tCs_dR_async, mode=[2]),
+                        ),
+                        stride=(cute.size(tCs_dR_async, mode=[2]), 0, 1),
+                    ),
+                    cutlass.Boolean,
+                )
+                for rest_v in cutlass.range_constexpr(tCp_dR_async.shape[0]):
+                    for rest_k in cutlass.range_constexpr(tCp_dR_async.shape[2]):
+                        tCp_dR_async[rest_v, 0, rest_k] = cute.elem_less(
+                            tCc_dR_async[(0, rest_v), 0, rest_k][3], mC.layout.shape[3]
+                        )
+                for vi in cutlass.range_constexpr(cute.size(tCs_dR_async.shape[1])):
+                    if cute.elem_less(tCc_dR_async[0, vi, 0][1], mC.layout.shape[1]):
+                        cute.copy(
+                            gmem_tiled_copy_D_async,
+                            tCg_dR_async[None, vi, None],
+                            tCs_dR_async[None, vi, None],
+                            pred=tCp_dR_async[None, vi, None],
+                        )
+            cute.arch.cp_async_commit_group()
+
             gDC = cute.local_tile(mDC[bidz, None, 0, None], (kv_tile, Dp), (m_tile, 0))
             gmem_thr_store_D = gmem_tiled_store_D.get_slice(tidx)
             tDsC = gmem_thr_store_D.partition_S(sQZ_tile)
@@ -1974,43 +2010,8 @@ class ChunkScanBwdDCDRAmpere:
                             pred=tDpDC[None, rest_m, None],
                         )
 
-            gC_reload = cute.local_tile(
-                mC[bidz, None, 0, None], (kv_tile, Dp), (m_tile, 0)
-            )
-            tCg_reload = gmem_thr_copy_D.partition_S(gC_reload)
-            tQs_reload = gmem_thr_copy_D.partition_D(sQZ_tile)
-            if cutlass.const_expr(self.D == Dp):
-                cute.copy(gmem_tiled_copy_D, tCg_reload, tQs_reload)
-            else:
-                cC_reload = cute.local_tile(mcKD_full, (kv_tile, Dp), (m_tile, 0))
-                tCc_reload = gmem_thr_copy_D.partition_S(cC_reload)
-                tCp_reload = cute.make_rmem_tensor(
-                    cute.make_layout(
-                        (
-                            tQs_reload.shape[0][1],
-                            cute.size(tQs_reload, mode=[1]),
-                            cute.size(tQs_reload, mode=[2]),
-                        ),
-                        stride=(cute.size(tQs_reload, mode=[2]), 0, 1),
-                    ),
-                    cutlass.Boolean,
-                )
-                for rest_v in cutlass.range_constexpr(tCp_reload.shape[0]):
-                    for rest_k in cutlass.range_constexpr(tCp_reload.shape[2]):
-                        tCp_reload[rest_v, 0, rest_k] = cute.elem_less(
-                            tCc_reload[(0, rest_v), 0, rest_k][3], mC.layout.shape[3]
-                        )
-                for vi in cutlass.range_constexpr(cute.size(tQs_reload.shape[1])):
-                    if cute.elem_less(tCc_reload[0, vi, 0][1], mC.layout.shape[1]):
-                        cute.copy(
-                            gmem_tiled_copy_D,
-                            tCg_reload[None, vi, None],
-                            tQs_reload[None, vi, None],
-                            pred=tCp_reload[None, vi, None],
-                        )
-                    else:
-                        tQs_reload[None, vi, None].fill(0)
-            cute.arch.barrier()
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.sync_threads()
 
             nvec = cutlass.Int32(N)
             nvec2 = cutlass.Int32(N2)
@@ -2032,12 +2033,8 @@ class ChunkScanBwdDCDRAmpere:
                             dq1 = cutlass.Float32(
                                 sK_tile[t_local, d0 + 1].to(cutlass.Float32)
                             )
-                            c0 = cutlass.Float32(
-                                sQZ_tile[t_local, d0 + 0].to(cutlass.Float32)
-                            )
-                            c1 = cutlass.Float32(
-                                sQZ_tile[t_local, d0 + 1].to(cutlass.Float32)
-                            )
+                            c0 = cutlass.Float32(sZ0[t_local, d0 + 0].to(cutlass.Float32))
+                            c1 = cutlass.Float32(sZ0[t_local, d0 + 1].to(cutlass.Float32))
                             dR00 = dR00 + dq0 * c0
                             dR01 = dR01 + dq0 * c1
                             dR10 = dR10 + dq1 * c0
@@ -2048,12 +2045,8 @@ class ChunkScanBwdDCDRAmpere:
                             dq3 = cutlass.Float32(
                                 sK_tile[t_local, d0 + 3].to(cutlass.Float32)
                             )
-                            c2 = cutlass.Float32(
-                                sQZ_tile[t_local, d0 + 2].to(cutlass.Float32)
-                            )
-                            c3 = cutlass.Float32(
-                                sQZ_tile[t_local, d0 + 3].to(cutlass.Float32)
-                            )
+                            c2 = cutlass.Float32(sZ0[t_local, d0 + 2].to(cutlass.Float32))
+                            c3 = cutlass.Float32(sZ0[t_local, d0 + 3].to(cutlass.Float32))
                             dR00 = dR00 + dq2 * c2
                             dR01 = dR01 + dq2 * c3
                             dR10 = dR10 + dq3 * c2
@@ -2069,12 +2062,8 @@ class ChunkScanBwdDCDRAmpere:
                             dq1 = cutlass.Float32(
                                 sK_tile[t_local, d0 + 1].to(cutlass.Float32)
                             )
-                            c0 = cutlass.Float32(
-                                sQZ_tile[t_local, d0 + 0].to(cutlass.Float32)
-                            )
-                            c1 = cutlass.Float32(
-                                sQZ_tile[t_local, d0 + 1].to(cutlass.Float32)
-                            )
+                            c0 = cutlass.Float32(sZ0[t_local, d0 + 0].to(cutlass.Float32))
+                            c1 = cutlass.Float32(sZ0[t_local, d0 + 1].to(cutlass.Float32))
                             dR00 = dR00 + dq0 * c0
                             dR01 = dR01 + dq0 * c1
                             dR10 = dR10 + dq1 * c0
