@@ -1,20 +1,15 @@
 from __future__ import annotations
 
 import math
-
 import pytest
 import torch
 
 from slinoss.ops.v2x2ssd import v2x2ssd, v2x2ssd_cute
-from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import (
-    batched_sgemm_fp32_cute,
-    pair_sum_batched_sgemm_fp32_cute,
-)
-from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import (
-    _compiled_key,
+from slinoss.ops.v2x2ssd.cute.kernels.fwd import (
+    compile_chunk_scan_kernel,
     chunk_scan_cute,
+    state_passing_cute,
 )
-from slinoss.ops.v2x2ssd.cute.kernels.fwd.state_passing import state_passing_cute
 from slinoss.ops.v2x2ssd.reference import chunk_increment, chunk_scan, state_passing
 
 
@@ -71,87 +66,69 @@ def _make_scan_inputs(
     return U, M, K, B, C, initial_states, B_prev, U_prev
 
 
-def test_chunk_scan_compiled_key_distinguishes_full_operand_contract() -> None:
-    Q = torch.empty((4, 32, 1, 16), dtype=torch.float16)
-    Kprev = torch.empty((4, 32, 1, 16), dtype=torch.float16)
-    Kcurr = torch.empty((4, 32, 1, 16), dtype=torch.float16)
-    logprefix = torch.empty((4, 32), dtype=torch.float32)
-    Z0 = torch.empty((4, 16, 1, 16), dtype=torch.float16)
-    out = torch.empty((4, 32, 1, 16), dtype=torch.float32)
-
-    Vprev_a = torch.empty((4, 32, 1, 16), dtype=torch.float16)
-    Vprev_b = torch.empty((4, 32, 1, 32), dtype=torch.float16)
-    Vcurr_a = torch.empty((4, 32, 1, 16), dtype=torch.float16)
-    Vcurr_b = torch.empty((4, 32, 1, 32), dtype=torch.float16)
-
-    key_a = _compiled_key(
-        Q,
-        Kprev,
-        Vprev_a,
-        Kcurr,
-        Vcurr_a,
-        logprefix,
-        Z0,
-        out,
-        device_index=0,
-    )
-    key_b = _compiled_key(
-        Q,
-        Kprev,
-        Vprev_b,
-        Kcurr,
-        Vcurr_b,
-        logprefix,
-        Z0,
-        out,
-        device_index=0,
-    )
-
-    assert key_a != key_b
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize(
-    "shape",
-    [(64, 64, 96), (64, 96, 64), (64, 64, 64), (32, 32, 32)],
-)
-def test_batched_sgemm_fp32_cute_matches_torch_bmm_mixed_layouts(
-    shape: tuple[int, int, int],
-) -> None:
+def test_chunk_scan_compile_entrypoint_reuses_cache() -> None:
     pytest.importorskip("cutlass")
     torch.manual_seed(0)
 
-    M, N, K = shape
-    batch = 64
-    A = torch.randn((batch, M, K), device="cuda", dtype=torch.float32)
-    B_base = torch.randn((batch, N, K), device="cuda", dtype=torch.float32)
-    B = B_base.transpose(1, 2)
+    U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
+        batch=2,
+        heads=2,
+        T=64,
+        N=8,
+        P=16,
+        device=torch.device("cuda"),
+    )
+    chunk_size = 32
 
-    got = batched_sgemm_fp32_cute(A, B)
-    want = torch.bmm(A, B)
+    inc_ref, m_ref = chunk_increment(
+        U,
+        M,
+        K,
+        B,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        T=U.shape[2],
+        chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+    )
+    starts_ref, _ = state_passing(
+        inc_ref,
+        m_ref,
+        initial_states=initial_states,
+        compute_dtype=torch.float32,
+    )
 
-    torch.testing.assert_close(got, want, atol=5e-5, rtol=1e-6)
+    compiled_a, out_chunk_a, out_view_a = compile_chunk_scan_kernel(
+        U,
+        M,
+        K,
+        B,
+        C,
+        starts_ref,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+        output_dtype=torch.float32,
+    )
+    compiled_b, out_chunk_b, out_view_b = compile_chunk_scan_kernel(
+        U,
+        M,
+        K,
+        B,
+        C,
+        starts_ref,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+        output_dtype=torch.float32,
+    )
 
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-@pytest.mark.parametrize("shape", [(64, 96, 64), (32, 32, 32)])
-def test_pair_sum_batched_sgemm_fp32_cute_matches_torch(
-    shape: tuple[int, int, int],
-) -> None:
-    pytest.importorskip("cutlass")
-    torch.manual_seed(0)
-
-    M, N, K = shape
-    batch = 64
-    A0 = torch.randn((batch, M, K), device="cuda", dtype=torch.float32)
-    B0 = torch.randn((batch, K, N), device="cuda", dtype=torch.float32)
-    A1 = torch.randn((batch, M, K), device="cuda", dtype=torch.float32)
-    B1 = torch.randn((batch, K, N), device="cuda", dtype=torch.float32)
-
-    got = pair_sum_batched_sgemm_fp32_cute(A0, B0, A1, B1)
-    want = torch.bmm(A0, B0) + torch.bmm(A1, B1)
-
-    torch.testing.assert_close(got, want, atol=5e-5, rtol=1e-6)
+    assert compiled_a is compiled_b
+    assert out_chunk_a.shape == out_chunk_b.shape == (8, 32, 1, 16)
+    assert out_view_a.shape == out_view_b.shape == (2, 2, 64, 16)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -183,13 +160,12 @@ def test_state_passing_cute_matches_reference_stage() -> None:
         inc,
         m_chunk,
         initial_states=initial_states,
-        compute_dtype=torch.float32,
     )
 
-    assert starts_cute.dtype == torch.float16
-    assert final_cute.dtype == torch.float16
-    torch.testing.assert_close(starts_cute.float(), starts_ref, atol=4e-3, rtol=0.0)
-    torch.testing.assert_close(final_cute.float(), final_ref, atol=2e-3, rtol=0.0)
+    assert starts_cute.dtype == torch.float32
+    assert final_cute.dtype == torch.float32
+    torch.testing.assert_close(starts_cute, starts_ref, atol=4e-3, rtol=0.0)
+    torch.testing.assert_close(final_cute, final_ref, atol=2e-3, rtol=0.0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -245,7 +221,7 @@ def test_chunk_scan_cute_matches_reference_stage() -> None:
         K,
         B,
         C,
-        starts_ref.to(dtype=torch.float16),
+        starts_ref,
         B_prev=B_prev,
         U_prev=U_prev,
         chunk_size=chunk_size,

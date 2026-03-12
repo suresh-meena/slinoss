@@ -11,11 +11,11 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment import (
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan import chunk_scan_bwd_cute
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.state_passing import state_passing_bwd_cute
-from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import (
+from slinoss.ops.v2x2ssd.cute.kernels.fwd import (
     chunk_increment_cute,
+    chunk_scan_cute,
+    state_passing_cute,
 )
-from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import chunk_scan_cute
-from slinoss.ops.v2x2ssd.cute.kernels.fwd.state_passing import state_passing_cute
 
 
 def _zero_like_optional(
@@ -54,7 +54,9 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
         B_d = B.detach()
         C_d = C.detach()
         initial_states_d = (
-            initial_states.detach() if initial_states is not None else None
+            initial_states.detach().to(dtype=torch.float32).contiguous()
+            if initial_states is not None
+            else None
         )
         B_prev_d = B_prev.detach() if B_prev is not None else None
         U_prev_d = U_prev.detach() if U_prev is not None else None
@@ -68,15 +70,14 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
             K_d,
             B_d,
             chunk_size=ctx.chunk_size,
-            B_prev=B_prev_d,
-            U_prev=U_prev_d,
+            B_prev0=B_prev_d,
+            U_prev0=U_prev_d,
             compute_dtype=compute_dtype,
         )
         chunk_starts, final_state = state_passing_cute(
             inc,
             m_chunk,
             initial_states=initial_states_d,
-            compute_dtype=compute_dtype,
         )
         Y = chunk_scan_cute(
             U_d,
@@ -87,7 +88,7 @@ class _V2x2SSDCuTeFn(torch.autograd.Function):
             chunk_starts,
             B_prev=B_prev_d,
             U_prev=U_prev_d,
-            output_dtype=output_dtype,
+            output_dtype=output_dtype or U.dtype,
             chunk_size=ctx.chunk_size,
             compute_dtype=compute_dtype,
         )

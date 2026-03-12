@@ -25,11 +25,9 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment import (  # noqa: E402
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.state_passing import (  # noqa: E402
     compile_state_passing_bwd_kernels,
 )
-from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import (  # noqa: E402
+from slinoss.ops.v2x2ssd.cute.kernels.fwd import (  # noqa: E402
     chunk_increment_cute,
-)
-from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import chunk_scan_cute  # noqa: E402
-from slinoss.ops.v2x2ssd.cute.kernels.fwd.state_passing import (  # noqa: E402
+    chunk_scan_cute,
     state_passing_cute,
 )
 from slinoss.ops.v2x2ssd.reference import (  # noqa: E402
@@ -250,8 +248,8 @@ def _build_forward_callable(
                 K,
                 B,
                 chunk_size=cfg.chunk_size,
-                B_prev=B_prev,
-                U_prev=U_prev,
+                B_prev0=B_prev,
+                U_prev0=U_prev,
                 compute_dtype=torch.float32,
             )
         fn()
@@ -274,19 +272,27 @@ def _build_forward_callable(
         K,
         B,
         chunk_size=cfg.chunk_size,
-        B_prev=B_prev,
-        U_prev=U_prev,
+        B_prev0=B_prev,
+        U_prev0=U_prev,
         compute_dtype=torch.float32,
     )
 
     if stage == "state_passing":
-        fn = partial(
-            ref_state_passing if backend == "reference" else state_passing_cute,
-            inc_ref if backend == "reference" else inc_cute,
-            m_ref if backend == "reference" else m_cute,
-            initial_states=initial_states,
-            compute_dtype=torch.float32,
-        )
+        if backend == "reference":
+            fn = partial(
+                ref_state_passing,
+                inc_ref,
+                m_ref,
+                initial_states=initial_states,
+                compute_dtype=torch.float32,
+            )
+        else:
+            fn = partial(
+                state_passing_cute,
+                inc_cute,
+                m_cute,
+                initial_states=initial_states.to(dtype=torch.float32).contiguous(),
+            )
         fn()
         return fn
 
@@ -299,8 +305,7 @@ def _build_forward_callable(
     starts_cute, _ = state_passing_cute(
         inc_cute,
         m_cute,
-        initial_states=initial_states,
-        compute_dtype=torch.float32,
+        initial_states=initial_states.to(dtype=torch.float32).contiguous(),
     )
 
     if stage != "chunk_scan":
@@ -495,8 +500,7 @@ def _build_state_passing_backward_callable(
     chunk_starts_cute, _ = state_passing_cute(
         inc,
         m_chunk,
-        initial_states=initial_states,
-        compute_dtype=torch.float32,
+        initial_states=initial_states.to(dtype=torch.float32).contiguous(),
     )
     compiled = compile_state_passing_bwd_kernels(
         chunk_starts_cute.to(dtype=torch.float32).contiguous(),
@@ -595,15 +599,14 @@ def _build_chunk_scan_backward_callable(
         K,
         B,
         chunk_size=cfg.chunk_size,
-        B_prev=B_prev,
-        U_prev=U_prev,
+        B_prev0=B_prev,
+        U_prev0=U_prev,
         compute_dtype=torch.float32,
     )
     starts_cute, _ = state_passing_cute(
         inc_cute,
         m_cute,
-        initial_states=initial_states,
-        compute_dtype=torch.float32,
+        initial_states=initial_states.to(dtype=torch.float32).contiguous(),
     )
     compiled = compile_chunk_scan_bwd_kernels(
         U,

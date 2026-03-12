@@ -39,9 +39,7 @@ def v2x2ssd_cute(
     import cutlass  # noqa: F401
     import cutlass.cute as cute  # noqa: F401
 
-    from .kernels.fwd.chunk_increment import chunk_increment_cute
-    from .kernels.fwd.chunk_scan import chunk_scan_cute
-    from .kernels.fwd.state_passing import state_passing_cute
+    from .kernels.fwd import chunk_increment_cute, chunk_scan_cute, state_passing_cute
 
     batch_size, n_heads, T, N, P = _validate_inputs(
         U, M, K, B, C, initial_states, B_prev, U_prev
@@ -106,15 +104,18 @@ def v2x2ssd_cute(
         K,
         B,
         chunk_size=chunk_size,
-        B_prev=B_prev,
-        U_prev=U_prev,
+        B_prev0=B_prev,
+        U_prev0=U_prev,
         compute_dtype=rdtype,
     )
     chunk_starts, final_state = state_passing_cute(
         inc,
         m_chunk,
-        initial_states=initial_states,
-        compute_dtype=rdtype,
+        initial_states=(
+            None
+            if initial_states is None
+            else initial_states.to(dtype=torch.float32).contiguous()
+        ),
     )
     Y = chunk_scan_cute(
         U,

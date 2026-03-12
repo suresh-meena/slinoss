@@ -6,9 +6,9 @@ from dataclasses import dataclass
 import pytest
 import torch
 
-from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import (
+from slinoss.ops.v2x2ssd.cute.kernels.fwd import (
     chunk_increment_cute,
-    chunk_increment_with_prepared_cute,
+    compile_chunk_increment_kernel,
 )
 from slinoss.ops.v2x2ssd.reference import chunk_increment as reference_chunk_increment
 
@@ -102,18 +102,18 @@ def test_chunk_increment_cute_matches_reference_stage() -> None:
         inputs.M,
         inputs.K,
         inputs.B,
-        B_prev=inputs.B_prev,
-        U_prev=inputs.U_prev,
+        B_prev0=inputs.B_prev,
+        U_prev0=inputs.U_prev,
         chunk_size=32,
         compute_dtype=torch.float32,
     )
 
-    torch.testing.assert_close(inc_cute, inc_ref, atol=2e-5, rtol=0.0)
+    torch.testing.assert_close(inc_cute, inc_ref, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(m_cute, m_ref, atol=2e-5, rtol=0.0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_chunk_increment_prepared_entrypoint_matches_public_stage() -> None:
+def test_chunk_increment_compile_entrypoint_reuses_cache() -> None:
     pytest.importorskip("cutlass")
     torch.manual_seed(0)
     inputs = _make_inputs(
@@ -127,30 +127,27 @@ def test_chunk_increment_prepared_entrypoint_matches_public_stage() -> None:
         streaming=True,
     )
 
-    inc_public, m_public = chunk_increment_cute(
+    compiled_a, inc_chunk_a, m_chunk_a = compile_chunk_increment_kernel(
         inputs.U,
         inputs.M,
         inputs.K,
         inputs.B,
-        B_prev=inputs.B_prev,
-        U_prev=inputs.U_prev,
+        B_prev0=inputs.B_prev,
+        U_prev0=inputs.U_prev,
         chunk_size=32,
         compute_dtype=torch.float32,
     )
-    inc_prepared, m_prepared, prepared = chunk_increment_with_prepared_cute(
+    compiled_b, inc_chunk_b, m_chunk_b = compile_chunk_increment_kernel(
         inputs.U,
         inputs.M,
         inputs.K,
         inputs.B,
+        B_prev0=inputs.B_prev,
+        U_prev0=inputs.U_prev,
         chunk_size=32,
-        B_prev=inputs.B_prev,
-        U_prev=inputs.U_prev,
         compute_dtype=torch.float32,
     )
 
-    torch.testing.assert_close(inc_prepared, inc_public, atol=0.0, rtol=0.0)
-    torch.testing.assert_close(m_prepared, m_public, atol=0.0, rtol=0.0)
-    assert prepared.A_main.is_contiguous()
-    assert prepared.B_main.is_contiguous()
-    assert prepared.u_head.is_contiguous()
-    assert prepared.b_head.is_contiguous()
+    assert compiled_a is compiled_b
+    assert inc_chunk_a.shape == inc_chunk_b.shape == (8, 16, 16)
+    assert m_chunk_a.shape == m_chunk_b.shape == (8, 2)

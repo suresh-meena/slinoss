@@ -27,11 +27,11 @@ def _load_ops() -> dict[str, Callable]:
         sys.path.insert(0, str(project_root))
 
     from slinoss.ops.v2x2ssd import v2x2ssd, v2x2ssd_cute
-    from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_increment import (
+    from slinoss.ops.v2x2ssd.cute.kernels.fwd import (
         chunk_increment_cute,
+        chunk_scan_cute,
+        state_passing_cute,
     )
-    from slinoss.ops.v2x2ssd.cute.kernels.fwd.chunk_scan import chunk_scan_cute
-    from slinoss.ops.v2x2ssd.cute.kernels.fwd.state_passing import state_passing_cute
     from slinoss.ops.v2x2ssd.reference import (
         chunk_increment as ref_chunk_increment,
     )
@@ -232,8 +232,8 @@ def _build_stage_callable(args: argparse.Namespace, backend: str):
                 K,
                 B,
                 chunk_size=chunk_size,
-                B_prev=B_prev,
-                U_prev=U_prev,
+                B_prev0=B_prev,
+                U_prev0=U_prev,
                 compute_dtype=torch.float32,
             )
         fn()
@@ -256,8 +256,8 @@ def _build_stage_callable(args: argparse.Namespace, backend: str):
         K,
         B,
         chunk_size=chunk_size,
-        B_prev=B_prev,
-        U_prev=U_prev,
+        B_prev0=B_prev,
+        U_prev0=U_prev,
         compute_dtype=torch.float32,
     )
 
@@ -275,8 +275,7 @@ def _build_stage_callable(args: argparse.Namespace, backend: str):
                 ops["state_passing_cute"],
                 inc_cute,
                 m_cute,
-                initial_states=initial_states,
-                compute_dtype=torch.float32,
+                initial_states=initial_states.to(dtype=torch.float32).contiguous(),
             )
         fn()
         return fn
@@ -290,8 +289,7 @@ def _build_stage_callable(args: argparse.Namespace, backend: str):
     starts_cute, _ = ops["state_passing_cute"](
         inc_cute,
         m_cute,
-        initial_states=initial_states,
-        compute_dtype=torch.float32,
+        initial_states=initial_states.to(dtype=torch.float32).contiguous(),
     )
 
     if backend == "reference":
