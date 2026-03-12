@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import cast
-
 import torch
 
 from slinoss.ops.v2x2ssd.reference import (
@@ -40,7 +38,7 @@ def v2x2ssd_cute(
     import cutlass  # noqa: F401
     import cutlass.cute as cute  # noqa: F401
 
-    from .kernels.fwd import chunk_increment_cute, chunk_scan_cute, state_passing_cute
+    from .kernels.fwd import v2x2ssd_fwd_cute
 
     batch_size, n_heads, T, N, P = _validate_inputs(
         U, M, K, B, C, initial_states, B_prev, U_prev
@@ -95,34 +93,17 @@ def v2x2ssd_cute(
             output_dtype=odtype,
         )
 
-    inc, m_chunk = chunk_increment_cute(
-        U,
-        M,
-        K,
-        B,
-        chunk_size=chunk_size,
-        compute_dtype=rdtype,
-    )
-    chunk_starts = cast(
-        torch.Tensor,
-        state_passing_cute(
-            inc,
-            m_chunk,
-            initial_states=None,
-            return_final_state=False,
-        ),
-    )
-    return chunk_scan_cute(
+    Y, _m_chunk, _chunk_starts = v2x2ssd_fwd_cute(
         U,
         M,
         K,
         B,
         C,
-        chunk_starts,
         chunk_size=chunk_size,
         output_dtype=odtype,
         compute_dtype=rdtype,
     )
+    return Y
 
 
 __all__ = ["v2x2ssd_cute"]

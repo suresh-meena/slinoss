@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import torch
+import cutlass
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import from_dlpack, make_ptr
 from typing import Callable
 
 from slinoss.perf import note_cache_event, record_region
@@ -25,6 +26,7 @@ from .state_passing import StatePassingFwdAmpere
 _CHUNK_INCREMENT_CACHE: dict[tuple, object] = {}
 _STATE_PASSING_CACHE: dict[tuple, object] = {}
 _CHUNK_SCAN_CACHE: dict[tuple, object] = {}
+_FWD_HOST_CACHE: dict[tuple, object] = {}
 _ZERO_PREV_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
@@ -73,6 +75,49 @@ def _resolve_chunk_scan_n_block_size(L: int, requested: int) -> int:
         f"No valid n_block_size multiple of 16 divides chunk_size={L} "
         f"for requested n_block_size={requested}."
     )
+
+
+def _make_row_major_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
+    if not shape:
+        return ()
+    stride = [1] * len(shape)
+    running = 1
+    for i in range(len(shape) - 1, -1, -1):
+        stride[i] = running
+        running *= int(shape[i])
+    return tuple(stride)
+
+
+def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
+    align = _assumed_align(t)
+    ptr = make_ptr(
+        _torch_to_cutlass_dtype(t.dtype),
+        t.data_ptr(),
+        cute.AddressSpace.gmem,
+        assumed_align=align,
+    )
+    return ptr, align
+
+
+def _prepare_time_operand(
+    tensor: torch.Tensor,
+    *,
+    T_pad: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    if (
+        tensor.dtype == dtype
+        and int(tensor.shape[2]) == T_pad
+        and tensor.is_contiguous()
+    ):
+        return tensor
+    return _pad_zero_time(tensor, T_pad=T_pad, dtype=dtype)
+
+
+def _prepare_m_operand(M: torch.Tensor, *, T_pad: int) -> torch.Tensor:
+    if int(M.shape[2]) == T_pad and M.dtype == torch.float32 and M.is_contiguous():
+        return M
+    return _pad_m_identity(M, T_pad=T_pad)
 
 
 def _chunk_increment_key(
@@ -709,11 +754,560 @@ def chunk_scan_cute(
     return out_view
 
 
+def _fwd_host_cache_key(
+    *,
+    device_index: int,
+    tc_dtype: torch.dtype,
+    out_dtype: torch.dtype,
+    U_shape: tuple[int, ...],
+    M_shape: tuple[int, ...],
+    K_shape: tuple[int, ...],
+    B_shape: tuple[int, ...],
+    C_shape: tuple[int, ...],
+    chunk_size: int,
+    m_block_size: int,
+    n_block_size: int,
+    scan_num_threads: int,
+    state_num_threads: int,
+    state_vecs_per_thread: int,
+    state_copy_bits_in: int,
+    state_copy_bits_out: int,
+    alignments: tuple[int, ...],
+) -> tuple:
+    return (
+        "v2x2ssd_fwd_host",
+        device_index,
+        tc_dtype,
+        out_dtype,
+        U_shape,
+        M_shape,
+        K_shape,
+        B_shape,
+        C_shape,
+        int(chunk_size),
+        int(m_block_size),
+        int(n_block_size),
+        int(scan_num_threads),
+        int(state_num_threads),
+        int(state_vecs_per_thread),
+        int(state_copy_bits_in),
+        int(state_copy_bits_out),
+        alignments,
+    )
+
+
+def _build_forward_args(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    *,
+    chunk_size: int,
+    compute_dtype: torch.dtype | None,
+    output_dtype: torch.dtype,
+    m_block_size: int | None,
+    n_block_size: int,
+    scan_num_threads: int,
+    state_num_threads: int,
+    state_vecs_per_thread: int,
+) -> tuple[
+    list[object],
+    tuple[int, ...],
+    tuple[int, ...],
+    tuple[int, ...],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+]:
+    if U.device.type != "cuda":
+        raise ValueError("CUDA tensor required.")
+    if U.dtype != B.dtype or U.dtype != C.dtype:
+        raise ValueError("U/B/C must share dtype.")
+    if U.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise TypeError("U/B/C must be float16/bfloat16/float32.")
+    if M.dtype != torch.float32 or K.dtype != torch.float32:
+        raise TypeError("M and K must be float32.")
+    if output_dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise TypeError("output_dtype must be float16/bfloat16/float32.")
+
+    Bsz, H, T, P = map(int, U.shape)
+    D = int(B.shape[-1])
+    if B.shape != (Bsz, H, T, D) or C.shape != (Bsz, H, T, D):
+        raise ValueError("B/C must be (B,H,T,D) matching U.")
+    if M.shape != (Bsz, H, T, 2):
+        raise ValueError(f"M must be (B,H,T,2)={(Bsz, H, T, 2)}.")
+    if K.shape != (Bsz, H, T, 2, 2):
+        raise ValueError(f"K must be (B,H,T,2,2)={(Bsz, H, T, 2, 2)}.")
+    if D % 2 != 0:
+        raise ValueError("B/C last dim must be divisible by 2.")
+
+    L = int(chunk_size)
+    if L <= 0:
+        raise ValueError("chunk_size must be positive.")
+    n_chunks = (T + L - 1) // L
+    T_pad = n_chunks * L
+
+    resolved_m_block = L if m_block_size is None else int(m_block_size)
+    resolved_n_block = _resolve_chunk_scan_n_block_size(L, int(n_block_size))
+    tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
+
+    U_tc = _prepare_time_operand(U, T_pad=T_pad, dtype=tc_dtype)
+    B_tc = _prepare_time_operand(B, T_pad=T_pad, dtype=tc_dtype)
+    C_tc = _prepare_time_operand(C, T_pad=T_pad, dtype=tc_dtype)
+    M_f = _prepare_m_operand(M, T_pad=T_pad)
+    K_f = _prepare_time_operand(K, T_pad=T_pad, dtype=torch.float32)
+
+    U_prev0, B_prev0 = _get_zero_prev_tensors(
+        device=U.device,
+        dtype=tc_dtype,
+        batch_size=Bsz,
+        heads=H,
+        P=P,
+        D=D,
+    )
+
+    inc = torch.empty((Bsz, H, n_chunks, P, D), device=U.device, dtype=torch.float32)
+    m_chunk = torch.empty((Bsz, H, n_chunks, 2), device=U.device, dtype=torch.float32)
+    chunk_starts = torch.empty(
+        (Bsz, H, n_chunks, P, D), device=U.device, dtype=torch.float32
+    )
+    final_state = torch.empty((Bsz, H, P, D), device=U.device, dtype=torch.float32)
+    out_pad = torch.empty((Bsz, H, T_pad, P), device=U.device, dtype=output_dtype)
+
+    state_copy_bits_in = _choose_copy_bits_for_linear_tiles(
+        inc,
+        tile_stride_elems=P * D,
+        elems_per_thread=2 * int(state_vecs_per_thread),
+    )
+    state_copy_bits_out = _choose_copy_bits_for_linear_tiles(
+        chunk_starts,
+        tile_stride_elems=P * D,
+        elems_per_thread=2 * int(state_vecs_per_thread),
+    )
+
+    U_ptr, U_align = _make_ptr_arg(U_tc)
+    B_ptr, B_align = _make_ptr_arg(B_tc)
+    C_ptr, C_align = _make_ptr_arg(C_tc)
+    M_ptr, M_align = _make_ptr_arg(M_f)
+    K_ptr, K_align = _make_ptr_arg(K_f)
+    Kprev_ptr, Kprev_align = _make_ptr_arg(K_f[:, :, :, 0, :])
+    Kcurr_ptr, Kcurr_align = _make_ptr_arg(K_f[:, :, :, 1, :])
+    U_prev_ptr, U_prev_align = _make_ptr_arg(U_prev0)
+    B_prev_ptr, B_prev_align = _make_ptr_arg(B_prev0)
+    inc_ptr, inc_align = _make_ptr_arg(inc)
+    m_chunk_ptr, m_chunk_align = _make_ptr_arg(m_chunk)
+    chunk_starts_ptr, chunk_starts_align = _make_ptr_arg(chunk_starts)
+    final_state_ptr, final_state_align = _make_ptr_arg(final_state)
+    out_ptr, out_align = _make_ptr_arg(out_pad)
+
+    dynamic_args = [
+        U_ptr,
+        B_ptr,
+        C_ptr,
+        M_ptr,
+        K_ptr,
+        Kprev_ptr,
+        Kcurr_ptr,
+        U_prev_ptr,
+        B_prev_ptr,
+        inc_ptr,
+        m_chunk_ptr,
+        chunk_starts_ptr,
+        final_state_ptr,
+        out_ptr,
+    ]
+    alignments = (
+        U_align,
+        B_align,
+        C_align,
+        M_align,
+        K_align,
+        Kprev_align,
+        Kcurr_align,
+        U_prev_align,
+        B_prev_align,
+        inc_align,
+        m_chunk_align,
+        chunk_starts_align,
+        final_state_align,
+        out_align,
+    )
+    spec = (
+        Bsz,
+        H,
+        T_pad,
+        P,
+        D,
+        n_chunks,
+        L,
+    )
+    cfg = (
+        resolved_m_block,
+        resolved_n_block,
+        int(scan_num_threads),
+        int(state_num_threads),
+        int(state_vecs_per_thread),
+        int(state_copy_bits_in),
+        int(state_copy_bits_out),
+    )
+    return (
+        dynamic_args,
+        alignments,
+        spec,
+        cfg,
+        (
+            out_pad[:, :, :T, :],
+            m_chunk,
+            chunk_starts,
+        ),
+    )
+
+
+def _make_v2x2ssd_fwd_host_wrapper(
+    *,
+    spec: tuple[int, ...],
+    cfg: tuple[int, ...],
+):
+    Bsz, H, T_pad, P, D, n_chunks, L = spec
+    (
+        m_block_size,
+        n_block_size,
+        scan_num_threads,
+        state_num_threads,
+        state_vecs_per_thread,
+        state_copy_bits_in,
+        state_copy_bits_out,
+    ) = cfg
+    BH = Bsz * H
+    BHC = BH * n_chunks
+
+    u_inc_shape = (P, T_pad, BH)
+    u_inc_stride = (1, P, T_pad * P)
+    b_inc_shape = (D, T_pad, BH)
+    b_inc_stride = (1, D, T_pad * D)
+    m_inc_shape = (2, T_pad, BH)
+    m_inc_stride = (1, 2, T_pad * 2)
+    k_inc_shape = (2, T_pad, BH)
+    k_inc_stride = (1, 4, T_pad * 4)
+    u_prev_inc_shape = (P, BH)
+    u_prev_inc_stride = (1, P)
+    b_prev_inc_shape = (D, BH)
+    b_prev_inc_stride = (1, D)
+    inc_out_shape = (P, D, BHC)
+    inc_out_stride = (D, 1, P * D)
+    m_chunk_out_shape = (2, BHC)
+    m_chunk_out_stride = (1, 2)
+
+    inc_state_shape = (Bsz, H, n_chunks, P, D)
+    inc_state_stride = _make_row_major_stride(inc_state_shape)
+    m_chunk_state_shape = (Bsz, H, n_chunks, 2)
+    m_chunk_state_stride = _make_row_major_stride(m_chunk_state_shape)
+    chunk_starts_shape = (Bsz, H, n_chunks, P, D)
+    chunk_starts_stride = _make_row_major_stride(chunk_starts_shape)
+    final_state_shape = (Bsz, H, P, D)
+    final_state_stride = _make_row_major_stride(final_state_shape)
+
+    u_scan_shape = (BHC, L, 1, P)
+    u_scan_stride = _make_row_major_stride(u_scan_shape)
+    b_scan_shape = (BHC, L, 1, D)
+    b_scan_stride = _make_row_major_stride(b_scan_shape)
+    c_scan_shape = (BHC, L, 1, D)
+    c_scan_stride = _make_row_major_stride(c_scan_shape)
+    m_scan_shape = (BHC, L, 2)
+    m_scan_stride = _make_row_major_stride(m_scan_shape)
+    k_scan_shape = (BHC, L, 2, 2)
+    k_scan_stride = _make_row_major_stride(k_scan_shape)
+    z0_scan_shape = (BHC, P, 1, D)
+    z0_scan_stride = _make_row_major_stride(z0_scan_shape)
+    u_prev_scan_shape = (BH, P)
+    u_prev_scan_stride = _make_row_major_stride(u_prev_scan_shape)
+    b_prev_scan_shape = (BH, D)
+    b_prev_scan_stride = _make_row_major_stride(b_prev_scan_shape)
+    out_scan_shape = (BHC, L, 1, P)
+    out_scan_stride = _make_row_major_stride(out_scan_shape)
+
+    @cute.jit
+    def _v2x2ssd_fwd_host_wrapper(
+        U_ptr: cute.Pointer,
+        B_ptr: cute.Pointer,
+        C_ptr: cute.Pointer,
+        M_ptr: cute.Pointer,
+        K_ptr: cute.Pointer,
+        Kprev_ptr: cute.Pointer,
+        Kcurr_ptr: cute.Pointer,
+        U_prev_ptr: cute.Pointer,
+        B_prev_ptr: cute.Pointer,
+        inc_ptr: cute.Pointer,
+        m_chunk_ptr: cute.Pointer,
+        chunk_starts_ptr: cute.Pointer,
+        final_state_ptr: cute.Pointer,
+        out_ptr: cute.Pointer,
+    ):
+        mU_inc = cute.make_tensor(
+            U_ptr, cute.make_layout(u_inc_shape, stride=u_inc_stride)
+        )
+        mB_inc = cute.make_tensor(
+            B_ptr, cute.make_layout(b_inc_shape, stride=b_inc_stride)
+        )
+        mM_inc = cute.make_tensor(
+            M_ptr, cute.make_layout(m_inc_shape, stride=m_inc_stride)
+        )
+        mKprev_inc = cute.make_tensor(
+            Kprev_ptr, cute.make_layout(k_inc_shape, stride=k_inc_stride)
+        )
+        mKcurr_inc = cute.make_tensor(
+            Kcurr_ptr, cute.make_layout(k_inc_shape, stride=k_inc_stride)
+        )
+        mU_prev_inc = cute.make_tensor(
+            U_prev_ptr, cute.make_layout(u_prev_inc_shape, stride=u_prev_inc_stride)
+        )
+        mB_prev_inc = cute.make_tensor(
+            B_prev_ptr, cute.make_layout(b_prev_inc_shape, stride=b_prev_inc_stride)
+        )
+        mInc = cute.make_tensor(
+            inc_ptr, cute.make_layout(inc_out_shape, stride=inc_out_stride)
+        )
+        mMchunk = cute.make_tensor(
+            m_chunk_ptr, cute.make_layout(m_chunk_out_shape, stride=m_chunk_out_stride)
+        )
+
+        inc_state_t = cute.make_tensor(
+            inc_ptr, cute.make_layout(inc_state_shape, stride=inc_state_stride)
+        )
+        m_chunk_state_t = cute.make_tensor(
+            m_chunk_ptr,
+            cute.make_layout(m_chunk_state_shape, stride=m_chunk_state_stride),
+        )
+        chunk_starts_state_t = cute.make_tensor(
+            chunk_starts_ptr,
+            cute.make_layout(chunk_starts_shape, stride=chunk_starts_stride),
+        )
+        final_state_t = cute.make_tensor(
+            final_state_ptr,
+            cute.make_layout(final_state_shape, stride=final_state_stride),
+        )
+
+        mU_scan = cute.make_tensor(
+            U_ptr, cute.make_layout(u_scan_shape, stride=u_scan_stride)
+        )
+        mB_scan = cute.make_tensor(
+            B_ptr, cute.make_layout(b_scan_shape, stride=b_scan_stride)
+        )
+        mC_scan = cute.make_tensor(
+            C_ptr, cute.make_layout(c_scan_shape, stride=c_scan_stride)
+        )
+        mM_scan = cute.make_tensor(
+            M_ptr, cute.make_layout(m_scan_shape, stride=m_scan_stride)
+        )
+        mK_scan = cute.make_tensor(
+            K_ptr, cute.make_layout(k_scan_shape, stride=k_scan_stride)
+        )
+        mZ0_scan = cute.make_tensor(
+            chunk_starts_ptr, cute.make_layout(z0_scan_shape, stride=z0_scan_stride)
+        )
+        mU_prev_scan_t = cute.make_tensor(
+            U_prev_ptr, cute.make_layout(u_prev_scan_shape, stride=u_prev_scan_stride)
+        )
+        mB_prev_scan_t = cute.make_tensor(
+            B_prev_ptr, cute.make_layout(b_prev_scan_shape, stride=b_prev_scan_stride)
+        )
+        mOut = cute.make_tensor(
+            out_ptr, cute.make_layout(out_scan_shape, stride=out_scan_stride)
+        )
+
+        tc_dtype = U_ptr.value_type
+        out_dtype = out_ptr.value_type
+
+        chunk_increment = ChunkIncrementFwdAmpere(tc_dtype, chunk_size=L)
+        chunk_increment(
+            mU_inc,
+            mB_inc,
+            mM_inc,
+            mKprev_inc,
+            mKcurr_inc,
+            mU_prev_inc,
+            mB_prev_inc,
+            mInc,
+            mMchunk,
+        )
+
+        state_passing = StatePassingFwdAmpere(
+            num_threads=state_num_threads,
+            vecs_per_thread=state_vecs_per_thread,
+            copy_bits_in=state_copy_bits_in,
+            copy_bits_out=state_copy_bits_out,
+            has_init=False,
+        )
+        state_passing(
+            inc_state_t,
+            m_chunk_state_t,
+            chunk_starts_state_t,
+            final_state_t,
+            final_state_t,
+        )
+
+        chunk_scan = ChunkScanFwdAmpere(
+            D=D,
+            P=P,
+            L=L,
+            m_block_size=m_block_size,
+            n_block_size=n_block_size,
+            num_threads=scan_num_threads,
+        )
+        if cutlass.const_expr(not chunk_scan.can_implement(tc_dtype, out_dtype)):
+            raise ValueError(
+                "Configuration exceeds SM80 shared-memory capacity or violates alignment."
+            )
+        chunk_scan(
+            mU_scan,
+            mB_scan,
+            mC_scan,
+            mM_scan,
+            mK_scan,
+            mZ0_scan,
+            mU_prev_scan_t,
+            mB_prev_scan_t,
+            mOut,
+        )
+
+    return _v2x2ssd_fwd_host_wrapper
+
+
+def compile_v2x2ssd_fwd_cute(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    *,
+    chunk_size: int,
+    compute_dtype: torch.dtype | None = None,
+    output_dtype: torch.dtype = torch.float32,
+    m_block_size: int | None = None,
+    n_block_size: int = 64,
+    scan_num_threads: int = 128,
+    state_num_threads: int = 128,
+    state_vecs_per_thread: int = 8,
+) -> object:
+    dynamic_args, alignments, spec, cfg, _outputs = _build_forward_args(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_size=chunk_size,
+        compute_dtype=compute_dtype,
+        output_dtype=output_dtype,
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+        scan_num_threads=scan_num_threads,
+        state_num_threads=state_num_threads,
+        state_vecs_per_thread=state_vecs_per_thread,
+    )
+    cache_key = _fwd_host_cache_key(
+        device_index=(U.device.index if U.device.index is not None else -1),
+        tc_dtype=_tc_input_dtype(U.dtype, compute_dtype),
+        out_dtype=output_dtype,
+        U_shape=tuple(U.shape),
+        M_shape=tuple(M.shape),
+        K_shape=tuple(K.shape),
+        B_shape=tuple(B.shape),
+        C_shape=tuple(C.shape),
+        chunk_size=int(chunk_size),
+        m_block_size=int(chunk_size if m_block_size is None else m_block_size),
+        n_block_size=_resolve_chunk_scan_n_block_size(
+            int(chunk_size), int(n_block_size)
+        ),
+        scan_num_threads=int(scan_num_threads),
+        state_num_threads=int(state_num_threads),
+        state_vecs_per_thread=int(state_vecs_per_thread),
+        state_copy_bits_in=int(cfg[5]),
+        state_copy_bits_out=int(cfg[6]),
+        alignments=alignments,
+    )
+    cached = _FWD_HOST_CACHE.get(cache_key)
+    if cached is not None:
+        note_cache_event("cache.v2x2ssd.forward.host_jit", hit=True)
+        return cached
+
+    note_cache_event("cache.v2x2ssd.forward.host_jit", hit=False)
+    host_wrapper = _make_v2x2ssd_fwd_host_wrapper(spec=spec, cfg=cfg)
+    compiled = cute.compile(host_wrapper, *dynamic_args)
+    _FWD_HOST_CACHE[cache_key] = compiled
+    return compiled
+
+
+def v2x2ssd_fwd_cute(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    *,
+    chunk_size: int,
+    compute_dtype: torch.dtype | None = None,
+    output_dtype: torch.dtype = torch.float32,
+    m_block_size: int | None = None,
+    n_block_size: int = 64,
+    scan_num_threads: int = 128,
+    state_num_threads: int = 128,
+    state_vecs_per_thread: int = 8,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    with record_region("forward.v2x2ssd.total"):
+        dynamic_args, alignments, spec, cfg, outputs = _build_forward_args(
+            U,
+            M,
+            K,
+            B,
+            C,
+            chunk_size=chunk_size,
+            compute_dtype=compute_dtype,
+            output_dtype=output_dtype,
+            m_block_size=m_block_size,
+            n_block_size=n_block_size,
+            scan_num_threads=scan_num_threads,
+            state_num_threads=state_num_threads,
+            state_vecs_per_thread=state_vecs_per_thread,
+        )
+        cache_key = _fwd_host_cache_key(
+            device_index=(U.device.index if U.device.index is not None else -1),
+            tc_dtype=_tc_input_dtype(U.dtype, compute_dtype),
+            out_dtype=output_dtype,
+            U_shape=tuple(U.shape),
+            M_shape=tuple(M.shape),
+            K_shape=tuple(K.shape),
+            B_shape=tuple(B.shape),
+            C_shape=tuple(C.shape),
+            chunk_size=int(chunk_size),
+            m_block_size=int(chunk_size if m_block_size is None else m_block_size),
+            n_block_size=_resolve_chunk_scan_n_block_size(
+                int(chunk_size), int(n_block_size)
+            ),
+            scan_num_threads=int(scan_num_threads),
+            state_num_threads=int(state_num_threads),
+            state_vecs_per_thread=int(state_vecs_per_thread),
+            state_copy_bits_in=int(cfg[5]),
+            state_copy_bits_out=int(cfg[6]),
+            alignments=alignments,
+        )
+        compiled = _FWD_HOST_CACHE.get(cache_key)
+        if compiled is None:
+            note_cache_event("cache.v2x2ssd.forward.host_jit", hit=False)
+            host_wrapper = _make_v2x2ssd_fwd_host_wrapper(spec=spec, cfg=cfg)
+            compiled = cute.compile(host_wrapper, *dynamic_args)
+            _FWD_HOST_CACHE[cache_key] = compiled
+        else:
+            note_cache_event("cache.v2x2ssd.forward.host_jit", hit=True)
+        compiled(*dynamic_args)
+        return outputs
+
+
 __all__ = [
     "chunk_increment_cute",
     "chunk_scan_cute",
     "compile_chunk_increment_kernel",
     "compile_chunk_scan_kernel",
     "compile_state_passing_kernel",
+    "compile_v2x2ssd_fwd_cute",
     "state_passing_cute",
+    "v2x2ssd_fwd_cute",
 ]

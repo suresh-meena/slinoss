@@ -12,11 +12,7 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment import (
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan import chunk_scan_bwd_cute
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.state_passing import state_passing_bwd_cute
-from slinoss.ops.v2x2ssd.cute.kernels.fwd import (
-    chunk_increment_cute,
-    chunk_scan_cute,
-    state_passing_cute,
-)
+from slinoss.ops.v2x2ssd.cute.kernels.fwd import v2x2ssd_fwd_cute
 
 
 _ZERO_FINAL_GRAD_CACHE: dict[tuple, torch.Tensor] = {}
@@ -70,33 +66,15 @@ class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
         B_d = B.detach()
         C_d = C.detach()
 
-        inc, m_chunk = chunk_increment_cute(
-            U_d,
-            M_d,
-            K_d,
-            B_d,
-            chunk_size=ctx.chunk_size,
-            compute_dtype=compute_dtype,
-        )
-        chunk_starts = cast(
-            torch.Tensor,
-            state_passing_cute(
-                inc,
-                m_chunk,
-                initial_states=None,
-                return_final_state=False,
-            ),
-        )
-        Y = chunk_scan_cute(
+        Y, m_chunk, chunk_starts = v2x2ssd_fwd_cute(
             U_d,
             M_d,
             K_d,
             B_d,
             C_d,
-            chunk_starts,
             chunk_size=ctx.chunk_size,
-            output_dtype=output_dtype or U.dtype,
             compute_dtype=compute_dtype,
+            output_dtype=output_dtype or U.dtype,
         )
 
         ctx.save_for_backward(U_d, M_d, K_d, B_d, C_d, m_chunk, chunk_starts)

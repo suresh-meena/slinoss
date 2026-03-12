@@ -17,6 +17,7 @@ import statistics
 import sys
 import time
 from pathlib import Path
+from typing import cast
 
 import torch
 
@@ -384,13 +385,15 @@ def main() -> int:
     print("| backend | stage | mean_ms | median_ms | stdev_ms |")
     print("| --- | --- | ---: | ---: | ---: |")
     for row in rows:
+        mean_ms = cast(float, row["mean_ms"])
+        median_ms = cast(float, row["median_ms"])
+        stdev_ms = cast(float, row["stdev_ms"])
         print(
             f"| {row['backend']} | {row['stage']} | "
-            f"{float(row['mean_ms']):.6f} | {float(row['median_ms']):.6f} | "
-            f"{float(row['stdev_ms']):.6f} |"
+            f"{mean_ms:.6f} | {median_ms:.6f} | {stdev_ms:.6f} |"
         )
     if len(rows) == 2:
-        speedup = float(rows[0]["mean_ms"]) / float(rows[1]["mean_ms"])
+        speedup = cast(float, rows[0]["mean_ms"]) / cast(float, rows[1]["mean_ms"])
         print(
             f"\nspeedup ({rows[0]['backend']} / {rows[1]['backend']}): {speedup:.3f}x"
         )
