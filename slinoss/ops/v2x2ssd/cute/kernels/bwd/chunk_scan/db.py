@@ -563,8 +563,6 @@ class ChunkScanBwdDBAmpere:
         iters_quads_tile = int(
             (total_quads_tile + self.num_threads - 1) // self.num_threads
         )
-        total_q_tile = int(kv_tile * Dp)
-        iters_q_tile = int((total_q_tile + self.num_threads - 1) // self.num_threads)
         iters_d = int((self.D + self.num_threads - 1) // self.num_threads)
         tQp = None
         if cutlass.const_expr(self.D != Dp):
@@ -1475,21 +1473,19 @@ class ChunkScanBwdDBAmpere:
             cKD_tile = cute.local_tile(mcKD_full, (kv_tile, Dp), (n_tile, 0))
             tOcKD_tile = thr_mma.partition_C(cKD_tile)
             tOcKD_tile_mn = self._make_acc_tensor_mn_view(tOcKD_tile)
+            tCsPrev = thr_mma.partition_C(sQ0)
+            tCrPrev = cute.make_fragment_like(tCsPrev, mU.element_type)
+            tCrPrev.fill(0.0)
+            tCrPrev_mn = self._make_acc_tensor_mn_view(tCrPrev)
+            tCsK = thr_mma.partition_C(sK_tile)
+            tCrK_curr = cute.make_fragment_like(tCsK, mU.element_type)
+            tCrK_curr.fill(0.0)
+            tCrK_curr_mn = self._make_acc_tensor_mn_view(tCrK_curr)
             acc_dK_curr_mn = self._make_acc_tensor_mn_view(acc_dK_curr)
             acc_dK_prev_mn = self._make_acc_tensor_mn_view(acc_dK_prev)
 
-            for it in cutlass.range_constexpr(iters_q_tile):
-                idx = tidx + cutlass.Int32(it * self.num_threads)
-                if idx < cutlass.Int32(total_q_tile):
-                    t_local = idx // cutlass.Int32(Dp)
-                    d = idx - t_local * cutlass.Int32(Dp)
-                    sQ0[t_local, d] = cutlass.Float32(0.0).to(mU.element_type)
-                    sK_tile[t_local, d] = cutlass.Float32(0.0).to(mU.element_type)
-            cute.arch.barrier()
-
             for r in cutlass.range_constexpr(cute.size(acc_dK_curr_mn.shape[0])):
                 row_idx = cutlass.Int32(tOcKD_tile_mn[r, 0][1])
-                row_local = row_idx - cutlass.Int32(n0)
                 if cute.elem_less(row_idx, cutlass.Int32(self.L)):
                     inv_rs = cutlass.Float32(s_inv_row_scale[row_idx])
                     for c in cutlass.range_constexpr(
@@ -1505,12 +1501,11 @@ class ChunkScanBwdDBAmpere:
                             pr = cutlass.Float32(s_phase[row_idx, 0])
                             pi = cutlass.Float32(s_phase[row_idx, 1])
                             bxr, bxi = conj_mul_phase(gx, gy, pr, pi)
-                            sK_tile[row_local, d + 0] = bxr.to(mU.element_type)
-                            sK_tile[row_local, d + 1] = bxi.to(mU.element_type)
+                            tCrK_curr_mn[r, c] = bxr.to(mU.element_type)
+                            tCrK_curr_mn[r, c + 1] = bxi.to(mU.element_type)
 
             for r in cutlass.range_constexpr(cute.size(acc_dK_prev_mn.shape[0])):
                 row_idx = cutlass.Int32(tOcKD_tile_mn[r, 0][1])
-                row_local = row_idx - cutlass.Int32(n0)
                 if cute.elem_less(row_idx, cutlass.Int32(self.L)):
                     inv_rs = cutlass.Float32(s_inv_row_scale[row_idx])
                     for c in cutlass.range_constexpr(
@@ -1526,8 +1521,10 @@ class ChunkScanBwdDBAmpere:
                             pr = cutlass.Float32(s_phase[row_idx, 0])
                             pi = cutlass.Float32(s_phase[row_idx, 1])
                             bxr, bxi = conj_mul_phase(gx, gy, pr, pi)
-                            sQ0[row_local, d + 0] = bxr.to(mU.element_type)
-                            sQ0[row_local, d + 1] = bxi.to(mU.element_type)
+                            tCrPrev_mn[r, c] = bxr.to(mU.element_type)
+                            tCrPrev_mn[r, c + 1] = bxi.to(mU.element_type)
+            cute.autovec_copy(tCrPrev, tCsPrev)
+            cute.autovec_copy(tCrK_curr, tCsK)
             cute.arch.barrier()
 
             t_local = warp
