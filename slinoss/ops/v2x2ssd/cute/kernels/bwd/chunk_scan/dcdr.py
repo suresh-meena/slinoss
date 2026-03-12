@@ -302,7 +302,6 @@ class ChunkScanBwdDCDRAmpere:
         smem_needed += cute.size_in_bytes(in_dtype, sV_layout)
         smem_needed += 2 * cute.size_in_bytes(in_dtype, sK_layout)
         smem_needed += cute.size_in_bytes(in_dtype, sDS_layout)
-        smem_needed += cute.size_in_bytes(in_dtype, sZ0_layout)
         smem_needed += cute.size_in_bytes(in_dtype, s_u_prev_layout)
         smem_needed += cute.size_in_bytes(in_dtype, s_b_prev_layout)
         smem_needed += cute.size_in_bytes(cutlass.Float32, s_dlp_layout)
@@ -430,7 +429,8 @@ class ChunkScanBwdDCDRAmpere:
         sSc_scratch = cute.make_tensor(sV_tile.iterator, sStage_layout)
         sDS_scratch = cute.make_tensor(sDY.iterator, sStage_layout)
         sQZ_tile = smem.allocate_tensor(mU.element_type, sK_layout, 16)
-        sZ0 = smem.allocate_tensor(mU.element_type, sZ0_layout, 16)
+        sQ_tile = sQZ_tile
+        sZ0 = cute.make_tensor(sK_tile.iterator, sZ0_layout)
         s_u_prev = smem.allocate_tensor(mU.element_type, s_u_prev_layout, 16)
         s_b_prev = smem.allocate_tensor(mU.element_type, s_b_prev_layout, 16)
         s_dlp = smem.allocate_tensor(cutlass.Float32, s_dlp_layout, 4)
@@ -1943,7 +1943,7 @@ class ChunkScanBwdDCDRAmpere:
                 mC[bidz, None, 0, None], (kv_tile, Dp), (m_tile, 0)
             )
             tCg_dR_async = gmem_thr_copy_D_async.partition_S(gC_dR)
-            tCs_dR_async = gmem_thr_copy_D_async.partition_D(sZ0)
+            tCs_dR_async = gmem_thr_copy_D_async.partition_D(sQ_tile)
             if cutlass.const_expr(self.D == Dp):
                 cute.copy(gmem_tiled_copy_D_async, tCg_dR_async, tCs_dR_async)
             else:
@@ -2033,8 +2033,8 @@ class ChunkScanBwdDCDRAmpere:
                             dq1 = cutlass.Float32(
                                 sK_tile[t_local, d0 + 1].to(cutlass.Float32)
                             )
-                            c0 = cutlass.Float32(sZ0[t_local, d0 + 0].to(cutlass.Float32))
-                            c1 = cutlass.Float32(sZ0[t_local, d0 + 1].to(cutlass.Float32))
+                            c0 = cutlass.Float32(sQ_tile[t_local, d0 + 0].to(cutlass.Float32))
+                            c1 = cutlass.Float32(sQ_tile[t_local, d0 + 1].to(cutlass.Float32))
                             dR00 = dR00 + dq0 * c0
                             dR01 = dR01 + dq0 * c1
                             dR10 = dR10 + dq1 * c0
@@ -2045,8 +2045,8 @@ class ChunkScanBwdDCDRAmpere:
                             dq3 = cutlass.Float32(
                                 sK_tile[t_local, d0 + 3].to(cutlass.Float32)
                             )
-                            c2 = cutlass.Float32(sZ0[t_local, d0 + 2].to(cutlass.Float32))
-                            c3 = cutlass.Float32(sZ0[t_local, d0 + 3].to(cutlass.Float32))
+                            c2 = cutlass.Float32(sQ_tile[t_local, d0 + 2].to(cutlass.Float32))
+                            c3 = cutlass.Float32(sQ_tile[t_local, d0 + 3].to(cutlass.Float32))
                             dR00 = dR00 + dq2 * c2
                             dR01 = dR01 + dq2 * c3
                             dR10 = dR10 + dq3 * c2
@@ -2062,8 +2062,8 @@ class ChunkScanBwdDCDRAmpere:
                             dq1 = cutlass.Float32(
                                 sK_tile[t_local, d0 + 1].to(cutlass.Float32)
                             )
-                            c0 = cutlass.Float32(sZ0[t_local, d0 + 0].to(cutlass.Float32))
-                            c1 = cutlass.Float32(sZ0[t_local, d0 + 1].to(cutlass.Float32))
+                            c0 = cutlass.Float32(sQ_tile[t_local, d0 + 0].to(cutlass.Float32))
+                            c1 = cutlass.Float32(sQ_tile[t_local, d0 + 1].to(cutlass.Float32))
                             dR00 = dR00 + dq0 * c0
                             dR01 = dR01 + dq0 * c1
                             dR10 = dR10 + dq1 * c0
