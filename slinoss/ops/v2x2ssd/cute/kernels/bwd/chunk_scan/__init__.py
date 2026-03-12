@@ -374,7 +374,7 @@ def compile_chunk_scan_bwd_kernels(
     compiled_dc_fast = None
     mZ0_fast = None
     Z0_blk_fast_keepalive = None
-    if return_launchers:
+    if return_launchers and enable_overlapped_launcher:
         Z0_blk_fast_keepalive = Z0_blk.to(dtype=tc_dtype)
         mZ0_fast = from_dlpack(Z0_blk_fast_keepalive, assumed_align=16)
         compiled_dc_fast = cute.compile(
