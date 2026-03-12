@@ -5,6 +5,7 @@ import math
 import pytest
 import torch
 
+import slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan as chunk_scan_bwd_mod
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan import (
     chunk_scan_bwd_cute,
     compile_chunk_scan_bwd_kernels,
@@ -258,7 +259,6 @@ def test_chunk_scan_bwd_overlapped_matches_sequential() -> None:
     ov_launch = ov_bundle[-1]
     seq_launch()
     ov_launch()
-    torch.cuda.synchronize()
 
     def public_from_bundle(
         bundle: tuple[object, ...],
@@ -302,3 +302,76 @@ def test_chunk_scan_bwd_overlapped_matches_sequential() -> None:
         ov_public, seq_public, atol_by_slot, strict=True
     ):
         torch.testing.assert_close(got_tensor, want_tensor, atol=atol, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_chunk_scan_bwd_compile_entrypoint_reuses_cached_executors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    batch, heads, T, N, P = 2, 2, 65, 8, 16
+    chunk_size = 32
+    device = torch.device("cuda")
+
+    U, M, K, B, C, B_prev, U_prev = _make_inputs(
+        batch=batch,
+        heads=heads,
+        T=T,
+        N=N,
+        P=P,
+        device=device,
+    )
+    inc, m_chunk = chunk_increment(
+        U,
+        M,
+        K,
+        B,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        T=T,
+        chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+    )
+    chunk_starts, _ = state_passing(
+        inc,
+        m_chunk,
+        initial_states=None,
+        compute_dtype=torch.float32,
+    )
+    d_out = torch.randn((batch, heads, T, P), device=device, dtype=torch.float32)
+
+    chunk_scan_bwd_mod._COMPILED_CACHE.clear()
+    compile_chunk_scan_bwd_kernels(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_starts,
+        d_out,
+        chunk_size=chunk_size,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        compute_dtype=torch.float32,
+    )
+
+    def _unexpected_compile(*args, **kwargs):
+        raise AssertionError("unexpected recompilation on cache hit")
+
+    monkeypatch.setattr(chunk_scan_bwd_mod.cute, "compile", _unexpected_compile)
+    compile_chunk_scan_bwd_kernels(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_starts,
+        d_out,
+        chunk_size=chunk_size,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        compute_dtype=torch.float32,
+    )
+    torch.cuda.synchronize()

@@ -14,6 +14,9 @@ from .dz0 import ChunkScanBwdDZ0Ampere
 from .param_scan import ChunkScanBwdParamScanAmpere
 
 
+_COMPILED_CACHE: dict[tuple, tuple[object, object, object, object, object, object | None]] = {}
+
+
 def _torch_to_cutlass_dtype(dt: torch.dtype) -> type[cutlass.Numeric]:
     if dt == torch.float16:
         return cutlass.Float16
@@ -129,6 +132,44 @@ def _public_dk_from_parts(
     return dK.reshape(B, H, C * L, 2, F)[:, :, :T, :].to(dtype=torch.float32).contiguous()
 
 
+def _compiled_key(
+    *,
+    device_index: int,
+    tc_dtype: torch.dtype,
+    U_shape: tuple[int, ...],
+    B_shape: tuple[int, ...],
+    C_shape: tuple[int, ...],
+    M_shape: tuple[int, ...],
+    K_shape: tuple[int, ...],
+    chunk_starts_shape: tuple[int, ...],
+    d_out_shape: tuple[int, ...],
+    chunk_size: int,
+    has_prev: bool,
+    num_threads_du: int,
+    num_threads_db: int,
+    num_threads_dc: int,
+    num_threads_param: int,
+) -> tuple:
+    return (
+        "chunk_scan_bwd",
+        device_index,
+        tc_dtype,
+        U_shape,
+        B_shape,
+        C_shape,
+        M_shape,
+        K_shape,
+        chunk_starts_shape,
+        d_out_shape,
+        int(chunk_size),
+        has_prev,
+        int(num_threads_du),
+        int(num_threads_db),
+        int(num_threads_dc),
+        int(num_threads_param),
+    )
+
+
 def compile_chunk_scan_bwd_kernels(
     U: torch.Tensor,
     M: torch.Tensor,
@@ -183,6 +224,23 @@ def compile_chunk_scan_bwd_kernels(
 
     tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
     cutlass_dtype = _torch_to_cutlass_dtype(tc_dtype)
+    cache_key = _compiled_key(
+        device_index=(U.device.index if U.device.index is not None else -1),
+        tc_dtype=tc_dtype,
+        U_shape=tuple(U.shape),
+        B_shape=tuple(B.shape),
+        C_shape=tuple(C.shape),
+        M_shape=tuple(M.shape),
+        K_shape=tuple(K.shape),
+        chunk_starts_shape=tuple(chunk_starts.shape),
+        d_out_shape=tuple(d_out.shape),
+        chunk_size=L,
+        has_prev=B_prev is not None,
+        num_threads_du=num_threads_du,
+        num_threads_db=num_threads_db,
+        num_threads_dc=num_threads_dc,
+        num_threads_param=num_threads_param,
+    )
 
     U_tc = _pad_zero_time(U, T_pad=T_pad, dtype=tc_dtype)
     B_tc = _pad_zero_time(B, T_pad=T_pad, dtype=tc_dtype)
@@ -231,7 +289,7 @@ def compile_chunk_scan_bwd_kernels(
     )
 
     k_dz0 = ChunkScanBwdDZ0Ampere(cutlass_dtype, chunk_size=L)
-    compiled_dz0 = cute.compile(k_dz0, mDOut_dz0, mC_dz0, mM_dz0, mDZ0)
+    compiled_dz0 = None
     dZ0_view = dZ0.reshape(Bsz, H, n_chunks, P, D)
 
     U_blk = U_tc.reshape(BH, n_chunks, L, P).reshape(BHC, L, 1, P).contiguous()
@@ -277,24 +335,7 @@ def compile_chunk_scan_bwd_kernels(
         P=P,
         num_threads=num_threads_du,
     )
-    compiled_du = cute.compile(
-        k_du,
-        mU,
-        mB,
-        mC,
-        mM,
-        mK,
-        mDOut,
-        mU_prev0,
-        mB_prev0,
-        mDU,
-        mDB_du_scratch,
-        mDU_prev,
-        mDB_prev_du_scratch,
-        mDLp_du_scratch,
-        mDMp_du_scratch,
-        mDMc_du_scratch,
-    )
+    compiled_du = None
 
     dB = torch.empty_like(B_blk)
     dB_prev = torch.empty((BHC, D), device=U.device, dtype=tc_dtype)
@@ -319,24 +360,7 @@ def compile_chunk_scan_bwd_kernels(
         P=P,
         num_threads=num_threads_db,
     )
-    compiled_db = cute.compile(
-        k_db,
-        mU,
-        mB,
-        mC,
-        mM,
-        mK,
-        mDOut,
-        mU_prev0,
-        mB_prev0,
-        mDU_db_scratch,
-        mDB,
-        mDU_prev_db_scratch,
-        mDB_prev,
-        mDLp_db_scratch,
-        mDMp_db_scratch,
-        mDMc_db_scratch,
-    )
+    compiled_db = None
 
     dU_view = dU.reshape(Bsz, H, n_chunks, L, P)
     dB_view = dB.reshape(Bsz, H, n_chunks, L, D)
@@ -359,42 +383,13 @@ def compile_chunk_scan_bwd_kernels(
         P=P,
         num_threads=num_threads_dc,
     )
-    compiled_dc = cute.compile(
-        k_dc,
-        mU,
-        mB,
-        mC,
-        mM,
-        mK,
-        mDOut,
-        mU_prev0,
-        mB_prev0,
-        mZ0,
-        mDLogp,
-        mDC,
-        mDR,
-    )
+    compiled_dc = None
     compiled_dc_fast = None
     mZ0_fast = None
     Z0_blk_fast_keepalive = None
     if return_launchers and enable_overlapped_launcher:
         Z0_blk_fast_keepalive = Z0_blk.to(dtype=tc_dtype)
         mZ0_fast = from_dlpack(Z0_blk_fast_keepalive, assumed_align=16)
-        compiled_dc_fast = cute.compile(
-            k_dc,
-            mU,
-            mB,
-            mC,
-            mM,
-            mK,
-            mDOut,
-            mU_prev0,
-            mB_prev0,
-            mZ0_fast,
-            mDLogp,
-            mDC,
-            mDR,
-        )
 
     dlogp_view = dlogp.reshape(Bsz, H, n_chunks, L)
     dC_view = dC.reshape(Bsz, H, n_chunks, L, D)
@@ -418,22 +413,136 @@ def compile_chunk_scan_bwd_kernels(
     mDKcurr = from_dlpack(dkcurr_out, assumed_align=16)
 
     k_param = ChunkScanBwdParamScanAmpere(chunk_size=L, num_threads=num_threads_param)
-    compiled_param = cute.compile(
-        k_param,
-        mM,
-        mK,
-        mDLp,
-        mDMprev,
-        mDMcurr,
-        mDR_param,
-        mDM,
-        mDKprev,
-        mDKcurr,
-    )
+    compiled_param = None
 
     dM_view = dM_out.reshape(Bsz, H, n_chunks, n_splits, L, 2)
     dkprev_view = dkprev_out.reshape(Bsz, H, n_chunks, n_splits, L, 2)
     dkcurr_view = dkcurr_out.reshape(Bsz, H, n_chunks, n_splits, L, 2)
+
+    cached = _COMPILED_CACHE.get(cache_key)
+    if cached is None:
+        compiled_dz0 = cute.compile(k_dz0, mDOut_dz0, mC_dz0, mM_dz0, mDZ0)
+        compiled_du = cute.compile(
+            k_du,
+            mU,
+            mB,
+            mC,
+            mM,
+            mK,
+            mDOut,
+            mU_prev0,
+            mB_prev0,
+            mDU,
+            mDB_du_scratch,
+            mDU_prev,
+            mDB_prev_du_scratch,
+            mDLp_du_scratch,
+            mDMp_du_scratch,
+            mDMc_du_scratch,
+        )
+        compiled_db = cute.compile(
+            k_db,
+            mU,
+            mB,
+            mC,
+            mM,
+            mK,
+            mDOut,
+            mU_prev0,
+            mB_prev0,
+            mDU_db_scratch,
+            mDB,
+            mDU_prev_db_scratch,
+            mDB_prev,
+            mDLp_db_scratch,
+            mDMp_db_scratch,
+            mDMc_db_scratch,
+        )
+        compiled_dc = cute.compile(
+            k_dc,
+            mU,
+            mB,
+            mC,
+            mM,
+            mK,
+            mDOut,
+            mU_prev0,
+            mB_prev0,
+            mZ0,
+            mDLogp,
+            mDC,
+            mDR,
+        )
+        if mZ0_fast is not None:
+            compiled_dc_fast = cute.compile(
+                k_dc,
+                mU,
+                mB,
+                mC,
+                mM,
+                mK,
+                mDOut,
+                mU_prev0,
+                mB_prev0,
+                mZ0_fast,
+                mDLogp,
+                mDC,
+                mDR,
+            )
+        compiled_param = cute.compile(
+            k_param,
+            mM,
+            mK,
+            mDLp,
+            mDMprev,
+            mDMcurr,
+            mDR_param,
+            mDM,
+            mDKprev,
+            mDKcurr,
+        )
+        cached = (
+            compiled_dz0,
+            compiled_du,
+            compiled_db,
+            compiled_dc,
+            compiled_param,
+            compiled_dc_fast,
+        )
+        _COMPILED_CACHE[cache_key] = cached
+    else:
+        (
+            compiled_dz0,
+            compiled_du,
+            compiled_db,
+            compiled_dc,
+            compiled_param,
+            compiled_dc_fast,
+        ) = cached
+        if compiled_dc_fast is None and mZ0_fast is not None:
+            compiled_dc_fast = cute.compile(
+                k_dc,
+                mU,
+                mB,
+                mC,
+                mM,
+                mK,
+                mDOut,
+                mU_prev0,
+                mB_prev0,
+                mZ0_fast,
+                mDLogp,
+                mDC,
+                mDR,
+            )
+            _COMPILED_CACHE[cache_key] = (
+                compiled_dz0,
+                compiled_du,
+                compiled_db,
+                compiled_dc,
+                compiled_param,
+                compiled_dc_fast,
+            )
 
     def _launch_dz0() -> None:
         compiled_dz0(mDOut_dz0, mC_dz0, mM_dz0, mDZ0)

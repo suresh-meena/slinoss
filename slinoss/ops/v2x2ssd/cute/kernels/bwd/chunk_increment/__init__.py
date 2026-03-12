@@ -13,6 +13,9 @@ from .du import ChunkIncrementBwdDUAmpere
 from .param_scan import ChunkIncrementBwdParamScanAmpere
 
 
+_COMPILED_CACHE: dict[tuple, tuple[object, object, object, object]] = {}
+
+
 def _tc_input_dtype(
     input_dtype: torch.dtype, compute_dtype: torch.dtype | None
 ) -> torch.dtype:
@@ -90,6 +93,34 @@ def _fold_chunk_boundary_carries(
     return x
 
 
+def _compiled_key(
+    *,
+    device_index: int,
+    tc_dtype: torch.dtype,
+    U_shape: tuple[int, ...],
+    B_shape: tuple[int, ...],
+    M_shape: tuple[int, ...],
+    K_shape: tuple[int, ...],
+    d_inc_shape: tuple[int, ...],
+    d_m_chunk_shape: tuple[int, ...],
+    chunk_size: int,
+    has_prev: bool,
+) -> tuple:
+    return (
+        "chunk_increment_bwd",
+        device_index,
+        tc_dtype,
+        U_shape,
+        B_shape,
+        M_shape,
+        K_shape,
+        d_inc_shape,
+        d_m_chunk_shape,
+        int(chunk_size),
+        has_prev,
+    )
+
+
 def compile_chunk_increment_bwd_kernels(
     U: torch.Tensor,
     M: torch.Tensor,
@@ -141,6 +172,18 @@ def compile_chunk_increment_bwd_kernels(
 
     tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
     cutlass_dtype = _torch_to_cutlass_dtype(tc_dtype)
+    cache_key = _compiled_key(
+        device_index=(U.device.index if U.device.index is not None else -1),
+        tc_dtype=tc_dtype,
+        U_shape=tuple(U.shape),
+        B_shape=tuple(B.shape),
+        M_shape=tuple(M.shape),
+        K_shape=tuple(K.shape),
+        d_inc_shape=tuple(d_inc.shape),
+        d_m_chunk_shape=tuple(d_m_chunk.shape),
+        chunk_size=L,
+        has_prev=B_prev is not None,
+    )
 
     U_tc = _pad_zero_time(U, T_pad=T_pad, dtype=tc_dtype)
     B_tc = _pad_zero_time(B, T_pad=T_pad, dtype=tc_dtype)
@@ -222,35 +265,41 @@ def compile_chunk_increment_bwd_kernels(
     mDKprev = from_dlpack(dKprev_out, assumed_align=16)
     mDKcurr = from_dlpack(dKcurr_out, assumed_align=16)
 
-    compiled_db = cute.compile(
-        k_db, mU, mB, mM, mKprev, mKcurr, mDInc_DP, mDB, mDMsum_part
-    )
-    compiled_du = cute.compile(
-        k_du, mDInc, mB, mM, mKprev, mKcurr, mDU
-    )
-    compiled_boundary = cute.compile(
-        k_boundary,
-        mDInc_boundary,
-        mBPrev,
-        mUPrev,
-        mM,
-        mKprev,
-        mDUPrev,
-        mDBPrev,
-        mDMp0,
-    )
-    compiled_param = cute.compile(
-        k_param,
-        mM,
-        mKprev,
-        mKcurr,
-        mDMsum_part,
-        mDMp0,
-        mDMchunk,
-        mDM,
-        mDKprev,
-        mDKcurr,
-    )
+    cached = _COMPILED_CACHE.get(cache_key)
+    if cached is None:
+        compiled_db = cute.compile(
+            k_db, mU, mB, mM, mKprev, mKcurr, mDInc_DP, mDB, mDMsum_part
+        )
+        compiled_du = cute.compile(
+            k_du, mDInc, mB, mM, mKprev, mKcurr, mDU
+        )
+        compiled_boundary = cute.compile(
+            k_boundary,
+            mDInc_boundary,
+            mBPrev,
+            mUPrev,
+            mM,
+            mKprev,
+            mDUPrev,
+            mDBPrev,
+            mDMp0,
+        )
+        compiled_param = cute.compile(
+            k_param,
+            mM,
+            mKprev,
+            mKcurr,
+            mDMsum_part,
+            mDMp0,
+            mDMchunk,
+            mDM,
+            mDKprev,
+            mDKcurr,
+        )
+        cached = (compiled_db, compiled_du, compiled_boundary, compiled_param)
+        _COMPILED_CACHE[cache_key] = cached
+    else:
+        compiled_db, compiled_du, compiled_boundary, compiled_param = cached
 
     dB_view = dB.reshape(Bsz, H, n_chunks, L, D)
     dU_view = dU.reshape(Bsz, H, n_chunks, L, P)

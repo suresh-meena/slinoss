@@ -20,7 +20,7 @@ from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan import (  # noqa: E402
     compile_chunk_scan_bwd_kernels,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment import (  # noqa: E402
-    chunk_increment_bwd_cute,
+    compile_chunk_increment_bwd_kernels,
 )
 from slinoss.ops.v2x2ssd.cute.kernels.bwd.state_passing import (  # noqa: E402
     compile_state_passing_bwd_kernels,
@@ -416,19 +416,23 @@ def _build_chunk_increment_backward_callable(
         fn()
         return fn
 
+    compiled = compile_chunk_increment_bwd_kernels(
+        U,
+        M,
+        K,
+        B,
+        d_inc=d_inc,
+        d_m_chunk=d_m_chunk,
+        chunk_size=cfg.chunk_size,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        compute_dtype=torch.float32,
+        return_launchers=True,
+    )
+    launch_overlapped = compiled[-1]
+
     def fn() -> None:
-        chunk_increment_bwd_cute(
-            U,
-            M,
-            K,
-            B,
-            d_inc=d_inc,
-            d_m_chunk=d_m_chunk,
-            chunk_size=cfg.chunk_size,
-            B_prev=B_prev,
-            U_prev=U_prev,
-            compute_dtype=torch.float32,
-        )
+        launch_overlapped()
 
     fn()
     return fn
