@@ -1746,79 +1746,14 @@ class ChunkScanBwdDCDRAmpere:
                         tQs_off[None, vi, None].fill(0)
             cute.arch.barrier()
 
-            if cutlass.const_expr((self.D % 4) == 0):
-                for it in range(iters_quads_tile):
-                    idx = tidx + cutlass.Int32(it * self.num_threads)
-                    if idx < total_quads_tile:
-                        t_local = idx // cutlass.Int32(N2)
-                        vv4 = idx - t_local * cutlass.Int32(N2)
-                        t = m0 + t_local
-                        d0 = vv4 * cutlass.Int32(4)
-                        qx0 = cutlass.Float32(0.0).to(mU.element_type)
-                        qy0 = cutlass.Float32(0.0).to(mU.element_type)
-                        qx1 = cutlass.Float32(0.0).to(mU.element_type)
-                        qy1 = cutlass.Float32(0.0).to(mU.element_type)
-                        if t < cutlass.Int32(self.L) and cute.elem_less(
-                            d0 + cutlass.Int32(3), cutlass.Int32(self.D)
-                        ):
-                            pr = cutlass.Float32(s_phase_row[t_local, 0])
-                            pi = cutlass.Float32(s_phase_row[t_local, 1])
-                            cx0 = cutlass.Float32(
-                                sQZ_tile[t_local, d0 + 0].to(cutlass.Float32)
-                            )
-                            cy0 = cutlass.Float32(
-                                sQZ_tile[t_local, d0 + 1].to(cutlass.Float32)
-                            )
-                            cx1 = cutlass.Float32(
-                                sQZ_tile[t_local, d0 + 2].to(cutlass.Float32)
-                            )
-                            cy1 = cutlass.Float32(
-                                sQZ_tile[t_local, d0 + 3].to(cutlass.Float32)
-                            )
-                            qxr0, qyr0 = conj_mul_phase(cx0, cy0, pr, pi)
-                            qxr1, qyr1 = conj_mul_phase(cx1, cy1, pr, pi)
-                            qx0 = qxr0.to(mU.element_type)
-                            qy0 = qyr0.to(mU.element_type)
-                            qx1 = qxr1.to(mU.element_type)
-                            qy1 = qyr1.to(mU.element_type)
-                        sQZ_tile[t_local, d0 + 0] = qx0
-                        sQZ_tile[t_local, d0 + 1] = qy0
-                        sQZ_tile[t_local, d0 + 2] = qx1
-                        sQZ_tile[t_local, d0 + 3] = qy1
-            else:
-                for it in range(iters_pairs_tile):
-                    idx = tidx + cutlass.Int32(it * self.num_threads)
-                    if idx < total_pairs_tile:
-                        t_local = idx // cutlass.Int32(N)
-                        vv = idx - t_local * cutlass.Int32(N)
-                        t = m0 + t_local
-                        d0 = vv * cutlass.Int32(2)
-                        qx0 = cutlass.Float32(0.0).to(mU.element_type)
-                        qy0 = cutlass.Float32(0.0).to(mU.element_type)
-                        if t < cutlass.Int32(self.L) and cute.elem_less(
-                            d0 + cutlass.Int32(1), cutlass.Int32(self.D)
-                        ):
-                            cx = cutlass.Float32(
-                                sQZ_tile[t_local, d0 + 0].to(cutlass.Float32)
-                            )
-                            cy = cutlass.Float32(
-                                sQZ_tile[t_local, d0 + 1].to(cutlass.Float32)
-                            )
-                            pr = cutlass.Float32(s_phase_row[t_local, 0])
-                            pi = cutlass.Float32(s_phase_row[t_local, 1])
-                            qx, qy = conj_mul_phase(cx, cy, pr, pi)
-                            qx0 = qx.to(mU.element_type)
-                            qy0 = qy.to(mU.element_type)
-                        sQZ_tile[t_local, d0 + 0] = qx0
-                        sQZ_tile[t_local, d0 + 1] = qy0
-            cute.arch.barrier()
-
             if lane < cutlass.Int32(16):
                 row_task = cutlass.Int32(warp * cutlass.Int32(16)) + lane
                 if row_task < cutlass.Int32(kv_tile):
                     t = m0 + row_task
                     row_sum = cutlass.Float32(0.0)
                     if cutlass.const_expr((self.D % 4) == 0):
+                        pr = cutlass.Float32(s_phase_row[row_task, 0])
+                        pi = cutlass.Float32(s_phase_row[row_task, 1])
                         for vv4 in cutlass.range_constexpr(N2):
                             d0 = cutlass.Int32(vv4 * 4)
                             dq0 = cutlass.Float32(
@@ -1827,10 +1762,10 @@ class ChunkScanBwdDCDRAmpere:
                             dq1 = cutlass.Float32(
                                 sK_tile[row_task, d0 + 1].to(cutlass.Float32)
                             )
-                            q0 = cutlass.Float32(
+                            c0 = cutlass.Float32(
                                 sQZ_tile[row_task, d0 + 0].to(cutlass.Float32)
                             )
-                            q1 = cutlass.Float32(
+                            c1 = cutlass.Float32(
                                 sQZ_tile[row_task, d0 + 1].to(cutlass.Float32)
                             )
                             dq2 = cutlass.Float32(
@@ -1839,14 +1774,18 @@ class ChunkScanBwdDCDRAmpere:
                             dq3 = cutlass.Float32(
                                 sK_tile[row_task, d0 + 3].to(cutlass.Float32)
                             )
-                            q2 = cutlass.Float32(
+                            c2 = cutlass.Float32(
                                 sQZ_tile[row_task, d0 + 2].to(cutlass.Float32)
                             )
-                            q3 = cutlass.Float32(
+                            c3 = cutlass.Float32(
                                 sQZ_tile[row_task, d0 + 3].to(cutlass.Float32)
                             )
+                            q0, q1 = conj_mul_phase(c0, c1, pr, pi)
+                            q2, q3 = conj_mul_phase(c2, c3, pr, pi)
                             row_sum = row_sum + dq0 * q0 + dq1 * q1 + dq2 * q2 + dq3 * q3
                     else:
+                        pr = cutlass.Float32(s_phase_row[row_task, 0])
+                        pi = cutlass.Float32(s_phase_row[row_task, 1])
                         for vv in cutlass.range_constexpr(N):
                             d0 = cutlass.Int32(vv * 2)
                             dq0 = cutlass.Float32(
@@ -1855,12 +1794,13 @@ class ChunkScanBwdDCDRAmpere:
                             dq1 = cutlass.Float32(
                                 sK_tile[row_task, d0 + 1].to(cutlass.Float32)
                             )
-                            q0 = cutlass.Float32(
+                            c0 = cutlass.Float32(
                                 sQZ_tile[row_task, d0 + 0].to(cutlass.Float32)
                             )
-                            q1 = cutlass.Float32(
+                            c1 = cutlass.Float32(
                                 sQZ_tile[row_task, d0 + 1].to(cutlass.Float32)
                             )
+                            q0, q1 = conj_mul_phase(c0, c1, pr, pi)
                             row_sum = row_sum + dq0 * q0 + dq1 * q1
                     if t < cutlass.Int32(self.L):
                         s_dlp[t] = s_dlp[t] + cutlass.Float32(2.0) * row_sum
