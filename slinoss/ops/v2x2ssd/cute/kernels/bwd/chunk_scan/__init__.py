@@ -144,6 +144,7 @@ def compile_chunk_scan_bwd_kernels(
     num_threads_dc: int = 128,
     num_threads_param: int = 32,
     return_launchers: bool = False,
+    enable_overlapped_launcher: bool = True,
 ) -> tuple:
     """Compile the standalone chunk-scan backward kernels and allocate outputs."""
     if (B_prev is None) ^ (U_prev is None):
@@ -535,7 +536,7 @@ def compile_chunk_scan_bwd_kernels(
     ev_db_done = None
     ev_dc_done = None
 
-    if return_launchers:
+    if return_launchers and enable_overlapped_launcher:
         stream_dz0 = torch.cuda.Stream(device=U.device)
         stream_du = torch.cuda.Stream(device=U.device)
         stream_db = torch.cuda.Stream(device=U.device)
@@ -580,12 +581,12 @@ def compile_chunk_scan_bwd_kernels(
             _launch_dc()
             stream_dc.record_event(ev_dc_done)
 
+        current.wait_event(ev_db_done)
         current.wait_event(ev_dc_done)
         _launch_param()
 
         current.wait_event(ev_dz0_done)
         current.wait_event(ev_du_done)
-        current.wait_event(ev_db_done)
 
     base = (
         compiled_dz0,
@@ -666,6 +667,7 @@ def chunk_scan_bwd_cute(
         U_prev=U_prev,
         compute_dtype=compute_dtype,
         return_launchers=True,
+        enable_overlapped_launcher=False,
     )
     launch_sequential()
 
