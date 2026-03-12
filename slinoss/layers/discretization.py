@@ -35,6 +35,38 @@ def _pack_complex(x: torch.Tensor) -> torch.Tensor:
     return torch.view_as_real(x).to(torch.float32).contiguous()
 
 
+def _foh_taps_from_normalized(
+    dt_f: torch.Tensor,
+    log_r_f: torch.Tensor,
+    theta_f: torch.Tensor,
+    rho: torch.Tensor,
+    *,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """FOH taps for already-normalized ``dt/log(r)/theta`` inputs."""
+
+    z = torch.complex(log_r_f, theta_f)
+    z_abs = torch.abs(z)
+    z_thresh = float(max(1.0e-4, math.sqrt(max(float(eps), 1.0e-12))))
+    small = z_abs < z_thresh
+    safe_z = torch.where(small, torch.ones_like(z), z)
+
+    # kappa1(z) = (exp(z) - 1) / z, kappa2(z) = (exp(z) * (z - 1) + 1) / z^2
+    kappa1 = (rho - 1.0) / safe_z
+    kappa2 = (rho * (safe_z - 1.0) + 1.0) / (safe_z * safe_z)
+
+    z2 = z * z
+    z3 = z2 * z
+    kappa1_taylor = 1.0 + 0.5 * z + z2 / 6.0 + z3 / 24.0
+    kappa2_taylor = 0.5 + z / 3.0 + z2 / 8.0 + z3 / 30.0
+    kappa1 = torch.where(small, kappa1_taylor, kappa1)
+    kappa2 = torch.where(small, kappa2_taylor, kappa2)
+
+    k_prev = dt_f * kappa2
+    k_curr = dt_f * kappa1 - k_prev
+    return _pack_complex(k_prev), _pack_complex(k_curr)
+
+
 def build_transition_from_polar(r: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
     """Builds packed complex transitions from polar parameters."""
     r_f = r.to(torch.float32).clamp_min(0.0)
@@ -61,27 +93,9 @@ def foh_taps_from_polar(
     r_f = r.to(torch.float32).clamp(min=max(1e-12, float(eps)), max=1.0)
     theta_f = principal_angle(theta)
 
-    z = torch.complex(torch.log(r_f), theta_f)
     rho = torch.polar(r_f, theta_f)
-    z_abs = torch.abs(z)
-    z_thresh = float(max(1.0e-4, math.sqrt(max(float(eps), 1.0e-12))))
-    small = z_abs < z_thresh
-    safe_z = torch.where(small, torch.ones_like(z), z)
-
-    # kappa1(z) = (exp(z) - 1) / z, kappa2(z) = (exp(z) * (z - 1) + 1) / z^2
-    kappa1 = (rho - 1.0) / safe_z
-    kappa2 = (rho * (safe_z - 1.0) + 1.0) / (safe_z * safe_z)
-
-    z2 = z * z
-    z3 = z2 * z
-    kappa1_taylor = 1.0 + 0.5 * z + z2 / 6.0 + z3 / 24.0
-    kappa2_taylor = 0.5 + z / 3.0 + z2 / 8.0 + z3 / 30.0
-    kappa1 = torch.where(small, kappa1_taylor, kappa1)
-    kappa2 = torch.where(small, kappa2_taylor, kappa2)
-
-    k_prev = dt_f * kappa2
-    k_curr = dt_f * kappa1 - k_prev
-    return _pack_complex(k_prev), _pack_complex(k_curr)
+    log_r_f = torch.log(r_f)
+    return _foh_taps_from_normalized(dt_f, log_r_f, theta_f, rho, eps=eps)
 
 
 @dataclass(frozen=True)
@@ -200,7 +214,18 @@ class SLinOSSDiscretizer(nn.Module):
                 _logit(torch.full_like(self.mix_k_curr_bias, 0.95))
             )
 
-    def forward(self, params: torch.Tensor) -> SLinOSSDiscretizationOutput:  # type: ignore[override]
+    def _compute_coefficients(
+        self,
+        params: torch.Tensor,
+        *,
+        include_aux: bool,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
         if params.ndim != 4 or params.shape[-2] != self.n_heads:
             raise ValueError(
                 f"Expected params shape (batch, T, {self.n_heads}, {self.param_dim}), "
@@ -229,35 +254,54 @@ class SLinOSSDiscretizer(nn.Module):
         ) = p.unbind(dim=-1)
 
         head = (1, 1, self.n_heads)
-        dt = self.dt_min + (self.dt_max - self.dt_min) * torch.sigmoid(
-            dt_raw + self.dt_bias.view(*head)
+        sigmoid_inputs = torch.stack(
+            [
+                dt_raw + self.dt_bias.view(*head),
+                r_raw,
+                mix_r_raw + self.mix_r_bias.view(*head),
+                mix_theta_raw + self.mix_theta_bias.view(*head),
+                mix_k_prev_raw + self.mix_k_prev_bias.view(*head),
+                mix_k_curr_raw + self.mix_k_curr_bias.view(*head),
+            ],
+            dim=-1,
         )
+        (
+            dt_u,
+            r_direct_u,
+            mix_r,
+            mix_theta,
+            mix_k_prev,
+            mix_k_curr,
+        ) = torch.sigmoid(sigmoid_inputs).unbind(dim=-1)
+        dt = self.dt_min + (self.dt_max - self.dt_min) * dt_u
         gamma = F.softplus(gamma_raw + self.gamma_bias.view(*head))
         omega = omega_raw + self.omega_bias.view(*head)
 
         r_struct = self.r_min + (self.r_max - self.r_min) * torch.exp(-gamma * dt)
         theta_struct = omega * dt
 
-        r_direct = self.r_min + (self.r_max - self.r_min) * torch.sigmoid(r_raw)
-        theta_direct = self.theta_bound * torch.tanh(theta_raw)
+        tanh_outputs = torch.tanh(
+            torch.stack([theta_raw, k_prev_re, k_prev_im, k_curr_re, k_curr_im], dim=-1)
+        )
+        theta_direct = self.theta_bound * tanh_outputs[..., 0]
+        k_prev_learned = self.k_max * tanh_outputs[..., 1:3]
+        k_curr_learned = self.k_max * tanh_outputs[..., 3:5]
+        r_direct = self.r_min + (self.r_max - self.r_min) * r_direct_u
 
-        mix_r = torch.sigmoid(mix_r_raw + self.mix_r_bias.view(*head))
-        mix_theta = torch.sigmoid(mix_theta_raw + self.mix_theta_bias.view(*head))
         r = mix_r * r_struct + (1.0 - mix_r) * r_direct
         theta = principal_angle(
             mix_theta * theta_struct + (1.0 - mix_theta) * theta_direct
         )
 
-        k_prev_struct, k_curr_struct = foh_taps_from_polar(dt, r, theta, eps=self.eps)
-        k_prev_learned = self.k_max * torch.tanh(
-            torch.stack([k_prev_re, k_prev_im], dim=-1)
-        )
-        k_curr_learned = self.k_max * torch.tanh(
-            torch.stack([k_curr_re, k_curr_im], dim=-1)
-        )
+        dt_f = dt.to(torch.float32).clamp_min(max(1e-6, float(self.eps)))
+        r_f = r.to(torch.float32).clamp(min=max(1e-12, float(self.eps)), max=1.0)
+        theta_f = theta
+        log_r_f = torch.log(r_f)
+        rho = torch.polar(r_f, theta_f)
 
-        mix_k_prev = torch.sigmoid(mix_k_prev_raw + self.mix_k_prev_bias.view(*head))
-        mix_k_curr = torch.sigmoid(mix_k_curr_raw + self.mix_k_curr_bias.view(*head))
+        k_prev_struct, k_curr_struct = _foh_taps_from_normalized(
+            dt_f, log_r_f, theta_f, rho, eps=self.eps
+        )
         k_prev = (
             mix_k_prev.unsqueeze(-1) * k_prev_struct
             + (1.0 - mix_k_prev.unsqueeze(-1)) * k_prev_learned
@@ -267,14 +311,31 @@ class SLinOSSDiscretizer(nn.Module):
             + (1.0 - mix_k_curr.unsqueeze(-1)) * k_curr_learned
         )
 
-        M = build_transition_from_polar(r, theta).permute(0, 2, 1, 3).contiguous()
+        M = _pack_complex(rho).permute(0, 2, 1, 3).contiguous()
         K = torch.stack([k_prev, k_curr], dim=-2).permute(0, 2, 1, 3, 4).contiguous()
+        if not include_aux:
+            return M, K, None, None, None
+        return (
+            M,
+            K,
+            dt.transpose(1, 2).contiguous(),
+            r.transpose(1, 2).contiguous(),
+            theta.transpose(1, 2).contiguous(),
+        )
+
+    def scan_coeffs(self, params: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        M, K, _, _, _ = self._compute_coefficients(params, include_aux=False)
+        return M, K
+
+    def forward(self, params: torch.Tensor) -> SLinOSSDiscretizationOutput:  # type: ignore[override]
+        M, K, dt, r, theta = self._compute_coefficients(params, include_aux=True)
+        assert dt is not None and r is not None and theta is not None
         return SLinOSSDiscretizationOutput(
             M=M,
             K=K,
-            dt=dt.transpose(1, 2).contiguous(),
-            r=r.transpose(1, 2).contiguous(),
-            theta=theta.transpose(1, 2).contiguous(),
+            dt=dt,
+            r=r,
+            theta=theta,
         )
 
     def extra_repr(self) -> str:

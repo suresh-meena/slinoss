@@ -174,7 +174,7 @@ class SLinOSSMixer(nn.Module):
 
     def _normalize_bc(self, x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         x_f = F.rms_norm(x.to(torch.float32), (self.d_state,), eps=1e-5)
-        scaled = x_f * scale.view(1, 1, self.n_heads, 2, self.d_state)
+        scaled = x_f * scale.view(1, 1, self.n_heads, x.shape[-2], self.d_state)
         return scaled.to(dtype=x.dtype).contiguous()
 
     def _apply_causal_depthwise_conv(
@@ -245,7 +245,9 @@ class SLinOSSMixer(nn.Module):
 
         coeffs = call_region(
             "mixer.discretizer",
-            lambda params_: self.discretizer(params_.view(batch, T, self.n_heads, -1)),
+            lambda params_: self.discretizer.scan_coeffs(
+                params_.view(batch, T, self.n_heads, -1)
+            ),
             params,
         )
         return call_region(
@@ -254,8 +256,8 @@ class SLinOSSMixer(nn.Module):
                 U=value_.view(batch, T, self.n_heads, self.d_head)
                 .permute(0, 2, 1, 3)
                 .contiguous(),
-                M=coeffs_.M,
-                K=coeffs_.K,
+                M=coeffs_[0],
+                K=coeffs_[1],
                 B=_pack_interleaved_pairs(B_sem_),
                 C=_pack_interleaved_pairs(C_sem_),
             ),
