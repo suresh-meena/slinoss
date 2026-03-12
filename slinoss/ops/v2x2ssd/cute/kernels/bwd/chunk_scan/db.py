@@ -185,7 +185,7 @@ class ChunkScanBwdDBAmpere:
             raise ValueError("P must be padded to a multiple of 32.")
 
         smem_k_block_size_D = 64 if Dp % 64 == 0 else 32
-        swizzle_bits_D = 3 if smem_k_block_size_D >= 32 else 2
+        swizzle_bits_D = 2 if smem_k_block_size_D >= 32 else 2
         sD_layout_atom = cute.make_composed_layout(
             cute.make_swizzle(swizzle_bits_D, 3, 3),
             0,
@@ -195,7 +195,7 @@ class ChunkScanBwdDBAmpere:
         sK_layout = cute.tile_to_shape(sD_layout_atom, (kv_tile, Dp), (0, 1))
 
         smem_k_block_size_P = p_tile
-        swizzle_bits_P = 2
+        swizzle_bits_P = 3
         sP_layout_atom = cute.make_composed_layout(
             cute.make_swizzle(swizzle_bits_P, 3, 3),
             0,
@@ -205,7 +205,7 @@ class ChunkScanBwdDBAmpere:
         sV_layout = cute.tile_to_shape(sP_layout_atom, (kv_tile, p_tile), (0, 1))
 
         smem_k_block_size_blk = kv_tile
-        swizzle_bits_blk = 3
+        swizzle_bits_blk = 3 if smem_k_block_size_blk == 64 else 2
         sBlk_layout_atom = cute.make_composed_layout(
             cute.make_swizzle(swizzle_bits_blk, 3, 3),
             0,
@@ -237,6 +237,9 @@ class ChunkScanBwdDBAmpere:
         )
         gmem_tiled_copy_P = cute.make_tiled_copy_tv(
             atom_async_copy_in, tP_layout, v_in_layout
+        )
+        gmem_tiled_copy_D = cute.make_tiled_copy_tv(
+            atom_async_copy_in, tD_layout, v_in_layout
         )
         atom_universal_copy_out = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
@@ -328,6 +331,7 @@ class ChunkScanBwdDBAmpere:
             sK_layout,
             sV_layout,
             sBlk_layout,
+            gmem_tiled_copy_D,
             gmem_tiled_copy_P,
             gmem_tiled_store_D,
             tiled_mma,
@@ -357,6 +361,7 @@ class ChunkScanBwdDBAmpere:
         sK_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
         sBlk_layout: cute.ComposedLayout,
+        gmem_tiled_copy_D: cute.TiledCopy,
         gmem_tiled_copy_P: cute.TiledCopy,
         gmem_tiled_store_D: cute.TiledCopy,
         tiled_mma: cute.TiledMma,
@@ -369,6 +374,7 @@ class ChunkScanBwdDBAmpere:
         p_tile = 32
         n_p_tiles = Pp // p_tile
         nvec = self.D // 2
+        nvec2 = self.D // 4
         BH = mU_prev0.shape[0]
         BHC = mB.shape[0]
         n_chunks = BHC // BH
@@ -520,13 +526,18 @@ class ChunkScanBwdDBAmpere:
         thr_copy_A = smem_tiled_copy_A.get_slice(tidx)
         thr_copy_B = smem_tiled_copy_B.get_slice(tidx)
         thr_copy_BT = smem_tiled_copy_BT.get_slice(tidx)
+        gmem_thr_copy_D = gmem_tiled_copy_D.get_slice(tidx)
         gmem_thr_copy_P = gmem_tiled_copy_P.get_slice(tidx)
         mcS = cute.make_identity_tensor((mU.shape[0], self.L, mU.shape[2], self.L))
         mcKD = cute.make_identity_tensor((mU.shape[0], self.L, mU.shape[2], Dp))
         mcU = cute.make_identity_tensor(mU.layout.shape)
+        mcC = cute.make_identity_tensor(mC.layout.shape)
         mcDY = cute.make_identity_tensor(mDOut.layout.shape)
         mcS_full = mcS[bidz, None, 0, None]
         mcKD_full = mcKD[bidz, None, 0, None]
+        tQsQ0 = gmem_thr_copy_D.partition_D(sQ0)
+        cC0 = cute.local_tile(mcC[bidz, None, 0, None], (kv_tile, Dp), (0, 0))
+        tCc0 = gmem_thr_copy_D.partition_S(cC0)
         tDYs0 = gmem_thr_copy_P.partition_D(sDY0)
         tDYs1 = gmem_thr_copy_P.partition_D(sDY1)
         tVsV0 = gmem_thr_copy_P.partition_D(sV_tile)
@@ -549,9 +560,31 @@ class ChunkScanBwdDBAmpere:
         iters_pairs_tile = int(
             (total_pairs_tile + self.num_threads - 1) // self.num_threads
         )
+        total_quads_tile = int(kv_tile * nvec2)
+        iters_quads_tile = int(
+            (total_quads_tile + self.num_threads - 1) // self.num_threads
+        )
         total_q_tile = int(kv_tile * Dp)
         iters_q_tile = int((total_q_tile + self.num_threads - 1) // self.num_threads)
         iters_d = int((self.D + self.num_threads - 1) // self.num_threads)
+        tQp = None
+        if cutlass.const_expr(self.D != Dp):
+            tQp = cute.make_rmem_tensor(
+                cute.make_layout(
+                    (
+                        tQsQ0.shape[0][1],
+                        cute.size(tQsQ0, mode=[1]),
+                        cute.size(tQsQ0, mode=[2]),
+                    ),
+                    stride=(cute.size(tQsQ0, mode=[2]), 0, 1),
+                ),
+                cutlass.Boolean,
+            )
+            for rest_v in cutlass.range_constexpr(tQp.shape[0]):
+                for rest_k in cutlass.range_constexpr(tQp.shape[2]):
+                    tQp[rest_v, 0, rest_k] = cute.elem_less(
+                        tCc0[(0, rest_v), 0, rest_k][3], mC.layout.shape[3]
+                    )
         tDYp = None
         if cutlass.const_expr(self.P != Pp):
             tDYp = cute.make_rmem_tensor(
@@ -599,28 +632,62 @@ class ChunkScanBwdDBAmpere:
                     sK_tile[t_local, d] = val
             cute.arch.barrier()
 
-            for it in cutlass.range_constexpr(iters_pairs_tile):
-                idx = tidx + cutlass.Int32(it * self.num_threads)
-                if idx < cutlass.Int32(total_pairs_tile):
-                    t_local = idx // nvec
-                    vv = idx - t_local * nvec
-                    t = cutlass.Int32(n0) + t_local
-                    if t < cutlass.Int32(self.L):
-                        d0 = vv * 2
-                        bx = cutlass.Float32(
-                            sK_tile[t_local, d0 + 0].to(cutlass.Float32)
-                        )
-                        by = cutlass.Float32(
-                            sK_tile[t_local, d0 + 1].to(cutlass.Float32)
-                        )
-                        kr = cutlass.Float32(s_tap_curr[t_local, 0])
-                        ki = cutlass.Float32(s_tap_curr[t_local, 1])
-                        tr, ti = apply_complex_tap(bx, by, kr, ki)
-                        pr = cutlass.Float32(s_phase[t, 0])
-                        pi = cutlass.Float32(s_phase[t, 1])
-                        kx, ky = conj_mul_phase(tr, ti, pr, pi)
-                        sK_tile[t_local, d0 + 0] = kx.to(mU.element_type)
-                        sK_tile[t_local, d0 + 1] = ky.to(mU.element_type)
+            if cutlass.const_expr((self.D % 4) == 0):
+                for it in cutlass.range_constexpr(iters_quads_tile):
+                    idx = tidx + cutlass.Int32(it * self.num_threads)
+                    if idx < cutlass.Int32(total_quads_tile):
+                        t_local = idx // cutlass.Int32(nvec2)
+                        vv4 = idx - t_local * cutlass.Int32(nvec2)
+                        t = cutlass.Int32(n0) + t_local
+                        if t < cutlass.Int32(self.L):
+                            d0 = vv4 * 4
+                            kr = cutlass.Float32(s_tap_curr[t_local, 0])
+                            ki = cutlass.Float32(s_tap_curr[t_local, 1])
+                            pr = cutlass.Float32(s_phase[t, 0])
+                            pi = cutlass.Float32(s_phase[t, 1])
+                            bx0 = cutlass.Float32(
+                                sK_tile[t_local, d0 + 0].to(cutlass.Float32)
+                            )
+                            by0 = cutlass.Float32(
+                                sK_tile[t_local, d0 + 1].to(cutlass.Float32)
+                            )
+                            tr0, ti0 = apply_complex_tap(bx0, by0, kr, ki)
+                            kx0, ky0 = conj_mul_phase(tr0, ti0, pr, pi)
+                            bx1 = cutlass.Float32(
+                                sK_tile[t_local, d0 + 2].to(cutlass.Float32)
+                            )
+                            by1 = cutlass.Float32(
+                                sK_tile[t_local, d0 + 3].to(cutlass.Float32)
+                            )
+                            tr1, ti1 = apply_complex_tap(bx1, by1, kr, ki)
+                            kx1, ky1 = conj_mul_phase(tr1, ti1, pr, pi)
+                            sK_tile[t_local, d0 + 0] = kx0.to(mU.element_type)
+                            sK_tile[t_local, d0 + 1] = ky0.to(mU.element_type)
+                            sK_tile[t_local, d0 + 2] = kx1.to(mU.element_type)
+                            sK_tile[t_local, d0 + 3] = ky1.to(mU.element_type)
+            else:
+                for it in cutlass.range_constexpr(iters_pairs_tile):
+                    idx = tidx + cutlass.Int32(it * self.num_threads)
+                    if idx < cutlass.Int32(total_pairs_tile):
+                        t_local = idx // nvec
+                        vv = idx - t_local * nvec
+                        t = cutlass.Int32(n0) + t_local
+                        if t < cutlass.Int32(self.L):
+                            d0 = vv * 2
+                            bx = cutlass.Float32(
+                                sK_tile[t_local, d0 + 0].to(cutlass.Float32)
+                            )
+                            by = cutlass.Float32(
+                                sK_tile[t_local, d0 + 1].to(cutlass.Float32)
+                            )
+                            kr = cutlass.Float32(s_tap_curr[t_local, 0])
+                            ki = cutlass.Float32(s_tap_curr[t_local, 1])
+                            tr, ti = apply_complex_tap(bx, by, kr, ki)
+                            pr = cutlass.Float32(s_phase[t, 0])
+                            pi = cutlass.Float32(s_phase[t, 1])
+                            kx, ky = conj_mul_phase(tr, ti, pr, pi)
+                            sK_tile[t_local, d0 + 0] = kx.to(mU.element_type)
+                            sK_tile[t_local, d0 + 1] = ky.to(mU.element_type)
             cute.arch.barrier()
 
             m_tiles = n_tiles - n_tile
@@ -628,37 +695,80 @@ class ChunkScanBwdDBAmpere:
                 m_tile = n_tile + mi
                 m0 = m_tile * kv_tile
 
-                for it in cutlass.range_constexpr(iters_q_tile):
-                    idx = tidx + cutlass.Int32(it * self.num_threads)
-                    if idx < cutlass.Int32(total_q_tile):
-                        t_local = idx // cutlass.Int32(Dp)
-                        d = idx - t_local * cutlass.Int32(Dp)
-                        val = cutlass.Float32(0.0).to(mU.element_type)
-                        t = cutlass.Int32(m0) + t_local
-                        if d < cutlass.Int32(self.D) and t < cutlass.Int32(self.L):
-                            val = mC[bidz, t, 0, d]
-                        sQ0[t_local, d] = val
+                gC = cute.local_tile(
+                    mC[bidz, None, 0, None], (kv_tile, Dp), (m_tile, 0)
+                )
+                tCg = gmem_thr_copy_D.partition_S(gC)
+                cC = cute.local_tile(
+                    mcC[bidz, None, 0, None], (kv_tile, Dp), (m_tile, 0)
+                )
+                tCc = gmem_thr_copy_D.partition_S(cC)
+                if cutlass.const_expr(self.D == Dp):
+                    cute.copy(gmem_tiled_copy_D, tCg, tQsQ0)
+                else:
+                    for di in cutlass.range_constexpr(cute.size(tQsQ0.shape[1])):
+                        if cute.elem_less(tCc[0, di, 0][1], mC.layout.shape[1]):
+                            cute.copy(
+                                gmem_tiled_copy_D,
+                                tCg[None, di, None],
+                                tQsQ0[None, di, None],
+                                pred=tQp[None, di, None],
+                            )
+                        else:
+                            tQsQ0[None, di, None].fill(0)
+                cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_wait_group(0)
                 cute.arch.barrier()
 
-                for it in cutlass.range_constexpr(iters_pairs_tile):
-                    idx = tidx + cutlass.Int32(it * self.num_threads)
-                    if idx < cutlass.Int32(total_pairs_tile):
-                        t_local = idx // nvec
-                        vv = idx - t_local * nvec
-                        t = cutlass.Int32(m0) + t_local
-                        if t < cutlass.Int32(self.L):
-                            d0 = vv * 2
-                            x = cutlass.Float32(
-                                sQ0[t_local, d0 + 0].to(cutlass.Float32)
-                            )
-                            y = cutlass.Float32(
-                                sQ0[t_local, d0 + 1].to(cutlass.Float32)
-                            )
-                            pr = cutlass.Float32(s_phase[t, 0])
-                            pi = cutlass.Float32(s_phase[t, 1])
-                            rx, ry = conj_mul_phase(x, y, pr, pi)
-                            sQ0[t_local, d0 + 0] = rx.to(mU.element_type)
-                            sQ0[t_local, d0 + 1] = ry.to(mU.element_type)
+                if cutlass.const_expr((self.D % 4) == 0):
+                    for it in cutlass.range_constexpr(iters_quads_tile):
+                        idx = tidx + cutlass.Int32(it * self.num_threads)
+                        if idx < cutlass.Int32(total_quads_tile):
+                            t_local = idx // cutlass.Int32(nvec2)
+                            vv4 = idx - t_local * cutlass.Int32(nvec2)
+                            t = cutlass.Int32(m0) + t_local
+                            if t < cutlass.Int32(self.L):
+                                d0 = vv4 * 4
+                                pr = cutlass.Float32(s_phase[t, 0])
+                                pi = cutlass.Float32(s_phase[t, 1])
+                                x0 = cutlass.Float32(
+                                    sQ0[t_local, d0 + 0].to(cutlass.Float32)
+                                )
+                                y0 = cutlass.Float32(
+                                    sQ0[t_local, d0 + 1].to(cutlass.Float32)
+                                )
+                                rx0, ry0 = conj_mul_phase(x0, y0, pr, pi)
+                                x1 = cutlass.Float32(
+                                    sQ0[t_local, d0 + 2].to(cutlass.Float32)
+                                )
+                                y1 = cutlass.Float32(
+                                    sQ0[t_local, d0 + 3].to(cutlass.Float32)
+                                )
+                                rx1, ry1 = conj_mul_phase(x1, y1, pr, pi)
+                                sQ0[t_local, d0 + 0] = rx0.to(mU.element_type)
+                                sQ0[t_local, d0 + 1] = ry0.to(mU.element_type)
+                                sQ0[t_local, d0 + 2] = rx1.to(mU.element_type)
+                                sQ0[t_local, d0 + 3] = ry1.to(mU.element_type)
+                else:
+                    for it in cutlass.range_constexpr(iters_pairs_tile):
+                        idx = tidx + cutlass.Int32(it * self.num_threads)
+                        if idx < cutlass.Int32(total_pairs_tile):
+                            t_local = idx // nvec
+                            vv = idx - t_local * nvec
+                            t = cutlass.Int32(m0) + t_local
+                            if t < cutlass.Int32(self.L):
+                                d0 = vv * 2
+                                x = cutlass.Float32(
+                                    sQ0[t_local, d0 + 0].to(cutlass.Float32)
+                                )
+                                y = cutlass.Float32(
+                                    sQ0[t_local, d0 + 1].to(cutlass.Float32)
+                                )
+                                pr = cutlass.Float32(s_phase[t, 0])
+                                pi = cutlass.Float32(s_phase[t, 1])
+                                rx, ry = conj_mul_phase(x, y, pr, pi)
+                                sQ0[t_local, d0 + 0] = rx.to(mU.element_type)
+                                sQ0[t_local, d0 + 1] = ry.to(mU.element_type)
                 cute.arch.barrier()
 
                 acc_blk_curr = cute.make_rmem_tensor(acc_shape_blk, cutlass.Float32)
@@ -912,23 +1022,50 @@ class ChunkScanBwdDBAmpere:
                         sS_blk[col_local, row_local] = val.to(mU.element_type)
                 cute.arch.barrier()
 
-                for it in cutlass.range_constexpr(iters_pairs_tile):
-                    idx = tidx + cutlass.Int32(it * self.num_threads)
-                    if idx < cutlass.Int32(total_pairs_tile):
-                        t_local = idx // nvec
-                        vv = idx - t_local * nvec
-                        t = cutlass.Int32(m0) + t_local
-                        if t < cutlass.Int32(self.L):
-                            d0 = vv * 2
-                            qx = cutlass.Float32(
-                                sQ0[t_local, d0 + 0].to(cutlass.Float32)
-                            )
-                            qy = cutlass.Float32(
-                                sQ0[t_local, d0 + 1].to(cutlass.Float32)
-                            )
-                            rs = cutlass.Float32(s_row_scale[t])
-                            sQ0[t_local, d0 + 0] = (qx * rs).to(mU.element_type)
-                            sQ0[t_local, d0 + 1] = (qy * rs).to(mU.element_type)
+                if cutlass.const_expr((self.D % 4) == 0):
+                    for it in cutlass.range_constexpr(iters_quads_tile):
+                        idx = tidx + cutlass.Int32(it * self.num_threads)
+                        if idx < cutlass.Int32(total_quads_tile):
+                            t_local = idx // cutlass.Int32(nvec2)
+                            vv4 = idx - t_local * cutlass.Int32(nvec2)
+                            t = cutlass.Int32(m0) + t_local
+                            if t < cutlass.Int32(self.L):
+                                d0 = vv4 * 4
+                                rs = cutlass.Float32(s_row_scale[t])
+                                qx0 = cutlass.Float32(
+                                    sQ0[t_local, d0 + 0].to(cutlass.Float32)
+                                )
+                                qy0 = cutlass.Float32(
+                                    sQ0[t_local, d0 + 1].to(cutlass.Float32)
+                                )
+                                qx1 = cutlass.Float32(
+                                    sQ0[t_local, d0 + 2].to(cutlass.Float32)
+                                )
+                                qy1 = cutlass.Float32(
+                                    sQ0[t_local, d0 + 3].to(cutlass.Float32)
+                                )
+                                sQ0[t_local, d0 + 0] = (qx0 * rs).to(mU.element_type)
+                                sQ0[t_local, d0 + 1] = (qy0 * rs).to(mU.element_type)
+                                sQ0[t_local, d0 + 2] = (qx1 * rs).to(mU.element_type)
+                                sQ0[t_local, d0 + 3] = (qy1 * rs).to(mU.element_type)
+                else:
+                    for it in cutlass.range_constexpr(iters_pairs_tile):
+                        idx = tidx + cutlass.Int32(it * self.num_threads)
+                        if idx < cutlass.Int32(total_pairs_tile):
+                            t_local = idx // nvec
+                            vv = idx - t_local * nvec
+                            t = cutlass.Int32(m0) + t_local
+                            if t < cutlass.Int32(self.L):
+                                d0 = vv * 2
+                                qx = cutlass.Float32(
+                                    sQ0[t_local, d0 + 0].to(cutlass.Float32)
+                                )
+                                qy = cutlass.Float32(
+                                    sQ0[t_local, d0 + 1].to(cutlass.Float32)
+                                )
+                                rs = cutlass.Float32(s_row_scale[t])
+                                sQ0[t_local, d0 + 0] = (qx * rs).to(mU.element_type)
+                                sQ0[t_local, d0 + 1] = (qy * rs).to(mU.element_type)
                 cute.arch.barrier()
 
                 cute.copy(
@@ -1393,77 +1530,215 @@ class ChunkScanBwdDBAmpere:
                     dmy_curr1 = cutlass.Float32(0.0)
                     dmy_prev0 = cutlass.Float32(0.0)
                     dmy_prev1 = cutlass.Float32(0.0)
-                    vv = lane
-                    while vv < nvec:
-                        d0 = vv * 2
+                    pr = cutlass.Float32(s_phase[row, 0])
+                    pi = cutlass.Float32(s_phase[row, 1])
+                    if cutlass.const_expr((self.D % 4) == 0):
+                        vv4 = lane
+                        while vv4 < cutlass.Int32(nvec2):
+                            d0 = vv4 * 4
 
-                        bxr_curr = cutlass.Float32(
-                            sK_tile[t_local, d0 + 0].to(cutlass.Float32)
-                        )
-                        bxi_curr = cutlass.Float32(
-                            sK_tile[t_local, d0 + 1].to(cutlass.Float32)
-                        )
-                        pr = cutlass.Float32(s_phase[row, 0])
-                        pi = cutlass.Float32(s_phase[row, 1])
-                        gx_curr, gy_curr = conj_mul_phase(bxr_curr, bxi_curr, pr, pi)
-                        br_curr = cutlass.Float32(
-                            mB[bidz, row, 0, d0 + 0].to(cutlass.Float32)
-                        )
-                        bi_curr = cutlass.Float32(
-                            mB[bidz, row, 0, d0 + 1].to(cutlass.Float32)
-                        )
-                        dmy_curr0 = dmy_curr0 + gx_curr * br_curr - gy_curr * bi_curr
-                        dmy_curr1 = dmy_curr1 + gx_curr * bi_curr + gy_curr * br_curr
+                            bxr_curr0 = cutlass.Float32(
+                                sK_tile[t_local, d0 + 0].to(cutlass.Float32)
+                            )
+                            bxi_curr0 = cutlass.Float32(
+                                sK_tile[t_local, d0 + 1].to(cutlass.Float32)
+                            )
+                            gx_curr0, gy_curr0 = conj_mul_phase(
+                                bxr_curr0, bxi_curr0, pr, pi
+                            )
+                            br_curr0 = cutlass.Float32(
+                                mB[bidz, row, 0, d0 + 0].to(cutlass.Float32)
+                            )
+                            bi_curr0 = cutlass.Float32(
+                                mB[bidz, row, 0, d0 + 1].to(cutlass.Float32)
+                            )
+                            dmy_curr0 = dmy_curr0 + gx_curr0 * br_curr0 - gy_curr0 * bi_curr0
+                            dmy_curr1 = dmy_curr1 + gx_curr0 * bi_curr0 + gy_curr0 * br_curr0
 
-                        bxr_prev = cutlass.Float32(
-                            sQ0[t_local, d0 + 0].to(cutlass.Float32)
-                        )
-                        bxi_prev = cutlass.Float32(
-                            sQ0[t_local, d0 + 1].to(cutlass.Float32)
-                        )
-                        gx_prev, gy_prev = conj_mul_phase(bxr_prev, bxi_prev, pr, pi)
-                        br_prev = cutlass.Float32(0.0)
-                        bi_prev = cutlass.Float32(0.0)
-                        if row > cutlass.Int32(0):
-                            br_prev = cutlass.Float32(
-                                mB[bidz, row - cutlass.Int32(1), 0, d0 + 0].to(
-                                    cutlass.Float32
-                                )
+                            bxr_curr1 = cutlass.Float32(
+                                sK_tile[t_local, d0 + 2].to(cutlass.Float32)
                             )
-                            bi_prev = cutlass.Float32(
-                                mB[bidz, row - cutlass.Int32(1), 0, d0 + 1].to(
-                                    cutlass.Float32
-                                )
+                            bxi_curr1 = cutlass.Float32(
+                                sK_tile[t_local, d0 + 3].to(cutlass.Float32)
                             )
-                        else:
-                            if chunk == cutlass.Int32(0):
-                                br_prev = cutlass.Float32(
-                                    mB_prev0[bh, d0 + 0].to(cutlass.Float32)
+                            gx_curr1, gy_curr1 = conj_mul_phase(
+                                bxr_curr1, bxi_curr1, pr, pi
+                            )
+                            br_curr1 = cutlass.Float32(
+                                mB[bidz, row, 0, d0 + 2].to(cutlass.Float32)
+                            )
+                            bi_curr1 = cutlass.Float32(
+                                mB[bidz, row, 0, d0 + 3].to(cutlass.Float32)
+                            )
+                            dmy_curr0 = dmy_curr0 + gx_curr1 * br_curr1 - gy_curr1 * bi_curr1
+                            dmy_curr1 = dmy_curr1 + gx_curr1 * bi_curr1 + gy_curr1 * br_curr1
+
+                            bxr_prev0 = cutlass.Float32(
+                                sQ0[t_local, d0 + 0].to(cutlass.Float32)
+                            )
+                            bxi_prev0 = cutlass.Float32(
+                                sQ0[t_local, d0 + 1].to(cutlass.Float32)
+                            )
+                            gx_prev0, gy_prev0 = conj_mul_phase(
+                                bxr_prev0, bxi_prev0, pr, pi
+                            )
+                            bxr_prev1 = cutlass.Float32(
+                                sQ0[t_local, d0 + 2].to(cutlass.Float32)
+                            )
+                            bxi_prev1 = cutlass.Float32(
+                                sQ0[t_local, d0 + 3].to(cutlass.Float32)
+                            )
+                            gx_prev1, gy_prev1 = conj_mul_phase(
+                                bxr_prev1, bxi_prev1, pr, pi
+                            )
+                            br_prev0 = cutlass.Float32(0.0)
+                            bi_prev0 = cutlass.Float32(0.0)
+                            br_prev1 = cutlass.Float32(0.0)
+                            bi_prev1 = cutlass.Float32(0.0)
+                            if row > cutlass.Int32(0):
+                                br_prev0 = cutlass.Float32(
+                                    mB[bidz, row - cutlass.Int32(1), 0, d0 + 0].to(
+                                        cutlass.Float32
+                                    )
                                 )
-                                bi_prev = cutlass.Float32(
-                                    mB_prev0[bh, d0 + 1].to(cutlass.Float32)
+                                bi_prev0 = cutlass.Float32(
+                                    mB[bidz, row - cutlass.Int32(1), 0, d0 + 1].to(
+                                        cutlass.Float32
+                                    )
+                                )
+                                br_prev1 = cutlass.Float32(
+                                    mB[bidz, row - cutlass.Int32(1), 0, d0 + 2].to(
+                                        cutlass.Float32
+                                    )
+                                )
+                                bi_prev1 = cutlass.Float32(
+                                    mB[bidz, row - cutlass.Int32(1), 0, d0 + 3].to(
+                                        cutlass.Float32
+                                    )
                                 )
                             else:
+                                if chunk == cutlass.Int32(0):
+                                    br_prev0 = cutlass.Float32(
+                                        mB_prev0[bh, d0 + 0].to(cutlass.Float32)
+                                    )
+                                    bi_prev0 = cutlass.Float32(
+                                        mB_prev0[bh, d0 + 1].to(cutlass.Float32)
+                                    )
+                                    br_prev1 = cutlass.Float32(
+                                        mB_prev0[bh, d0 + 2].to(cutlass.Float32)
+                                    )
+                                    bi_prev1 = cutlass.Float32(
+                                        mB_prev0[bh, d0 + 3].to(cutlass.Float32)
+                                    )
+                                else:
+                                    br_prev0 = cutlass.Float32(
+                                        mB[
+                                            bidz - cutlass.Int32(1),
+                                            cutlass.Int32(self.L - 1),
+                                            0,
+                                            d0 + 0,
+                                        ].to(cutlass.Float32)
+                                    )
+                                    bi_prev0 = cutlass.Float32(
+                                        mB[
+                                            bidz - cutlass.Int32(1),
+                                            cutlass.Int32(self.L - 1),
+                                            0,
+                                            d0 + 1,
+                                        ].to(cutlass.Float32)
+                                    )
+                                    br_prev1 = cutlass.Float32(
+                                        mB[
+                                            bidz - cutlass.Int32(1),
+                                            cutlass.Int32(self.L - 1),
+                                            0,
+                                            d0 + 2,
+                                        ].to(cutlass.Float32)
+                                    )
+                                    bi_prev1 = cutlass.Float32(
+                                        mB[
+                                            bidz - cutlass.Int32(1),
+                                            cutlass.Int32(self.L - 1),
+                                            0,
+                                            d0 + 3,
+                                        ].to(cutlass.Float32)
+                                    )
+                            dmy_prev0 = dmy_prev0 + gx_prev0 * br_prev0 - gy_prev0 * bi_prev0
+                            dmy_prev1 = dmy_prev1 + gx_prev0 * bi_prev0 + gy_prev0 * br_prev0
+                            dmy_prev0 = dmy_prev0 + gx_prev1 * br_prev1 - gy_prev1 * bi_prev1
+                            dmy_prev1 = dmy_prev1 + gx_prev1 * bi_prev1 + gy_prev1 * br_prev1
+
+                            vv4 = vv4 + cutlass.Int32(32)
+                    else:
+                        vv = lane
+                        while vv < nvec:
+                            d0 = vv * 2
+
+                            bxr_curr = cutlass.Float32(
+                                sK_tile[t_local, d0 + 0].to(cutlass.Float32)
+                            )
+                            bxi_curr = cutlass.Float32(
+                                sK_tile[t_local, d0 + 1].to(cutlass.Float32)
+                            )
+                            gx_curr, gy_curr = conj_mul_phase(bxr_curr, bxi_curr, pr, pi)
+                            br_curr = cutlass.Float32(
+                                mB[bidz, row, 0, d0 + 0].to(cutlass.Float32)
+                            )
+                            bi_curr = cutlass.Float32(
+                                mB[bidz, row, 0, d0 + 1].to(cutlass.Float32)
+                            )
+                            dmy_curr0 = dmy_curr0 + gx_curr * br_curr - gy_curr * bi_curr
+                            dmy_curr1 = dmy_curr1 + gx_curr * bi_curr + gy_curr * br_curr
+
+                            bxr_prev = cutlass.Float32(
+                                sQ0[t_local, d0 + 0].to(cutlass.Float32)
+                            )
+                            bxi_prev = cutlass.Float32(
+                                sQ0[t_local, d0 + 1].to(cutlass.Float32)
+                            )
+                            gx_prev, gy_prev = conj_mul_phase(bxr_prev, bxi_prev, pr, pi)
+                            br_prev = cutlass.Float32(0.0)
+                            bi_prev = cutlass.Float32(0.0)
+                            if row > cutlass.Int32(0):
                                 br_prev = cutlass.Float32(
-                                    mB[
-                                        bidz - cutlass.Int32(1),
-                                        cutlass.Int32(self.L - 1),
-                                        0,
-                                        d0 + 0,
-                                    ].to(cutlass.Float32)
+                                    mB[bidz, row - cutlass.Int32(1), 0, d0 + 0].to(
+                                        cutlass.Float32
+                                    )
                                 )
                                 bi_prev = cutlass.Float32(
-                                    mB[
-                                        bidz - cutlass.Int32(1),
-                                        cutlass.Int32(self.L - 1),
-                                        0,
-                                        d0 + 1,
-                                    ].to(cutlass.Float32)
+                                    mB[bidz, row - cutlass.Int32(1), 0, d0 + 1].to(
+                                        cutlass.Float32
+                                    )
                                 )
-                        dmy_prev0 = dmy_prev0 + gx_prev * br_prev - gy_prev * bi_prev
-                        dmy_prev1 = dmy_prev1 + gx_prev * bi_prev + gy_prev * br_prev
+                            else:
+                                if chunk == cutlass.Int32(0):
+                                    br_prev = cutlass.Float32(
+                                        mB_prev0[bh, d0 + 0].to(cutlass.Float32)
+                                    )
+                                    bi_prev = cutlass.Float32(
+                                        mB_prev0[bh, d0 + 1].to(cutlass.Float32)
+                                    )
+                                else:
+                                    br_prev = cutlass.Float32(
+                                        mB[
+                                            bidz - cutlass.Int32(1),
+                                            cutlass.Int32(self.L - 1),
+                                            0,
+                                            d0 + 0,
+                                        ].to(cutlass.Float32)
+                                    )
+                                    bi_prev = cutlass.Float32(
+                                        mB[
+                                            bidz - cutlass.Int32(1),
+                                            cutlass.Int32(self.L - 1),
+                                            0,
+                                            d0 + 1,
+                                        ].to(cutlass.Float32)
+                                    )
+                            dmy_prev0 = dmy_prev0 + gx_prev * br_prev - gy_prev * bi_prev
+                            dmy_prev1 = dmy_prev1 + gx_prev * bi_prev + gy_prev * br_prev
 
-                        vv = vv + cutlass.Int32(32)
+                            vv = vv + cutlass.Int32(32)
 
                     for off in (16, 8, 4, 2, 1):
                         dmy_curr0 = dmy_curr0 + cute.arch.shuffle_sync_bfly(
@@ -1486,80 +1761,204 @@ class ChunkScanBwdDBAmpere:
                 t_local = t_local + cutlass.Int32(self.num_warps)
             cute.arch.barrier()
 
-            for it in cutlass.range_constexpr(iters_pairs_tile):
-                idx = tidx + cutlass.Int32(it * self.num_threads)
-                if idx < cutlass.Int32(total_pairs_tile):
-                    t_local = idx // nvec
-                    vv = idx - t_local * nvec
-                    row = cutlass.Int32(n0) + t_local
-                    if row < cutlass.Int32(self.L):
-                        d0 = vv * 2
-                        bxr_curr = cutlass.Float32(
-                            sK_tile[t_local, d0 + 0].to(cutlass.Float32)
-                        )
-                        bxi_curr = cutlass.Float32(
-                            sK_tile[t_local, d0 + 1].to(cutlass.Float32)
-                        )
-                        kr_curr = cutlass.Float32(s_tap_curr[t_local, 0])
-                        ki_curr = cutlass.Float32(s_tap_curr[t_local, 1])
-                        dbr_curr, dbi_curr = apply_complex_tap_adjoint(
-                            bxr_curr, bxi_curr, kr_curr, ki_curr
-                        )
-                        sK_tile[t_local, d0 + 0] = dbr_curr.to(mU.element_type)
-                        sK_tile[t_local, d0 + 1] = dbi_curr.to(mU.element_type)
+            if cutlass.const_expr((self.D % 4) == 0):
+                for it in cutlass.range_constexpr(iters_quads_tile):
+                    idx = tidx + cutlass.Int32(it * self.num_threads)
+                    if idx < cutlass.Int32(total_quads_tile):
+                        t_local = idx // cutlass.Int32(nvec2)
+                        vv4 = idx - t_local * cutlass.Int32(nvec2)
+                        row = cutlass.Int32(n0) + t_local
+                        if row < cutlass.Int32(self.L):
+                            d0 = vv4 * 4
+                            kr_curr = cutlass.Float32(s_tap_curr[t_local, 0])
+                            ki_curr = cutlass.Float32(s_tap_curr[t_local, 1])
+                            bxr_curr0 = cutlass.Float32(
+                                sK_tile[t_local, d0 + 0].to(cutlass.Float32)
+                            )
+                            bxi_curr0 = cutlass.Float32(
+                                sK_tile[t_local, d0 + 1].to(cutlass.Float32)
+                            )
+                            dbr_curr0, dbi_curr0 = apply_complex_tap_adjoint(
+                                bxr_curr0, bxi_curr0, kr_curr, ki_curr
+                            )
+                            bxr_curr1 = cutlass.Float32(
+                                sK_tile[t_local, d0 + 2].to(cutlass.Float32)
+                            )
+                            bxi_curr1 = cutlass.Float32(
+                                sK_tile[t_local, d0 + 3].to(cutlass.Float32)
+                            )
+                            dbr_curr1, dbi_curr1 = apply_complex_tap_adjoint(
+                                bxr_curr1, bxi_curr1, kr_curr, ki_curr
+                            )
+                            sK_tile[t_local, d0 + 0] = dbr_curr0.to(mU.element_type)
+                            sK_tile[t_local, d0 + 1] = dbi_curr0.to(mU.element_type)
+                            sK_tile[t_local, d0 + 2] = dbr_curr1.to(mU.element_type)
+                            sK_tile[t_local, d0 + 3] = dbi_curr1.to(mU.element_type)
 
-                        bxr_prev = cutlass.Float32(
-                            sQ0[t_local, d0 + 0].to(cutlass.Float32)
-                        )
-                        bxi_prev = cutlass.Float32(
-                            sQ0[t_local, d0 + 1].to(cutlass.Float32)
-                        )
-                        kr_prev = cutlass.Float32(s_tap_prev[row, 0])
-                        ki_prev = cutlass.Float32(s_tap_prev[row, 1])
-                        dbr_prev, dbi_prev = apply_complex_tap_adjoint(
-                            bxr_prev, bxi_prev, kr_prev, ki_prev
-                        )
-                        sQ0[t_local, d0 + 0] = dbr_prev.to(mU.element_type)
-                        sQ0[t_local, d0 + 1] = dbi_prev.to(mU.element_type)
+                            kr_prev = cutlass.Float32(s_tap_prev[row, 0])
+                            ki_prev = cutlass.Float32(s_tap_prev[row, 1])
+                            bxr_prev0 = cutlass.Float32(
+                                sQ0[t_local, d0 + 0].to(cutlass.Float32)
+                            )
+                            bxi_prev0 = cutlass.Float32(
+                                sQ0[t_local, d0 + 1].to(cutlass.Float32)
+                            )
+                            dbr_prev0, dbi_prev0 = apply_complex_tap_adjoint(
+                                bxr_prev0, bxi_prev0, kr_prev, ki_prev
+                            )
+                            bxr_prev1 = cutlass.Float32(
+                                sQ0[t_local, d0 + 2].to(cutlass.Float32)
+                            )
+                            bxi_prev1 = cutlass.Float32(
+                                sQ0[t_local, d0 + 3].to(cutlass.Float32)
+                            )
+                            dbr_prev1, dbi_prev1 = apply_complex_tap_adjoint(
+                                bxr_prev1, bxi_prev1, kr_prev, ki_prev
+                            )
+                            sQ0[t_local, d0 + 0] = dbr_prev0.to(mU.element_type)
+                            sQ0[t_local, d0 + 1] = dbi_prev0.to(mU.element_type)
+                            sQ0[t_local, d0 + 2] = dbr_prev1.to(mU.element_type)
+                            sQ0[t_local, d0 + 3] = dbi_prev1.to(mU.element_type)
+            else:
+                for it in cutlass.range_constexpr(iters_pairs_tile):
+                    idx = tidx + cutlass.Int32(it * self.num_threads)
+                    if idx < cutlass.Int32(total_pairs_tile):
+                        t_local = idx // nvec
+                        vv = idx - t_local * nvec
+                        row = cutlass.Int32(n0) + t_local
+                        if row < cutlass.Int32(self.L):
+                            d0 = vv * 2
+                            bxr_curr = cutlass.Float32(
+                                sK_tile[t_local, d0 + 0].to(cutlass.Float32)
+                            )
+                            bxi_curr = cutlass.Float32(
+                                sK_tile[t_local, d0 + 1].to(cutlass.Float32)
+                            )
+                            kr_curr = cutlass.Float32(s_tap_curr[t_local, 0])
+                            ki_curr = cutlass.Float32(s_tap_curr[t_local, 1])
+                            dbr_curr, dbi_curr = apply_complex_tap_adjoint(
+                                bxr_curr, bxi_curr, kr_curr, ki_curr
+                            )
+                            sK_tile[t_local, d0 + 0] = dbr_curr.to(mU.element_type)
+                            sK_tile[t_local, d0 + 1] = dbi_curr.to(mU.element_type)
+
+                            bxr_prev = cutlass.Float32(
+                                sQ0[t_local, d0 + 0].to(cutlass.Float32)
+                            )
+                            bxi_prev = cutlass.Float32(
+                                sQ0[t_local, d0 + 1].to(cutlass.Float32)
+                            )
+                            kr_prev = cutlass.Float32(s_tap_prev[row, 0])
+                            ki_prev = cutlass.Float32(s_tap_prev[row, 1])
+                            dbr_prev, dbi_prev = apply_complex_tap_adjoint(
+                                bxr_prev, bxi_prev, kr_prev, ki_prev
+                            )
+                            sQ0[t_local, d0 + 0] = dbr_prev.to(mU.element_type)
+                            sQ0[t_local, d0 + 1] = dbi_prev.to(mU.element_type)
             cute.arch.barrier()
 
-            for it in cutlass.range_constexpr(iters_pairs_tile):
-                idx = tidx + cutlass.Int32(it * self.num_threads)
-                if idx < cutlass.Int32(total_pairs_tile):
-                    t_local = idx // nvec
-                    vv = idx - t_local * nvec
-                    row = cutlass.Int32(n0) + t_local
-                    if row < cutlass.Int32(self.L):
-                        d0 = vv * 2
-                        currx = cutlass.Float32(
-                            sK_tile[t_local, d0 + 0].to(cutlass.Float32)
-                        )
-                        curry = cutlass.Float32(
-                            sK_tile[t_local, d0 + 1].to(cutlass.Float32)
-                        )
-                        prevx = cutlass.Float32(0.0)
-                        prevy = cutlass.Float32(0.0)
-                        if row + cutlass.Int32(1) < cutlass.Int32(self.L):
-                            if t_local + cutlass.Int32(1) < cutlass.Int32(kv_tile):
-                                prevx = cutlass.Float32(
-                                    sQ0[t_local + cutlass.Int32(1), d0 + 0].to(
-                                        cutlass.Float32
+            if cutlass.const_expr((self.D % 4) == 0):
+                for it in cutlass.range_constexpr(iters_quads_tile):
+                    idx = tidx + cutlass.Int32(it * self.num_threads)
+                    if idx < cutlass.Int32(total_quads_tile):
+                        t_local = idx // cutlass.Int32(nvec2)
+                        vv4 = idx - t_local * cutlass.Int32(nvec2)
+                        row = cutlass.Int32(n0) + t_local
+                        if row < cutlass.Int32(self.L):
+                            d0 = vv4 * 4
+                            currx0 = cutlass.Float32(
+                                sK_tile[t_local, d0 + 0].to(cutlass.Float32)
+                            )
+                            curry0 = cutlass.Float32(
+                                sK_tile[t_local, d0 + 1].to(cutlass.Float32)
+                            )
+                            currx1 = cutlass.Float32(
+                                sK_tile[t_local, d0 + 2].to(cutlass.Float32)
+                            )
+                            curry1 = cutlass.Float32(
+                                sK_tile[t_local, d0 + 3].to(cutlass.Float32)
+                            )
+                            prevx0 = cutlass.Float32(0.0)
+                            prevy0 = cutlass.Float32(0.0)
+                            prevx1 = cutlass.Float32(0.0)
+                            prevy1 = cutlass.Float32(0.0)
+                            if row + cutlass.Int32(1) < cutlass.Int32(self.L):
+                                if t_local + cutlass.Int32(1) < cutlass.Int32(kv_tile):
+                                    prevx0 = cutlass.Float32(
+                                        sQ0[t_local + cutlass.Int32(1), d0 + 0].to(
+                                            cutlass.Float32
+                                        )
                                     )
-                                )
-                                prevy = cutlass.Float32(
-                                    sQ0[t_local + cutlass.Int32(1), d0 + 1].to(
-                                        cutlass.Float32
+                                    prevy0 = cutlass.Float32(
+                                        sQ0[t_local + cutlass.Int32(1), d0 + 1].to(
+                                            cutlass.Float32
+                                        )
                                     )
-                                )
-                            else:
-                                prevx = cutlass.Float32(
-                                    sDB_carry[d0 + 0].to(cutlass.Float32)
-                                )
-                                prevy = cutlass.Float32(
-                                    sDB_carry[d0 + 1].to(cutlass.Float32)
-                                )
-                        sK_tile[t_local, d0 + 0] = (currx + prevx).to(mU.element_type)
-                        sK_tile[t_local, d0 + 1] = (curry + prevy).to(mU.element_type)
+                                    prevx1 = cutlass.Float32(
+                                        sQ0[t_local + cutlass.Int32(1), d0 + 2].to(
+                                            cutlass.Float32
+                                        )
+                                    )
+                                    prevy1 = cutlass.Float32(
+                                        sQ0[t_local + cutlass.Int32(1), d0 + 3].to(
+                                            cutlass.Float32
+                                        )
+                                    )
+                                else:
+                                    prevx0 = cutlass.Float32(
+                                        sDB_carry[d0 + 0].to(cutlass.Float32)
+                                    )
+                                    prevy0 = cutlass.Float32(
+                                        sDB_carry[d0 + 1].to(cutlass.Float32)
+                                    )
+                                    prevx1 = cutlass.Float32(
+                                        sDB_carry[d0 + 2].to(cutlass.Float32)
+                                    )
+                                    prevy1 = cutlass.Float32(
+                                        sDB_carry[d0 + 3].to(cutlass.Float32)
+                                    )
+                            sK_tile[t_local, d0 + 0] = (currx0 + prevx0).to(mU.element_type)
+                            sK_tile[t_local, d0 + 1] = (curry0 + prevy0).to(mU.element_type)
+                            sK_tile[t_local, d0 + 2] = (currx1 + prevx1).to(mU.element_type)
+                            sK_tile[t_local, d0 + 3] = (curry1 + prevy1).to(mU.element_type)
+            else:
+                for it in cutlass.range_constexpr(iters_pairs_tile):
+                    idx = tidx + cutlass.Int32(it * self.num_threads)
+                    if idx < cutlass.Int32(total_pairs_tile):
+                        t_local = idx // nvec
+                        vv = idx - t_local * nvec
+                        row = cutlass.Int32(n0) + t_local
+                        if row < cutlass.Int32(self.L):
+                            d0 = vv * 2
+                            currx = cutlass.Float32(
+                                sK_tile[t_local, d0 + 0].to(cutlass.Float32)
+                            )
+                            curry = cutlass.Float32(
+                                sK_tile[t_local, d0 + 1].to(cutlass.Float32)
+                            )
+                            prevx = cutlass.Float32(0.0)
+                            prevy = cutlass.Float32(0.0)
+                            if row + cutlass.Int32(1) < cutlass.Int32(self.L):
+                                if t_local + cutlass.Int32(1) < cutlass.Int32(kv_tile):
+                                    prevx = cutlass.Float32(
+                                        sQ0[t_local + cutlass.Int32(1), d0 + 0].to(
+                                            cutlass.Float32
+                                        )
+                                    )
+                                    prevy = cutlass.Float32(
+                                        sQ0[t_local + cutlass.Int32(1), d0 + 1].to(
+                                            cutlass.Float32
+                                        )
+                                    )
+                                else:
+                                    prevx = cutlass.Float32(
+                                        sDB_carry[d0 + 0].to(cutlass.Float32)
+                                    )
+                                    prevy = cutlass.Float32(
+                                        sDB_carry[d0 + 1].to(cutlass.Float32)
+                                    )
+                            sK_tile[t_local, d0 + 0] = (currx + prevx).to(mU.element_type)
+                            sK_tile[t_local, d0 + 1] = (curry + prevy).to(mU.element_type)
             cute.arch.barrier()
 
             gDB = cute.local_tile(mDB[bidz, None, 0, None], (kv_tile, Dp), (n_tile, 0))
