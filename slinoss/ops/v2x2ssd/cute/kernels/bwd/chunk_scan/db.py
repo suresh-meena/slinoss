@@ -504,7 +504,6 @@ class ChunkScanBwdDBAmpere:
             s_phase[tidx, 1] = ui
             s_tap_prev[tidx, 0] = cutlass.Float32(mK[bidz, tidx, 0, 0])
             s_tap_prev[tidx, 1] = cutlass.Float32(mK[bidz, tidx, 0, 1])
-            s_dlp[tidx] = cutlass.Float32(0.0)
         cute.arch.barrier()
 
         smem_copy_atom_A = cute.make_copy_atom(

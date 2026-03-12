@@ -511,7 +511,6 @@ class ChunkScanBwdDUAmpere:
             )
             s_row_scale[tidx] = row_scale
             s_inv_row_scale[tidx] = cutlass.Float32(1.0) / row_scale
-            s_dlp[tidx] = cutlass.Float32(0.0)
             tap_prev = mK[bidz, tidx, 0, None].load().to(cutlass.Float32)
             s_tap_prev[tidx, 0] = cutlass.Float32(tap_prev[0])
             s_tap_prev[tidx, 1] = cutlass.Float32(tap_prev[1])
