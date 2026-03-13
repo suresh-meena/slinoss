@@ -22,8 +22,10 @@ _ACTIVE_STEPS_LOCK = threading.RLock()
 
 
 def current_step() -> "_PerfStep | None":
-    with _ACTIVE_STEPS_LOCK:
-        return _ACTIVE_STEPS[-1] if _ACTIVE_STEPS else None
+    try:
+        return _ACTIVE_STEPS[-1]
+    except IndexError:
+        return None
 
 
 def _profiler_enabled() -> bool:
