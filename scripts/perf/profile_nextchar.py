@@ -22,9 +22,8 @@ from _common import dtype_from_str, ensure_cuda, seed_all  # noqa: E402
 from _nextchar import (  # noqa: E402
     NextCharPerfConfig,
     build_model,
-    attach_workload_timers,
     random_batch,
-    run_train_step,
+    run_train_step_profiled,
 )
 from slinoss.perf.budget import (  # noqa: E402
     build_tree,
@@ -89,71 +88,66 @@ def main() -> int:
     seed_all(args.seed)
 
     cfg = _make_cfg(args)
-    model, optimizer = build_model(cfg, backend=args.backend)
-    handles = attach_workload_timers(model)
+    model, optimizer = build_model(cfg, backend=args.backend, instrumented=True)
     captures: list[dict[str, Any]] = []
-    try:
-        activities = [torch.profiler.ProfilerActivity.CPU]
-        if torch.cuda.is_available():
-            activities.append(torch.profiler.ProfilerActivity.CUDA)
-        schedule = torch.profiler.schedule(
-            wait=0, warmup=args.warmup, active=args.active, repeat=1
-        )
-        total_steps = int(args.warmup) + int(args.active)
-        with torch.profiler.profile(
-            activities=activities,
-            schedule=schedule,
-            acc_events=True,
-            record_shapes=True,
-            profile_memory=True,
-            with_stack=False,
-        ) as prof:
-            for _ in range(total_steps):
-                xb, yb = random_batch(cfg)
-                from slinoss.perf import PerfRecorder
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+    schedule = torch.profiler.schedule(
+        wait=0, warmup=args.warmup, active=args.active, repeat=1
+    )
+    total_steps = int(args.warmup) + int(args.active)
+    with torch.profiler.profile(
+        activities=activities,
+        schedule=schedule,
+        acc_events=True,
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=False,
+    ) as prof:
+        for _ in range(total_steps):
+            xb, yb = random_batch(cfg)
+            from slinoss.perf import PerfRecorder
 
-                recorder = PerfRecorder(device=cfg.torch_device)
-                with recorder.capture_step():
-                    run_train_step(model, optimizer, xb, yb, grad_clip=cfg.grad_clip)
-                captures.append(recorder.steps[-1])
-                prof.step()
-        if args.trace_out is not None:
-            args.trace_out.parent.mkdir(parents=True, exist_ok=True)
-            prof.export_chrome_trace(str(args.trace_out))
-        active_captures = captures[-int(args.active) :]
-        region_samples = [capture["regions_ms"] for capture in active_captures]
-        summaries = summarize_named_samples(region_samples)
-        budget = summarize_budget_samples(region_samples)
-        tree = build_tree(budget)
+            recorder = PerfRecorder(device=cfg.torch_device)
+            with recorder.capture_step():
+                run_train_step_profiled(
+                    model, optimizer, xb, yb, grad_clip=cfg.grad_clip
+                )
+            captures.append(recorder.steps[-1])
+            prof.step()
+    if args.trace_out is not None:
+        args.trace_out.parent.mkdir(parents=True, exist_ok=True)
+        prof.export_chrome_trace(str(args.trace_out))
+    active_captures = captures[-int(args.active) :]
+    region_samples = [capture["regions_ms"] for capture in active_captures]
+    summaries = summarize_named_samples(region_samples)
+    budget = summarize_budget_samples(region_samples)
+    tree = build_tree(budget)
 
-        print(
-            prof.key_averages().table(
-                sort_by=args.sort_by,
-                row_limit=args.top_k,
-            )
+    print(
+        prof.key_averages().table(
+            sort_by=args.sort_by,
+            row_limit=args.top_k,
         )
-        payload = {
-            "kind": "profile_nextchar",
-            "schema_version": 1,
-            "backend": args.backend,
-            "config": cfg.perf_config_dict,
-            "regions": summaries,
-            "budget": budget,
-            "tree": tree,
-            "trace_out": None if args.trace_out is None else str(args.trace_out),
-        }
-        validate_nextchar_profile_payload(payload)
-        if args.json_out is not None:
-            args.json_out.parent.mkdir(parents=True, exist_ok=True)
-            args.json_out.write_text(
-                json.dumps(payload, indent=2, sort_keys=True) + "\n"
-            )
-            print(f"json: {args.json_out}")
-        if args.trace_out is not None:
-            print(f"trace: {args.trace_out}")
-    finally:
-        for handle in handles:
-            handle.remove()
+    )
+    payload = {
+        "kind": "profile_nextchar",
+        "schema_version": 1,
+        "backend": args.backend,
+        "config": cfg.perf_config_dict,
+        "regions": summaries,
+        "budget": budget,
+        "tree": tree,
+        "trace_out": None if args.trace_out is None else str(args.trace_out),
+    }
+    validate_nextchar_profile_payload(payload)
+    if args.json_out is not None:
+        args.json_out.parent.mkdir(parents=True, exist_ok=True)
+        args.json_out.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        print(f"json: {args.json_out}")
+    if args.trace_out is not None:
+        print(f"trace: {args.trace_out}")
     return 0
 
 

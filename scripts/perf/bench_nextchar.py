@@ -134,15 +134,13 @@ def _summarize_workload(
     steps: int,
 ) -> dict[str, object]:
     result = run_bench_step(cfg, backend=backend, warmup=warmup_steps, steps=steps)
-    cold = result["cold"]
-    warm_steps = result["warm_steps"]
+    cold = result["cold_profile"]
+    warm_steps = result["warm_profile"]
     tokens_per_step = int(result["tokens_per_step"])
+    step_total_samples = [float(ms) for ms in result["warm_step_ms"]]
 
     warm_region_samples = [step["regions_ms"] for step in warm_steps]
     warm_cache_samples = [step["cache_events"] for step in warm_steps]
-    step_total_samples = [
-        float(step["regions_ms"].get("step.total", 0.0)) for step in warm_steps
-    ]
 
     warm_regions = summarize_named_samples(warm_region_samples)
     warm_budget = summarize_budget_samples(warm_region_samples)

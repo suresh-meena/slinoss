@@ -6,8 +6,6 @@ import torch
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
-from slinoss.perf import note_cache_event, record_region
-
 from .common import _TileConfig, _choose_copy_bits_for_linear_tiles
 from .m import StatePassingBwdMAmpere
 from .state import StatePassingBwdStateAmpere
@@ -139,7 +137,6 @@ def compile_state_passing_bwd_kernels(
 
     cached = _COMPILED_CACHE.get(cache_key)
     if cached is None:
-        note_cache_event("cache.v2x2ssd.backward.state_passing", hit=False)
         k_state = StatePassingBwdStateAmpere(
             cfg,
             copy_bits_in=copy_bits_state,
@@ -151,14 +148,11 @@ def compile_state_passing_bwd_kernels(
         cached = (compiled_state, compiled_m)
         _COMPILED_CACHE[cache_key] = cached
     else:
-        note_cache_event("cache.v2x2ssd.backward.state_passing", hit=True)
         compiled_state, compiled_m = cached
 
     def launch_sequential() -> None:
-        with record_region("backward.v2x2ssd.state_passing.state"):
-            compiled_state(mDStarts, mDFinal, mM, mDInc, mDInit)
-        with record_region("backward.v2x2ssd.state_passing.m"):
-            compiled_m(mStarts, mDInc, mDM)
+        compiled_state(mDStarts, mDFinal, mM, mDInc, mDInit)
+        compiled_m(mStarts, mDInc, mDM)
 
     def launch_overlapped() -> None:
         launch_sequential()
@@ -197,8 +191,7 @@ def state_passing_bwd_cute(
         pairs_per_thread=pairs_per_thread,
         return_launchers=True,
     )
-    with record_region("backward.v2x2ssd.state_passing.total"):
-        launch_sequential()
+    launch_sequential()
     if not return_d_initial:
         return (
             d_inc.to(dtype=torch.float32).contiguous(),

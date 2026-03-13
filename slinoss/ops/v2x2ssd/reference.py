@@ -46,8 +46,6 @@ from collections.abc import Sequence
 
 import torch
 
-from slinoss.perf import call_region
-
 
 def _promote_real_dtypes(dtypes: Sequence[torch.dtype]) -> torch.dtype:
     if not dtypes:
@@ -1240,9 +1238,7 @@ def v2x2ssd(
     B_last = B[:, :, -1, :].to(dtype=odtype).contiguous()
     U_last = U[:, :, -1, :].to(dtype=odtype).contiguous()
 
-    inc, m_chunk = call_region(
-        "v2x2ssd.chunk_increment.total",
-        chunk_increment,
+    inc, m_chunk = chunk_increment(
         U,
         M,
         K,
@@ -1253,17 +1249,13 @@ def v2x2ssd(
         chunk_size=chunk_size,
         compute_dtype=rdtype,
     )
-    chunk_starts, final_state = call_region(
-        "v2x2ssd.state_passing.total",
-        state_passing,
+    chunk_starts, final_state = state_passing(
         inc,
         m_chunk,
         initial_states=initial_states,
         compute_dtype=rdtype,
     )
-    Y = call_region(
-        "v2x2ssd.chunk_scan.total",
-        chunk_scan,
+    Y = chunk_scan(
         U,
         M,
         K,

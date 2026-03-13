@@ -8,8 +8,6 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack, make_ptr
 from typing import Callable
 
-from slinoss.perf import note_cache_event, record_region
-
 from .chunk_increment import ChunkIncrementFwdAmpere
 from .chunk_scan import ChunkScanFwdAmpere
 from .common import (
@@ -337,29 +335,25 @@ def _compile_chunk_increment_kernel_impl(
 
     compiled = _CHUNK_INCREMENT_CACHE.get(cache_key)
     if compiled is None:
-        note_cache_event("cache.v2x2ssd.forward.chunk_increment", hit=False)
         cutlass_dtype = _torch_to_cutlass_dtype(tc_dtype)
         kernel = ChunkIncrementFwdAmpere(cutlass_dtype, chunk_size=L)
         compiled = cute.compile(
             kernel, mU, mB, mM, mKprev, mKcurr, mU_prev, mB_prev, mInc, mMchunk
         )
         _CHUNK_INCREMENT_CACHE[cache_key] = compiled
-    else:
-        note_cache_event("cache.v2x2ssd.forward.chunk_increment", hit=True)
 
     def launch() -> None:
-        with record_region("forward.v2x2ssd.chunk_increment.total"):
-            compiled(
-                mU,
-                mB,
-                mM,
-                mKprev,
-                mKcurr,
-                mU_prev,
-                mB_prev,
-                mInc,
-                mMchunk,
-            )
+        compiled(
+            mU,
+            mB,
+            mM,
+            mKprev,
+            mKcurr,
+            mU_prev,
+            mB_prev,
+            mInc,
+            mMchunk,
+        )
 
     return compiled, inc_chunk, m_chunk_chunk, launch
 
@@ -497,7 +491,6 @@ def _compile_state_passing_kernel_impl(
 
     compiled = _STATE_PASSING_CACHE.get(cache_key)
     if compiled is None:
-        note_cache_event("cache.v2x2ssd.forward.state_passing", hit=False)
         kernel = StatePassingFwdAmpere(
             num_threads=num_threads,
             vecs_per_thread=vecs_per_thread,
@@ -507,12 +500,9 @@ def _compile_state_passing_kernel_impl(
         )
         compiled = cute.compile(kernel, mInc, mM, mOutStarts, mOutFinal, mInit)
         _STATE_PASSING_CACHE[cache_key] = compiled
-    else:
-        note_cache_event("cache.v2x2ssd.forward.state_passing", hit=True)
 
     def launch() -> None:
-        with record_region("forward.v2x2ssd.state_passing.total"):
-            compiled(mInc, mM, mOutStarts, mOutFinal, mInit)
+        compiled(mInc, mM, mOutStarts, mOutFinal, mInit)
 
     return compiled, out_starts, out_final, launch
 
@@ -683,7 +673,6 @@ def _compile_chunk_scan_kernel_impl(
 
     compiled = _CHUNK_SCAN_CACHE.get(cache_key)
     if compiled is None:
-        note_cache_event("cache.v2x2ssd.forward.chunk_scan", hit=False)
         in_cutlass_dtype = _torch_to_cutlass_dtype(tc_dtype)
         out_cutlass_dtype = _torch_to_cutlass_dtype(output_dtype)
         kernel = ChunkScanFwdAmpere(
@@ -702,12 +691,9 @@ def _compile_chunk_scan_kernel_impl(
             kernel, mU, mB, mC, mM, mK, mZ0, mU_prev0, mB_prev0, mOut
         )
         _CHUNK_SCAN_CACHE[cache_key] = compiled
-    else:
-        note_cache_event("cache.v2x2ssd.forward.chunk_scan", hit=True)
 
     def launch() -> None:
-        with record_region("forward.v2x2ssd.chunk_scan.total"):
-            compiled(mU, mB, mC, mM, mK, mZ0, mU_prev0, mB_prev0, mOut)
+        compiled(mU, mB, mC, mM, mK, mZ0, mU_prev0, mB_prev0, mOut)
 
     return compiled, out_chunk, out_view, launch
 
@@ -1310,10 +1296,8 @@ def compile_v2x2ssd_fwd_cute(
     )
     cached = _FWD_HOST_CACHE.get(cache_key)
     if cached is not None:
-        note_cache_event("cache.v2x2ssd.forward.host_jit", hit=True)
         return cached
 
-    note_cache_event("cache.v2x2ssd.forward.host_jit", hit=False)
     host_wrapper = _make_v2x2ssd_fwd_host_wrapper(spec=spec, cfg=cfg)
     compiled = cute.compile(host_wrapper, *dynamic_args)
     _FWD_HOST_CACHE[cache_key] = compiled
@@ -1344,54 +1328,50 @@ def v2x2ssd_fwd_cute(
     ]
     | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    with record_region("forward.v2x2ssd.total"):
-        dynamic_args, alignments, spec, cfg, outputs = _build_forward_args(
-            U,
-            M,
-            K,
-            B,
-            C,
-            chunk_size=chunk_size,
-            compute_dtype=compute_dtype,
-            output_dtype=output_dtype,
-            m_block_size=m_block_size,
-            n_block_size=n_block_size,
-            scan_num_threads=scan_num_threads,
-            state_num_threads=state_num_threads,
-            state_vecs_per_thread=state_vecs_per_thread,
-            prepared_inputs=prepared_inputs,
-        )
-        cache_key = _fwd_host_cache_key(
-            device_index=(U.device.index if U.device.index is not None else -1),
-            tc_dtype=_tc_input_dtype(U.dtype, compute_dtype),
-            out_dtype=output_dtype,
-            U_shape=tuple(U.shape),
-            M_shape=tuple(M.shape),
-            K_shape=tuple(K.shape),
-            B_shape=tuple(B.shape),
-            C_shape=tuple(C.shape),
-            chunk_size=int(chunk_size),
-            m_block_size=int(chunk_size if m_block_size is None else m_block_size),
-            n_block_size=_resolve_chunk_scan_n_block_size(
-                int(chunk_size), int(n_block_size)
-            ),
-            scan_num_threads=int(scan_num_threads),
-            state_num_threads=int(state_num_threads),
-            state_vecs_per_thread=int(state_vecs_per_thread),
-            state_copy_bits_in=int(cfg[5]),
-            state_copy_bits_out=int(cfg[6]),
-            alignments=alignments,
-        )
-        compiled = _FWD_HOST_CACHE.get(cache_key)
-        if compiled is None:
-            note_cache_event("cache.v2x2ssd.forward.host_jit", hit=False)
-            host_wrapper = _make_v2x2ssd_fwd_host_wrapper(spec=spec, cfg=cfg)
-            compiled = cute.compile(host_wrapper, *dynamic_args)
-            _FWD_HOST_CACHE[cache_key] = compiled
-        else:
-            note_cache_event("cache.v2x2ssd.forward.host_jit", hit=True)
-        compiled(*dynamic_args)
-        return outputs
+    dynamic_args, alignments, spec, cfg, outputs = _build_forward_args(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_size=chunk_size,
+        compute_dtype=compute_dtype,
+        output_dtype=output_dtype,
+        m_block_size=m_block_size,
+        n_block_size=n_block_size,
+        scan_num_threads=scan_num_threads,
+        state_num_threads=state_num_threads,
+        state_vecs_per_thread=state_vecs_per_thread,
+        prepared_inputs=prepared_inputs,
+    )
+    cache_key = _fwd_host_cache_key(
+        device_index=(U.device.index if U.device.index is not None else -1),
+        tc_dtype=_tc_input_dtype(U.dtype, compute_dtype),
+        out_dtype=output_dtype,
+        U_shape=tuple(U.shape),
+        M_shape=tuple(M.shape),
+        K_shape=tuple(K.shape),
+        B_shape=tuple(B.shape),
+        C_shape=tuple(C.shape),
+        chunk_size=int(chunk_size),
+        m_block_size=int(chunk_size if m_block_size is None else m_block_size),
+        n_block_size=_resolve_chunk_scan_n_block_size(
+            int(chunk_size), int(n_block_size)
+        ),
+        scan_num_threads=int(scan_num_threads),
+        state_num_threads=int(state_num_threads),
+        state_vecs_per_thread=int(state_vecs_per_thread),
+        state_copy_bits_in=int(cfg[5]),
+        state_copy_bits_out=int(cfg[6]),
+        alignments=alignments,
+    )
+    compiled = _FWD_HOST_CACHE.get(cache_key)
+    if compiled is None:
+        host_wrapper = _make_v2x2ssd_fwd_host_wrapper(spec=spec, cfg=cfg)
+        compiled = cute.compile(host_wrapper, *dynamic_args)
+        _FWD_HOST_CACHE[cache_key] = compiled
+    compiled(*dynamic_args)
+    return outputs
 
 
 __all__ = [

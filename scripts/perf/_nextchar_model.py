@@ -7,7 +7,6 @@ from torch import nn
 from torch.nn import functional as F
 
 from slinoss.layers import SLinOSSMixer
-from slinoss.perf import call_region
 
 
 def configure_optim(
@@ -75,15 +74,10 @@ class NextCharBlock(nn.Module):
         self.ff = FeedForward(d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        norm1 = call_region("norms.pre_mixer", self.norm1, x)
-        x = call_region("residual.mixer", torch.add, x, self.mixer(norm1))
-        norm2 = call_region("norms.pre_ffn", self.norm2, x)
-        x = call_region(
-            "residual.ffn",
-            torch.add,
-            x,
-            call_region("ffn", self.ff, norm2),
-        )
+        norm1 = self.norm1(x)
+        x = x + self.mixer(norm1)
+        norm2 = self.norm2(x)
+        x = x + self.ff(norm2)
         return x
 
 
@@ -143,18 +137,9 @@ class NextCharLM(nn.Module):
             raise ValueError(
                 f"Sequence length {idx.shape[1]} exceeds block_size {self.block_size}."
             )
-        x = call_region(
-            "embed.token",
-            self.token_embed,
-            idx,
-        )
-        x = call_region(
-            "embed.pos",
-            self._add_pos_embed,
-            x,
-            int(idx.shape[1]),
-        )
+        x = self.token_embed(idx)
+        x = self._add_pos_embed(x, int(idx.shape[1]))
         for block in self.blocks:
             x = block(x)
-        x = call_region("norms.final", self.norm_f, x)
-        return call_region("head.logits", self.lm_head, x)
+        x = self.norm_f(x)
+        return self.lm_head(x)

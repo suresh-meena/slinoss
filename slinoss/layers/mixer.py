@@ -9,9 +9,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from slinoss.perf import call_region
-
-from .backend import AutoScanBackend, CuteScanBackend, ScanBackend, ScanInputs
+from .backend import AutoScanBackend, ScanBackend, ScanInputs
 from .discretization import SLinOSSDiscretizer
 from .state import SLinOSSMixerState, ScanState
 
@@ -220,40 +218,14 @@ class SLinOSSMixer(nn.Module):
         params: torch.Tensor,
     ) -> ScanInputs:
         batch, T, _ = map(int, value.shape)
-        bc = call_region(
-            "mixer.bc_proj",
-            self._project_bc,
-            value,
-            batch,
-            T,
-        )
+        bc = self._project_bc(value, batch, T)
         B_sem = bc[..., :2, :]
         C_sem = bc[..., 2:, :]
         if self.normalize_bc:
-            B_sem, C_sem = call_region(
-                "mixer.bc_norm",
-                self._normalize_scan_bc,
-                B_sem,
-                C_sem,
-            )
+            B_sem, C_sem = self._normalize_scan_bc(B_sem, C_sem)
 
-        coeffs = call_region(
-            "mixer.discretizer",
-            self._scan_coeffs_from_flat_params,
-            params,
-            batch,
-            T,
-        )
-        return call_region(
-            "mixer.scan_input_pack",
-            self._pack_scan_inputs,
-            value,
-            coeffs,
-            B_sem,
-            C_sem,
-            batch,
-            T,
-        )
+        coeffs = self._scan_coeffs_from_flat_params(params, batch, T)
+        return self._pack_scan_inputs(value, coeffs, B_sem, C_sem, batch, T)
 
     def forward(
         self,
@@ -273,62 +245,29 @@ class SLinOSSMixer(nn.Module):
             next_state = SLinOSSMixerState() if state is None else state
             return (empty, next_state) if return_state else empty
 
-        proj = call_region("mixer.in_proj", self.in_proj, x)
+        proj = self.in_proj(x)
         gate, value_raw, params = torch.split(
             proj,
             [self.d_inner, self.d_inner, self.n_heads * self.discretizer.param_dim],
             dim=-1,
         )
         conv_state_in = None if state is None else state.conv
-        conv_out, conv_state = call_region(
-            "mixer.dw_conv",
-            self._apply_causal_depthwise_conv_with_state,
-            value_raw,
-            conv_state_in,
+        conv_out, conv_state = self._apply_causal_depthwise_conv_with_state(
+            value_raw, conv_state_in
         )
-        value = call_region("mixer.dw_conv_activation", F.silu, conv_out)
+        value = F.silu(conv_out)
 
         scan_inputs = self._build_scan_inputs(value=value, params=params)
         scan_state_in = None if state is None else state.scan
-        if (
-            scan_state_in is None
-            and not return_state
-            and isinstance(self.backend, (CuteScanBackend, AutoScanBackend))
-            and scan_inputs.U.device.type == "cuda"
-        ):
-            scan_result = self._run_scan_backend(
-                scan_inputs,
-                scan_state_in,
-                return_state,
-            )
-        else:
-            scan_result = call_region(
-                "v2x2ssd.total",
-                self._run_scan_backend,
-                scan_inputs,
-                scan_state_in,
-                return_state,
-            )
+        scan_result = self._run_scan_backend(scan_inputs, scan_state_in, return_state)
         if return_state:
             scan_y, scan_state = cast(tuple[torch.Tensor, ScanState], scan_result)
         else:
             scan_y = cast(torch.Tensor, scan_result)
             scan_state = None
 
-        gated = call_region(
-            "mixer.gate_skip",
-            self._apply_gate_skip,
-            scan_y,
-            value,
-            gate,
-            batch,
-            T,
-        )
-        out = call_region(
-            "mixer.out_proj",
-            self.out_proj,
-            gated,
-        )
+        gated = self._apply_gate_skip(scan_y, value, gate, batch, T)
+        out = self.out_proj(gated)
 
         if not return_state:
             return out

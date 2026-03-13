@@ -35,7 +35,7 @@ from slinoss.ops.v2x2ssd.reference import (  # noqa: E402
 )
 from slinoss.ops.v2x2ssd.reference import chunk_scan as ref_chunk_scan  # noqa: E402
 from slinoss.ops.v2x2ssd.reference import state_passing as ref_state_passing  # noqa: E402
-from slinoss.perf import PerfRecorder  # noqa: E402
+from slinoss.perf import PerfRecorder, record_region  # noqa: E402
 from slinoss.perf.budget import summarize_cache_samples, summarize_named_samples  # noqa: E402
 
 DEFAULT_BATCH = 16
@@ -273,10 +273,23 @@ def build_callable(
     backend: str,
 ) -> Callable[[], object]:
     if direction == "forward":
-        return _build_forward_callable(cfg, stage=stage, backend=backend)
-    if direction == "backward":
-        return _build_backward_callable(cfg, stage=stage, backend=backend)
-    raise ValueError(f"Unsupported direction: {direction}")
+        fn = _build_forward_callable(cfg, stage=stage, backend=backend)
+    elif direction == "backward":
+        fn = _build_backward_callable(cfg, stage=stage, backend=backend)
+    else:
+        raise ValueError(f"Unsupported direction: {direction}")
+
+    region_label = (
+        f"{direction}.v2x2ssd.total"
+        if stage == "full"
+        else f"{direction}.v2x2ssd.{stage}.total"
+    )
+
+    def wrapped() -> object:
+        with record_region(region_label):
+            return fn()
+
+    return wrapped
 
 
 def _build_forward_callable(

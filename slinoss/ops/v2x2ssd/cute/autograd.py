@@ -6,7 +6,6 @@ from typing import cast
 
 import torch
 
-from slinoss.perf import record_region
 from slinoss.ops.v2x2ssd.cute.kernels.bwd import v2x2ssd_bwd_cute
 from slinoss.ops.v2x2ssd.cute.kernels.fwd import (
     _prepare_m_operand,
@@ -87,60 +86,57 @@ class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
         None,
         None,
     ]:
-        with record_region("backward.v2x2ssd.custom_op_total"):
-            U, M, K, B, C, U_tc, M_f, K_f, B_tc, C_tc, m_chunk, chunk_starts = (
-                ctx.saved_tensors
-            )
+        U, M, K, B, C, U_tc, M_f, K_f, B_tc, C_tc, m_chunk, chunk_starts = (
+            ctx.saved_tensors
+        )
 
-            if dY is None:
-                with record_region("backward.v2x2ssd.autograd_wrapper"):
-                    return (
-                        torch.zeros_like(U),
-                        torch.zeros_like(M),
-                        torch.zeros_like(K),
-                        torch.zeros_like(B),
-                        torch.zeros_like(C),
-                        None,
-                        None,
-                        None,
-                    )
-
-            with record_region("backward.v2x2ssd.autograd_wrapper"):
-                dY_contig = dY if dY.is_contiguous() else dY.contiguous()
-
-            dU_scan, dM_scan, dK_scan, dB_scan, dC_scan = cast(
-                tuple[
-                    torch.Tensor,
-                    torch.Tensor,
-                    torch.Tensor,
-                    torch.Tensor,
-                    torch.Tensor,
-                ],
-                v2x2ssd_bwd_cute(
-                    U,
-                    M,
-                    K,
-                    B,
-                    C,
-                    m_chunk,
-                    chunk_starts,
-                    dY_contig,
-                    chunk_size=ctx.chunk_size,
-                    compute_dtype=ctx.compute_dtype,
-                    prepared_inputs=(U_tc, M_f, K_f, B_tc, C_tc),
-                ),
-            )
-
+        if dY is None:
             return (
-                dU_scan,
-                dM_scan,
-                dK_scan,
-                dB_scan,
-                dC_scan,
+                torch.zeros_like(U),
+                torch.zeros_like(M),
+                torch.zeros_like(K),
+                torch.zeros_like(B),
+                torch.zeros_like(C),
                 None,
                 None,
                 None,
             )
+
+        dY_contig = dY if dY.is_contiguous() else dY.contiguous()
+
+        dU_scan, dM_scan, dK_scan, dB_scan, dC_scan = cast(
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+                torch.Tensor,
+            ],
+            v2x2ssd_bwd_cute(
+                U,
+                M,
+                K,
+                B,
+                C,
+                m_chunk,
+                chunk_starts,
+                dY_contig,
+                chunk_size=ctx.chunk_size,
+                compute_dtype=ctx.compute_dtype,
+                prepared_inputs=(U_tc, M_f, K_f, B_tc, C_tc),
+            ),
+        )
+
+        return (
+            dU_scan,
+            dM_scan,
+            dK_scan,
+            dB_scan,
+            dC_scan,
+            None,
+            None,
+            None,
+        )
 
 
 def v2x2ssd_cute_training_autograd(

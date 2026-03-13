@@ -6,8 +6,6 @@ import torch
 import cutlass.cute as cute
 from cutlass.cute.runtime import make_ptr
 
-from slinoss.perf import note_cache_event, record_region
-
 from ..fwd.common import (
     _assumed_align,
     _pad_m_identity,
@@ -1091,10 +1089,8 @@ def compile_v2x2ssd_bwd_cute(
     )
     cached = _BWD_HOST_CACHE.get(cache_key)
     if cached is not None:
-        note_cache_event("cache.v2x2ssd.backward.host_jit", hit=True)
         return cached
 
-    note_cache_event("cache.v2x2ssd.backward.host_jit", hit=False)
     host_wrapper = _make_v2x2ssd_bwd_host_wrapper(spec=spec, cfg=cfg)
     compiled = cute.compile(host_wrapper, *dynamic_args)
     _BWD_HOST_CACHE[cache_key] = compiled
@@ -1128,97 +1124,93 @@ def v2x2ssd_bwd_cute(
     ]
     | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    with record_region("backward.v2x2ssd.total"):
-        dynamic_args, alignments, spec, cfg, outputs = _build_backward_args(
-            U,
-            M,
-            K,
-            B,
-            C,
-            m_chunk,
-            chunk_starts,
-            d_out,
-            chunk_size=chunk_size,
-            compute_dtype=compute_dtype,
-            scan_num_threads_du=scan_num_threads_du,
-            scan_num_threads_db=scan_num_threads_db,
-            scan_num_threads_dc=scan_num_threads_dc,
-            scan_num_threads_param=scan_num_threads_param,
-            state_num_threads=state_num_threads,
-            state_pairs_per_thread=state_pairs_per_thread,
-            prepared_inputs=prepared_inputs,
-        )
-        cache_key = _bwd_host_cache_key(
-            device_index=(U.device.index if U.device.index is not None else -1),
-            tc_dtype=_tc_input_dtype(U.dtype, compute_dtype),
-            U_shape=tuple(U.shape),
-            M_shape=tuple(M.shape),
-            K_shape=tuple(K.shape),
-            B_shape=tuple(B.shape),
-            C_shape=tuple(C.shape),
-            m_chunk_shape=tuple(m_chunk.shape),
-            chunk_starts_shape=tuple(chunk_starts.shape),
-            d_out_shape=tuple(d_out.shape),
-            chunk_size=int(chunk_size),
-            scan_num_threads_du=int(scan_num_threads_du),
-            scan_num_threads_db=int(scan_num_threads_db),
-            scan_num_threads_dc=int(scan_num_threads_dc),
-            scan_num_threads_param=int(scan_num_threads_param),
-            state_num_threads=int(state_num_threads),
-            state_pairs_per_thread=int(state_pairs_per_thread),
-            state_copy_bits_state=int(cfg[6]),
-            state_copy_bits_out=int(cfg[7]),
-            n_d_tiles=int(spec[7]),
-            alignments=alignments,
-        )
-        compiled = _BWD_HOST_CACHE.get(cache_key)
-        if compiled is None:
-            note_cache_event("cache.v2x2ssd.backward.host_jit", hit=False)
-            host_wrapper = _make_v2x2ssd_bwd_host_wrapper(spec=spec, cfg=cfg)
-            compiled = cute.compile(host_wrapper, *dynamic_args)
-            _BWD_HOST_CACHE[cache_key] = compiled
-        else:
-            note_cache_event("cache.v2x2ssd.backward.host_jit", hit=True)
+    dynamic_args, alignments, spec, cfg, outputs = _build_backward_args(
+        U,
+        M,
+        K,
+        B,
+        C,
+        m_chunk,
+        chunk_starts,
+        d_out,
+        chunk_size=chunk_size,
+        compute_dtype=compute_dtype,
+        scan_num_threads_du=scan_num_threads_du,
+        scan_num_threads_db=scan_num_threads_db,
+        scan_num_threads_dc=scan_num_threads_dc,
+        scan_num_threads_param=scan_num_threads_param,
+        state_num_threads=state_num_threads,
+        state_pairs_per_thread=state_pairs_per_thread,
+        prepared_inputs=prepared_inputs,
+    )
+    cache_key = _bwd_host_cache_key(
+        device_index=(U.device.index if U.device.index is not None else -1),
+        tc_dtype=_tc_input_dtype(U.dtype, compute_dtype),
+        U_shape=tuple(U.shape),
+        M_shape=tuple(M.shape),
+        K_shape=tuple(K.shape),
+        B_shape=tuple(B.shape),
+        C_shape=tuple(C.shape),
+        m_chunk_shape=tuple(m_chunk.shape),
+        chunk_starts_shape=tuple(chunk_starts.shape),
+        d_out_shape=tuple(d_out.shape),
+        chunk_size=int(chunk_size),
+        scan_num_threads_du=int(scan_num_threads_du),
+        scan_num_threads_db=int(scan_num_threads_db),
+        scan_num_threads_dc=int(scan_num_threads_dc),
+        scan_num_threads_param=int(scan_num_threads_param),
+        state_num_threads=int(state_num_threads),
+        state_pairs_per_thread=int(state_pairs_per_thread),
+        state_copy_bits_state=int(cfg[6]),
+        state_copy_bits_out=int(cfg[7]),
+        n_d_tiles=int(spec[7]),
+        alignments=alignments,
+    )
+    compiled = _BWD_HOST_CACHE.get(cache_key)
+    if compiled is None:
+        host_wrapper = _make_v2x2ssd_bwd_host_wrapper(spec=spec, cfg=cfg)
+        compiled = cute.compile(host_wrapper, *dynamic_args)
+        _BWD_HOST_CACHE[cache_key] = compiled
 
-        compiled(*dynamic_args)
+    compiled(*dynamic_args)
 
-        (
-            dU_scan,
-            dU_prev_scan,
-            dB_scan,
-            dB_prev_scan,
-            dC_scan,
-            dM_scan,
-            dKprev_scan,
-            dKcurr_scan,
-            dU_inc,
-            dU_prev_inc,
-            dB_inc,
-            dB_prev_inc,
-            dM_inc,
-            dKprev_inc,
-            dKcurr_inc,
-            *_keepalive,
-        ) = outputs
+    (
+        dU_scan,
+        dU_prev_scan,
+        dB_scan,
+        dB_prev_scan,
+        dC_scan,
+        dM_scan,
+        dKprev_scan,
+        dKcurr_scan,
+        dU_inc,
+        dU_prev_inc,
+        dB_inc,
+        dB_prev_inc,
+        dM_inc,
+        dKprev_inc,
+        dKcurr_inc,
+        *_keepalive,
+    ) = outputs
 
-        dU_scan.add_(dU_inc)
-        dU_prev_scan.add_(dU_prev_inc)
-        dB_scan.add_(dB_inc)
-        dB_prev_scan.add_(dB_prev_inc)
-        dM_scan[:, :, :, 0, :, :].add_(dM_inc)
-        dKprev_scan[:, :, :, 0, :, :].add_(dKprev_inc)
-        dKcurr_scan[:, :, :, 0, :, :].add_(dKcurr_inc)
+    dU_scan.add_(dU_inc)
+    dU_prev_scan.add_(dU_prev_inc)
+    dB_scan.add_(dB_inc)
+    dB_prev_scan.add_(dB_prev_inc)
+    dM_scan[:, :, :, 0, :, :].add_(dM_inc)
+    dKprev_scan[:, :, :, 0, :, :].add_(dKprev_inc)
+    dKcurr_scan[:, :, :, 0, :, :].add_(dKcurr_inc)
 
-        dU_public = _fold_chunk_boundary_carries(dU_scan, dU_prev_scan)
-        dB_public = _fold_chunk_boundary_carries(dB_scan, dB_prev_scan)
+    dU_public = _fold_chunk_boundary_carries(dU_scan, dU_prev_scan)
+    dB_public = _fold_chunk_boundary_carries(dB_scan, dB_prev_scan)
 
-        return (
-            _public_from_chunked(dU_public, T=U.shape[2], dtype=U.dtype),
-            _public_from_param_scan(dM_scan, T=U.shape[2]),
-            _public_dk_from_parts(dKprev_scan, dKcurr_scan, T=U.shape[2]),
-            _public_from_chunked(dB_public, T=U.shape[2], dtype=B.dtype),
-            _public_from_chunked(dC_scan, T=U.shape[2], dtype=C.dtype),
-        )
+    return (
+        _public_from_chunked(dU_public, T=U.shape[2], dtype=U.dtype),
+        _public_from_param_scan(dM_scan, T=U.shape[2]),
+        _public_dk_from_parts(dKprev_scan, dKcurr_scan, T=U.shape[2]),
+        _public_from_chunked(dB_public, T=U.shape[2], dtype=B.dtype),
+        _public_from_chunked(dC_scan, T=U.shape[2], dtype=C.dtype),
+    )
 
 
 __all__ = [
