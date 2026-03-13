@@ -193,48 +193,80 @@ def note_cache_event(label: str, *, hit: bool) -> None:
         step.note_cache_event(label, hit=hit)
 
 
-class _BackwardRegionEnter(torch.autograd.Function):
-    @staticmethod
-    def forward(  # type: ignore[override]
-        ctx,
-        tensor: torch.Tensor,
-        label: str,
-        token_id: int,
-    ) -> torch.Tensor:
-        ctx.label = label
-        ctx.token_id = int(token_id)
-        return tensor
-
-    @staticmethod
-    def backward(  # type: ignore[override]
-        ctx, grad_output: torch.Tensor
-    ) -> tuple[torch.Tensor, None, None]:
+def _make_boundary_hook(
+    *, backward_label: str, token_id: int, kind: str
+) -> Callable[[torch.Tensor], torch.Tensor]:
+    def _hook(grad: torch.Tensor) -> torch.Tensor:
         step = current_step()
         if step is not None:
-            step.record_backward_boundary(ctx.label, ctx.token_id, kind="enter")
-        return grad_output, None, None
+            step.record_backward_boundary(backward_label, token_id, kind=kind)
+        return grad
+
+    return _hook
 
 
-class _BackwardRegionExit(torch.autograd.Function):
-    @staticmethod
-    def forward(  # type: ignore[override]
-        ctx,
-        tensor: torch.Tensor,
-        label: str,
-        token_id: int,
-    ) -> torch.Tensor:
-        ctx.label = label
-        ctx.token_id = int(token_id)
+def _alias_with_backward_exit_hook(
+    tensor: torch.Tensor,
+    *,
+    backward_label: str,
+    token_id: int,
+) -> torch.Tensor:
+    if not tensor.requires_grad:
         return tensor
+    aliased = torch.ops.aten.alias.default(tensor)
+    aliased.register_hook(
+        _make_boundary_hook(
+            backward_label=backward_label,
+            token_id=token_id,
+            kind="exit",
+        )
+    )
+    return aliased
 
-    @staticmethod
-    def backward(  # type: ignore[override]
-        ctx, grad_output: torch.Tensor
-    ) -> tuple[torch.Tensor, None, None]:
-        step = current_step()
-        if step is not None:
-            step.record_backward_boundary(ctx.label, ctx.token_id, kind="exit")
-        return grad_output, None, None
+
+def _iter_unique_tensors(
+    obj: Any, seen: set[int] | None = None
+) -> Iterator[torch.Tensor]:
+    if seen is None:
+        seen = set()
+    if isinstance(obj, torch.Tensor):
+        obj_id = id(obj)
+        if obj_id not in seen:
+            seen.add(obj_id)
+            yield obj
+        return
+    if isinstance(obj, tuple):
+        for item in obj:
+            yield from _iter_unique_tensors(item, seen)
+        return
+    if isinstance(obj, list):
+        for item in obj:
+            yield from _iter_unique_tensors(item, seen)
+        return
+    if isinstance(obj, dict):
+        for value in obj.values():
+            yield from _iter_unique_tensors(value, seen)
+        return
+    if is_dataclass(obj) and not isinstance(obj, type):
+        for field in fields(obj):
+            yield from _iter_unique_tensors(getattr(obj, field.name), seen)
+        return
+
+
+def _attach_backward_enter_hooks(
+    out: Any,
+    *,
+    backward_label: str,
+    token_id: int,
+) -> None:
+    hook = _make_boundary_hook(
+        backward_label=backward_label,
+        token_id=token_id,
+        kind="enter",
+    )
+    for tensor in _iter_unique_tensors(out):
+        if tensor.requires_grad:
+            tensor.register_hook(hook)
 
 
 def _tree_map_tensors(obj: T, fn: Callable[[torch.Tensor], torch.Tensor]) -> T:
@@ -255,71 +287,6 @@ def _tree_map_tensors(obj: T, fn: Callable[[torch.Tensor], torch.Tensor]) -> T:
     return obj
 
 
-def _wrap_backward_exit_tensor(
-    tensor: torch.Tensor,
-    *,
-    backward_label: str,
-    token_id: int,
-) -> torch.Tensor:
-    if tensor.requires_grad:
-        return cast(
-            torch.Tensor,
-            _BackwardRegionExit.apply(tensor, backward_label, token_id),
-        )
-    return tensor
-
-
-def _wrap_backward_enter_tensor(
-    tensor: torch.Tensor,
-    *,
-    backward_label: str,
-    token_id: int,
-) -> torch.Tensor:
-    if tensor.requires_grad:
-        return cast(
-            torch.Tensor,
-            _BackwardRegionEnter.apply(tensor, backward_label, token_id),
-        )
-    return tensor
-
-
-def _wrap_backward_enter_simple_out(
-    out: T,
-    *,
-    backward_label: str,
-    token_id: int,
-) -> T:
-    if isinstance(out, torch.Tensor):
-        return cast(
-            T,
-            _wrap_backward_enter_tensor(
-                out,
-                backward_label=backward_label,
-                token_id=token_id,
-            ),
-        )
-    if isinstance(out, tuple) and all(isinstance(item, torch.Tensor) for item in out):
-        return cast(
-            T,
-            tuple(
-                _wrap_backward_enter_tensor(
-                    item,
-                    backward_label=backward_label,
-                    token_id=token_id,
-                )
-                for item in out
-            ),
-        )
-    return _tree_map_tensors(
-        out,
-        lambda t: _wrap_backward_enter_tensor(
-            t,
-            backward_label=backward_label,
-            token_id=token_id,
-        ),
-    )
-
-
 def call_region(
     label: str,
     fn: Callable[..., T],
@@ -331,80 +298,86 @@ def call_region(
     if step is None:
         return fn(*args, **kwargs)
 
+    forward_label = f"forward.{label}"
+    if not capture_backward:
+        with record_region(forward_label):
+            return fn(*args, **kwargs)
+
     token_id = step.next_backward_token()
     backward_label = f"backward.{label}"
 
-    if capture_backward:
-        if not kwargs:
-            if len(args) == 1 and isinstance(args[0], torch.Tensor):
-                arg0 = _wrap_backward_exit_tensor(
-                    args[0],
-                    backward_label=backward_label,
-                    token_id=token_id,
-                )
-                with record_region(f"forward.{label}"):
-                    out = fn(arg0)
-                return _wrap_backward_enter_simple_out(
-                    out,
-                    backward_label=backward_label,
-                    token_id=token_id,
-                )
-            if (
-                len(args) == 2
-                and isinstance(args[0], torch.Tensor)
-                and isinstance(args[1], torch.Tensor)
-            ):
-                arg0 = _wrap_backward_exit_tensor(
-                    args[0],
-                    backward_label=backward_label,
-                    token_id=token_id,
-                )
-                arg1 = _wrap_backward_exit_tensor(
-                    args[1],
-                    backward_label=backward_label,
-                    token_id=token_id,
-                )
-                with record_region(f"forward.{label}"):
-                    out = fn(arg0, arg1)
-                return _wrap_backward_enter_simple_out(
-                    out,
-                    backward_label=backward_label,
-                    token_id=token_id,
-                )
-        args = tuple(
-            _tree_map_tensors(
-                arg,
-                lambda t: _wrap_backward_exit_tensor(
-                    t,
-                    backward_label=backward_label,
-                    token_id=token_id,
-                ),
-            )
-            for arg in args
+    if not kwargs and len(args) == 1 and isinstance(args[0], torch.Tensor):
+        arg0 = _alias_with_backward_exit_hook(
+            args[0],
+            backward_label=backward_label,
+            token_id=token_id,
         )
-        kwargs = {
-            key: _tree_map_tensors(
-                value,
-                lambda t: _wrap_backward_exit_tensor(
-                    t,
-                    backward_label=backward_label,
-                    token_id=token_id,
-                ),
-            )
-            for key, value in kwargs.items()
-        }
-
-    with record_region(f"forward.{label}"):
-        out = fn(*args, **kwargs)
-
-    if not capture_backward:
+        with record_region(forward_label):
+            out = fn(arg0)
+        _attach_backward_enter_hooks(
+            out,
+            backward_label=backward_label,
+            token_id=token_id,
+        )
         return out
 
-    return _wrap_backward_enter_simple_out(
+    if (
+        not kwargs
+        and len(args) == 2
+        and isinstance(args[0], torch.Tensor)
+        and isinstance(args[1], torch.Tensor)
+    ):
+        arg0 = _alias_with_backward_exit_hook(
+            args[0],
+            backward_label=backward_label,
+            token_id=token_id,
+        )
+        arg1 = _alias_with_backward_exit_hook(
+            args[1],
+            backward_label=backward_label,
+            token_id=token_id,
+        )
+        with record_region(forward_label):
+            out = fn(arg0, arg1)
+        _attach_backward_enter_hooks(
+            out,
+            backward_label=backward_label,
+            token_id=token_id,
+        )
+        return out
+
+    args = tuple(
+        _tree_map_tensors(
+            arg,
+            lambda t: _alias_with_backward_exit_hook(
+                t,
+                backward_label=backward_label,
+                token_id=token_id,
+            ),
+        )
+        for arg in args
+    )
+    kwargs = {
+        key: _tree_map_tensors(
+            value,
+            lambda t: _alias_with_backward_exit_hook(
+                t,
+                backward_label=backward_label,
+                token_id=token_id,
+            ),
+        )
+        for key, value in kwargs.items()
+    }
+
+    with record_region(forward_label):
+        out = fn(*args, **kwargs)
+
+    _attach_backward_enter_hooks(
         out,
         backward_label=backward_label,
         token_id=token_id,
     )
+    return out
 
 
 def attach_module_timer(
