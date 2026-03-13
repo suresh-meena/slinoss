@@ -236,7 +236,9 @@ class SLinOSSDiscretizer(nn.Module):
                 f"Expected last dim {self.param_dim}, got {int(params.shape[-1])}."
             )
 
-        p = params.to(torch.float32)
+        # Run the coefficient algebra in the scan backend's native (B, H, T, *)
+        # layout so we do not materialize transposed outputs afterward.
+        p = params.to(torch.float32).permute(0, 2, 1, 3)
         (
             dt_raw,
             gamma_raw,
@@ -253,7 +255,7 @@ class SLinOSSDiscretizer(nn.Module):
             k_curr_im,
         ) = p.unbind(dim=-1)
 
-        head = (1, 1, self.n_heads)
+        head = (1, self.n_heads, 1)
         sigmoid_inputs = torch.stack(
             [
                 dt_raw + self.dt_bias.view(*head),
@@ -311,16 +313,16 @@ class SLinOSSDiscretizer(nn.Module):
             + (1.0 - mix_k_curr.unsqueeze(-1)) * k_curr_learned
         )
 
-        M = _pack_complex(rho).permute(0, 2, 1, 3).contiguous()
-        K = torch.stack([k_prev, k_curr], dim=-2).permute(0, 2, 1, 3, 4).contiguous()
+        M = _pack_complex(rho)
+        K = torch.stack([k_prev, k_curr], dim=-2)
         if not include_aux:
             return M, K, None, None, None
         return (
             M,
             K,
-            dt.transpose(1, 2).contiguous(),
-            r.transpose(1, 2).contiguous(),
-            theta.transpose(1, 2).contiguous(),
+            dt,
+            r,
+            theta,
         )
 
     def scan_coeffs(self, params: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
