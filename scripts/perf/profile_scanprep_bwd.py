@@ -43,8 +43,8 @@ def _parse_args() -> argparse.Namespace:
         default=1,
         help="Warm launches to run before starting the CUDA profiler.",
     )
-    parser.add_argument("--block-size", type=int, default=128)
-    parser.add_argument("--reduce-block-size", type=int, default=128)
+    parser.add_argument("--block-size", type=int, default=64)
+    parser.add_argument("--reduce-block-size", type=int, default=64)
     parser.add_argument(
         "--no-normalize-bc",
         action="store_false",

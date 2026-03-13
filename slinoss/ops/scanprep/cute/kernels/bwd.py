@@ -34,8 +34,8 @@ class ScanPrepBwdFused:
         theta_bound: float,
         k_max: float,
         eps: float,
-        block_size: int = 128,
-        reduce_block_size: int = 128,
+        block_size: int = 64,
+        reduce_block_size: int = 64,
     ) -> None:
         batch, t_size, h_size, p_size, n_size, param_dim = spec
         self.batch = int(batch)
@@ -89,14 +89,18 @@ class ScanPrepBwdFused:
             self.total_rows + self.block_size - 1
         ) // self.block_size
         self.reduce_block_size = int(reduce_block_size)
+        if self.reduce_block_size % 32 != 0:
+            raise ValueError("reduce_block_size must be a multiple of 32.")
+        self.reduce_warps_per_block = self.reduce_block_size // 32
+        self.reduce_bt_rows = self.batch * self.t_size
         self.scale_reduce_rows = self.h_size * 4 * self.n_size
         self.scale_reduce_grid = (
-            self.scale_reduce_rows + self.reduce_block_size - 1
-        ) // self.reduce_block_size
+            self.scale_reduce_rows + self.reduce_warps_per_block - 1
+        ) // self.reduce_warps_per_block
         self.bias_reduce_rows = self.h_size * 7
         self.bias_reduce_grid = (
-            self.bias_reduce_rows + self.reduce_block_size - 1
-        ) // self.reduce_block_size
+            self.bias_reduce_rows + self.reduce_warps_per_block - 1
+        ) // self.reduce_warps_per_block
 
         self.dt_min = float(dt_min)
         self.dt_scale = float(dt_max - dt_min)
@@ -636,10 +640,11 @@ class ScanPrepBwdFused:
         mScaleGrad: cute.Tensor,
         total_rows,
     ):
-        tidx, _, _ = cute.arch.thread_idx()
+        _tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        block_dim, _, _ = cute.arch.block_dim()
-        row = bidx * block_dim + tidx
+        lane = cute.arch.lane_idx()
+        warp = cute.arch.warp_idx()
+        row = bidx * self.reduce_warps_per_block + warp
         if row < total_rows:
             channels = mPartials.shape[3]
             n_size = mPartials.shape[4]
@@ -648,10 +653,16 @@ class ScanPrepBwdFused:
             c = rem // n_size
             n = rem - c * n_size
             acc = cutlass.Float32(0.0)
-            for b in range(mPartials.shape[0]):
-                for t in range(mPartials.shape[2]):
+            num_bt_iters = (self.reduce_bt_rows + 31) // 32
+            for bt_iter in cutlass.range_constexpr(num_bt_iters):
+                bt = lane + bt_iter * 32
+                if bt < self.reduce_bt_rows:
+                    b = bt // self.t_size
+                    t = bt - b * self.t_size
                     acc = acc + cutlass.Float32(mPartials[b, h, t, c, n])
-            mScaleGrad[h, c, n] = acc
+            acc = cute.arch.warp_reduction_sum(acc)
+            if lane == 0:
+                mScaleGrad[h, c, n] = acc
 
     @cute.kernel
     def reduce_bias_kernel(
@@ -660,19 +671,26 @@ class ScanPrepBwdFused:
         mBiasGrad: cute.Tensor,
         total_rows,
     ):
-        tidx, _, _ = cute.arch.thread_idx()
+        _tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        block_dim, _, _ = cute.arch.block_dim()
-        row = bidx * block_dim + tidx
+        lane = cute.arch.lane_idx()
+        warp = cute.arch.warp_idx()
+        row = bidx * self.reduce_warps_per_block + warp
         if row < total_rows:
             channels = mPartials.shape[3]
             h = row // channels
             c = row - h * channels
             acc = cutlass.Float32(0.0)
-            for b in range(mPartials.shape[0]):
-                for t in range(mPartials.shape[2]):
+            num_bt_iters = (self.reduce_bt_rows + 31) // 32
+            for bt_iter in cutlass.range_constexpr(num_bt_iters):
+                bt = lane + bt_iter * 32
+                if bt < self.reduce_bt_rows:
+                    b = bt // self.t_size
+                    t = bt - b * self.t_size
                     acc = acc + cutlass.Float32(mPartials[b, h, t, c])
-            mBiasGrad[h, c] = acc
+            acc = cute.arch.warp_reduction_sum(acc)
+            if lane == 0:
+                mBiasGrad[h, c] = acc
 
     @cute.jit
     def __call__(

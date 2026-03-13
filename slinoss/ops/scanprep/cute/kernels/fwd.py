@@ -32,7 +32,7 @@ class ScanPrepFwdFused:
         theta_bound: float,
         k_max: float,
         eps: float,
-        block_size: int = 128,
+        block_size: int = 96,
     ) -> None:
         batch, t_size, h_size, p_size, n_size = spec
         self.batch = int(batch)
