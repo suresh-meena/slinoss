@@ -1,4 +1,4 @@
-"""Reference SLinOSS mixer built around a hot-swappable scan backend."""
+"""Reference SLinOSS mixer built around hot-swappable scanprep and scan backends."""
 
 from __future__ import annotations
 
@@ -9,25 +9,14 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from .backend import AutoScanBackend, ScanBackend, ScanInputs
-from .discretization import SLinOSSDiscretizer
+from .backend import AutoScanBackend, ScanBackend, ScanInputs, ScanPrepBackend
+from .scanprep import SLinOSSScanPrep
 from .state import SLinOSSMixerState, ScanState
 
 
 def _require(cond: bool, msg: str) -> None:
     if not cond:
         raise ValueError(msg)
-
-
-def _pack_interleaved_pairs(x: torch.Tensor) -> torch.Tensor:
-    """Packs semantic ``(..., 2, N)`` pairs to canonical interleaved ``(..., 2N)``."""
-    if x.ndim != 5 or x.shape[-2] != 2:
-        raise ValueError(
-            "Expected semantic pair tensor with shape (batch, T, heads, 2, N). "
-            f"Got {tuple(x.shape)}."
-        )
-    batch, T, heads, _, N = map(int, x.shape)
-    return x.permute(0, 2, 1, 4, 3).reshape(batch, heads, T, 2 * N).contiguous()
 
 
 class SLinOSSMixer(nn.Module):
@@ -42,6 +31,7 @@ class SLinOSSMixer(nn.Module):
         d_head: int = 64,
         d_conv: int = 4,
         chunk_size: int = 64,
+        scanprep_backend: ScanPrepBackend | None = None,
         dt_min: float = 1e-4,
         dt_max: float = 1e-1,
         dt_init_floor: float = 1e-4,
@@ -79,8 +69,12 @@ class SLinOSSMixer(nn.Module):
         self.n_heads = int(self.d_inner // self.d_head)
 
         factory_kwargs = {"device": device, "dtype": dtype}
-        self.discretizer = SLinOSSDiscretizer(
+        self.scanprep = SLinOSSScanPrep(
             n_heads=self.n_heads,
+            d_state=self.d_state,
+            d_head=self.d_head,
+            normalize_bc=normalize_bc,
+            backend=scanprep_backend,
             dt_min=dt_min,
             dt_max=dt_max,
             dt_init_floor=dt_init_floor,
@@ -93,7 +87,7 @@ class SLinOSSMixer(nn.Module):
         )
         self.backend = AutoScanBackend() if backend is None else backend
 
-        param_dim = self.n_heads * self.discretizer.param_dim
+        param_dim = self.n_heads * self.scanprep.param_dim
         self.in_proj = nn.Linear(
             self.d_model,
             2 * self.d_inner + param_dim,
@@ -124,20 +118,8 @@ class SLinOSSMixer(nn.Module):
             torch.ones((self.d_inner,), device=device, dtype=torch.float32)
         )
         if self.normalize_bc:
-            self.b_scale = nn.Parameter(
-                torch.ones(
-                    (self.n_heads, 2, self.d_state), device=device, dtype=torch.float32
-                )
-            )
-            self.c_scale = nn.Parameter(
-                torch.ones(
-                    (self.n_heads, 2, self.d_state), device=device, dtype=torch.float32
-                )
-            )
             self.output_norm: nn.Module | None = None
         else:
-            self.b_scale = None
-            self.c_scale = None
             self.output_norm = nn.RMSNorm(self.d_inner, eps=1e-5, **factory_kwargs)
 
         self.reset_parameters()
@@ -145,11 +127,7 @@ class SLinOSSMixer(nn.Module):
     def reset_parameters(self) -> None:
         with torch.no_grad():
             self.skip.fill_(1.0)
-            if self.b_scale is not None:
-                self.b_scale.fill_(1.0)
-            if self.c_scale is not None:
-                self.c_scale.fill_(1.0)
-        self.discretizer.reset_parameters()
+        self.scanprep.reset_parameters()
 
     def init_state(
         self,
@@ -170,11 +148,6 @@ class SLinOSSMixer(nn.Module):
                 dtype=dtype,
             )
         )
-
-    def _normalize_bc(self, x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-        x_f = F.rms_norm(x.to(torch.float32), (self.d_state,), eps=1e-5)
-        scaled = x_f.mul(scale.view(1, 1, self.n_heads, x.shape[-2], self.d_state))
-        return scaled.to(dtype=x.dtype)
 
     def _apply_causal_depthwise_conv(
         self,
@@ -219,11 +192,7 @@ class SLinOSSMixer(nn.Module):
     ) -> ScanInputs:
         batch, T, _ = map(int, value.shape)
         bc = self._project_bc(value, batch, T)
-        U = self._pack_scan_u(value, batch, T)
-        bc = self._normalize_scan_bc_rows(bc)
-        B, C = self._pack_scan_bc(bc, batch, T)
-        coeffs = self._scan_coeffs_from_flat_params(params, batch, T)
-        return ScanInputs(U=U, M=coeffs[0], K=coeffs[1], B=B, C=C)
+        return self.scanprep(value, params, bc)
 
     def forward(
         self,
@@ -246,7 +215,7 @@ class SLinOSSMixer(nn.Module):
         proj = self.in_proj(x)
         gate, value_raw, params = torch.split(
             proj,
-            [self.d_inner, self.d_inner, self.n_heads * self.discretizer.param_dim],
+            [self.d_inner, self.d_inner, self.n_heads * self.scanprep.param_dim],
             dim=-1,
         )
         conv_state_in = None if state is None else state.conv
@@ -293,42 +262,6 @@ class SLinOSSMixer(nn.Module):
 
     def _project_bc(self, value: torch.Tensor, batch: int, T: int) -> torch.Tensor:
         return self.bc_proj(value).view(batch, T, self.n_heads, 4, self.d_state)
-
-    def _pack_scan_u(self, value: torch.Tensor, batch: int, T: int) -> torch.Tensor:
-        return (
-            value.view(batch, T, self.n_heads, self.d_head)
-            .permute(0, 2, 1, 3)
-            .contiguous()
-        )
-
-    def _normalize_scan_bc_rows(self, bc: torch.Tensor) -> torch.Tensor:
-        if self.normalize_bc:
-            assert self.b_scale is not None and self.c_scale is not None
-            return self._normalize_bc(
-                bc, torch.cat((self.b_scale, self.c_scale), dim=1)
-            )
-        return bc
-
-    def _pack_scan_bc(
-        self,
-        bc: torch.Tensor,
-        batch: int,
-        T: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        packed = bc.permute(0, 2, 1, 4, 3).reshape(
-            batch, self.n_heads, T, self.d_state, 4
-        )
-        B = packed[..., :2].reshape(batch, self.n_heads, T, 2 * self.d_state)
-        C = packed[..., 2:].reshape(batch, self.n_heads, T, 2 * self.d_state)
-        return B, C
-
-    def _scan_coeffs_from_flat_params(
-        self,
-        params: torch.Tensor,
-        batch: int,
-        T: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.discretizer.scan_coeffs(params.view(batch, T, self.n_heads, -1))
 
     def _apply_causal_depthwise_conv_with_state(
         self,

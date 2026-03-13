@@ -1,15 +1,30 @@
-"""Backend boundary for SLinOSS scan operators."""
+"""Backend boundaries for SLinOSS scan preparation and scan operators."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import torch
 
 from slinoss.ops.v2x2ssd import v2x2ssd, v2x2ssd_cute
 
 from .state import ScanState
+
+
+@dataclass(frozen=True)
+class ScanPrepInputs:
+    """Canonical inputs for the scanprep backend.
+
+    Shapes:
+    - ``value``: ``(batch, T, heads * P)``
+    - ``params``: ``(batch, T, heads * param_dim)``
+    - ``bc``: ``(batch, T, heads, 4, N)``
+    """
+
+    value: torch.Tensor
+    params: torch.Tensor
+    bc: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -28,6 +43,47 @@ class ScanInputs:
     K: torch.Tensor
     B: torch.Tensor
     C: torch.Tensor
+
+
+if TYPE_CHECKING:
+
+    class _ScanPrepOwner(Protocol):
+        def _prepare_inputs_reference(self, inputs: ScanPrepInputs) -> ScanInputs: ...
+
+
+class ScanPrepBackend(Protocol):
+    """Hot-swappable SLinOSS scanprep backend."""
+
+    def __call__(
+        self,
+        owner: "_ScanPrepOwner",
+        inputs: ScanPrepInputs,
+    ) -> ScanInputs: ...
+
+
+class ReferenceScanPrepBackend:
+    """Reference backend for preparing scan-native ``(U, M, K, B, C)`` inputs."""
+
+    def __call__(
+        self,
+        owner: "_ScanPrepOwner",
+        inputs: ScanPrepInputs,
+    ) -> ScanInputs:
+        return owner._prepare_inputs_reference(inputs)
+
+
+class AutoScanPrepBackend:
+    """Default scanprep backend. CUDA fusion will route here later."""
+
+    def __init__(self) -> None:
+        self.reference = ReferenceScanPrepBackend()
+
+    def __call__(
+        self,
+        owner: "_ScanPrepOwner",
+        inputs: ScanPrepInputs,
+    ) -> ScanInputs:
+        return self.reference(owner, inputs)
 
 
 class ScanBackend(Protocol):
@@ -156,6 +212,10 @@ class AutoScanBackend:
 
 
 __all__ = [
+    "ScanPrepInputs",
+    "ScanPrepBackend",
+    "ReferenceScanPrepBackend",
+    "AutoScanPrepBackend",
     "ScanInputs",
     "ScanBackend",
     "ReferenceScanBackend",

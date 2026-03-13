@@ -21,18 +21,20 @@ class ProfiledSLinOSSMixer(SLinOSSMixer):
     ) -> ScanInputs:
         batch, T, _ = map(int, value.shape)
         bc = call_region("mixer.bc_proj", self._project_bc, value, batch, T)
-        U = call_region("mixer.scan_input_pack", self._pack_scan_u, value, batch, T)
-        bc = call_region("mixer.bc_norm", self._normalize_scan_bc_rows, bc)
+        U = call_region(
+            "mixer.scan_input_pack", self.scanprep._pack_scan_u, value, batch, T
+        )
+        bc = call_region("mixer.bc_norm", self.scanprep._normalize_scan_bc_rows, bc)
         coeffs = call_region(
             "mixer.discretizer",
-            self._scan_coeffs_from_flat_params,
+            self.scanprep._scan_coeffs_from_flat_params,
             params,
             batch,
             T,
         )
         B, C = call_region(
             "mixer.scan_input_pack",
-            self._pack_scan_bc,
+            self.scanprep._pack_scan_bc,
             bc,
             batch,
             T,
@@ -62,7 +64,7 @@ class ProfiledSLinOSSMixer(SLinOSSMixer):
         proj = call_region("mixer.in_proj", self.in_proj, x)
         gate, value_raw, params = torch.split(
             proj,
-            [self.d_inner, self.d_inner, self.n_heads * self.discretizer.param_dim],
+            [self.d_inner, self.d_inner, self.n_heads * self.scanprep.param_dim],
             dim=-1,
         )
         conv_state_in = None if state is None else state.conv

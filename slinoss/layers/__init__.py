@@ -2,14 +2,18 @@
 
 from .backend import (
     AutoScanBackend,
+    AutoScanPrepBackend,
     CuteScanBackend,
     ReferenceScanBackend,
+    ReferenceScanPrepBackend,
     ScanBackend,
     ScanInputs,
+    ScanPrepBackend,
+    ScanPrepInputs,
 )
-from .discretization import (
-    SLinOSSDiscretizationOutput,
-    SLinOSSDiscretizer,
+from .scanprep import (
+    SLinOSSScanPrep,
+    SLinOSSScanPrepCoefficients,
     build_transition_from_polar,
     foh_taps_from_polar,
     principal_angle,
@@ -19,14 +23,18 @@ from .state import SLinOSSMixerState, ScanState
 
 __all__ = [
     "ScanInputs",
+    "ScanPrepInputs",
     "ScanBackend",
+    "ScanPrepBackend",
     "ReferenceScanBackend",
+    "ReferenceScanPrepBackend",
     "CuteScanBackend",
     "AutoScanBackend",
+    "AutoScanPrepBackend",
     "ScanState",
     "SLinOSSMixerState",
-    "SLinOSSDiscretizationOutput",
-    "SLinOSSDiscretizer",
+    "SLinOSSScanPrepCoefficients",
+    "SLinOSSScanPrep",
     "SLinOSSMixer",
     "principal_angle",
     "build_transition_from_polar",

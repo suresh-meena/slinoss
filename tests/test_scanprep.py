@@ -7,7 +7,7 @@ import torch
 
 from slinoss.layers import (
     ReferenceScanBackend,
-    SLinOSSDiscretizer,
+    SLinOSSScanPrep,
     ScanInputs,
     ScanState,
     build_transition_from_polar,
@@ -52,10 +52,12 @@ def test_foh_taps_match_midpoint_rule_at_identity() -> None:
     assert torch.equal(k_curr[..., 1], torch.zeros_like(half_dt))
 
 
-def test_discretizer_outputs_are_bounded_and_finite() -> None:
+def test_scanprep_coefficients_are_bounded_and_finite() -> None:
     torch.manual_seed(0)
-    disc = SLinOSSDiscretizer(
+    prep = SLinOSSScanPrep(
         n_heads=3,
+        d_state=4,
+        d_head=2,
         dt_min=1e-3,
         dt_max=1e-1,
         r_min=0.8,
@@ -63,9 +65,9 @@ def test_discretizer_outputs_are_bounded_and_finite() -> None:
         theta_bound=math.pi / 2.0,
         k_max=0.25,
     )
-    params = torch.randn((2, 7, 3, disc.param_dim), dtype=torch.float32)
+    params = torch.randn((2, 7, 3, prep.param_dim), dtype=torch.float32)
 
-    out = disc(params)
+    out = prep.coefficients(params)
     m = torch.view_as_complex(out.M)
     r = torch.abs(m)
 
@@ -79,10 +81,10 @@ def test_discretizer_outputs_are_bounded_and_finite() -> None:
     assert torch.isfinite(out.dt).all()
     assert torch.isfinite(out.r).all()
     assert torch.isfinite(out.theta).all()
-    assert bool((out.dt >= disc.dt_min).all())
-    assert bool((out.dt <= disc.dt_max).all())
-    assert bool((out.r >= disc.r_min).all())
-    assert bool((out.r <= disc.r_max).all())
+    assert bool((out.dt >= prep.dt_min).all())
+    assert bool((out.dt <= prep.dt_max).all())
+    assert bool((out.r >= prep.r_min).all())
+    assert bool((out.r <= prep.r_max).all())
     assert torch.allclose(r, out.r, atol=1e-6, rtol=1e-6)
 
 

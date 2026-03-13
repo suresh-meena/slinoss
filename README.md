@@ -9,7 +9,7 @@ but replaces scalar decays with a damped rotation and exact two-endpoint forcing
 In this repo, the core pieces are:
 
 - [`SLinOSSMixer`](./slinoss/layers/mixer.py): the paper-faithful mixer layer
-- [`SLinOSSDiscretizer`](./slinoss/layers/discretization.py): bounded per-token oscillator parameterization and exact FOH taps
+- [`SLinOSSScanPrep`](./slinoss/layers/scanprep.py): reference scan-preparation boundary for bounded per-token oscillator parameterization and exact FOH taps
 - [`v2x2ssd`](./slinoss/ops/v2x2ssd/reference.py): the current reference scan backend
 
 ## Install
