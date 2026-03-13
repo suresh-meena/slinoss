@@ -8,7 +8,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from .db import ChunkScanBwdDBAmpere
-from .dcdr import ChunkScanBwdDCDRAmpere
+from .dlp import ChunkScanBwdDLPAmpere
 from .du import ChunkScanBwdDUAmpere
 from .dz0 import ChunkScanBwdDZ0Ampere
 from .param_scan import ChunkScanBwdParamScanAmpere
@@ -236,6 +236,7 @@ def _compiled_key(
     d_out_shape: tuple[int, ...],
     chunk_size: int,
     has_prev: bool,
+    input_ptr_signature: tuple[int, ...],
     num_threads_du: int,
     num_threads_db: int,
     num_threads_dc: int,
@@ -254,6 +255,7 @@ def _compiled_key(
         d_out_shape,
         int(chunk_size),
         has_prev,
+        input_ptr_signature,
         int(num_threads_du),
         int(num_threads_db),
         int(num_threads_dc),
@@ -327,6 +329,17 @@ def compile_chunk_scan_bwd_kernels(
         d_out_shape=tuple(d_out.shape),
         chunk_size=L,
         has_prev=B_prev is not None,
+        input_ptr_signature=(
+            int(U.data_ptr()),
+            int(M.data_ptr()),
+            int(K.data_ptr()),
+            int(B.data_ptr()),
+            int(C.data_ptr()),
+            int(chunk_starts.data_ptr()),
+            int(d_out.data_ptr()),
+            int(B_prev.data_ptr()) if B_prev is not None else 0,
+            int(U_prev.data_ptr()) if U_prev is not None else 0,
+        ),
         num_threads_du=num_threads_du,
         num_threads_db=num_threads_db,
         num_threads_dc=num_threads_dc,
@@ -473,7 +486,7 @@ def compile_chunk_scan_bwd_kernels(
     mDC = from_dlpack(dC, assumed_align=16)
     mDR = from_dlpack(dR, assumed_align=16)
 
-    k_dc = ChunkScanBwdDCDRAmpere(
+    k_dc = ChunkScanBwdDLPAmpere(
         cutlass_dtype,
         chunk_size=L,
         D=D,
@@ -482,11 +495,6 @@ def compile_chunk_scan_bwd_kernels(
     )
     compiled_dc = None
     compiled_dc_fast = None
-    mZ0_fast = None
-    Z0_blk_fast_keepalive = None
-    if return_launchers and enable_overlapped_launcher:
-        Z0_blk_fast_keepalive = Z0_blk.to(dtype=tc_dtype)
-        mZ0_fast = from_dlpack(Z0_blk_fast_keepalive, assumed_align=16)
 
     dlogp_view = dlogp.reshape(Bsz, H, n_chunks, L)
     dC_view = dC.reshape(Bsz, H, n_chunks, L, D)
@@ -516,7 +524,8 @@ def compile_chunk_scan_bwd_kernels(
     dkprev_view = dkprev_out.reshape(Bsz, H, n_chunks, n_splits, L, 2)
     dkcurr_view = dkcurr_out.reshape(Bsz, H, n_chunks, n_splits, L, 2)
 
-    cached = _COMPILED_CACHE.get(cache_key)
+    use_compiled_cache = not return_launchers
+    cached = _COMPILED_CACHE.get(cache_key) if use_compiled_cache else None
     if cached is None:
         compiled_dz0 = cute.compile(k_dz0, mDOut_dz0, mC_dz0, mM_dz0, mDZ0)
         compiled_du = cute.compile(
@@ -570,22 +579,6 @@ def compile_chunk_scan_bwd_kernels(
             mDC,
             mDR,
         )
-        if mZ0_fast is not None:
-            compiled_dc_fast = cute.compile(
-                k_dc,
-                mU,
-                mB,
-                mC,
-                mM,
-                mK,
-                mDOut,
-                mU_prev0,
-                mB_prev0,
-                mZ0_fast,
-                mDLogp,
-                mDC,
-                mDR,
-            )
         compiled_param = cute.compile(
             k_param,
             mM,
@@ -606,7 +599,8 @@ def compile_chunk_scan_bwd_kernels(
             compiled_param,
             compiled_dc_fast,
         )
-        _COMPILED_CACHE[cache_key] = cached
+        if use_compiled_cache:
+            _COMPILED_CACHE[cache_key] = cached
     else:
         (
             compiled_dz0,
@@ -616,22 +610,7 @@ def compile_chunk_scan_bwd_kernels(
             compiled_param,
             compiled_dc_fast,
         ) = cached
-        if compiled_dc_fast is None and mZ0_fast is not None:
-            compiled_dc_fast = cute.compile(
-                k_dc,
-                mU,
-                mB,
-                mC,
-                mM,
-                mK,
-                mDOut,
-                mU_prev0,
-                mB_prev0,
-                mZ0_fast,
-                mDLogp,
-                mDC,
-                mDR,
-            )
+        if use_compiled_cache:
             _COMPILED_CACHE[cache_key] = (
                 compiled_dz0,
                 compiled_du,
@@ -683,37 +662,20 @@ def compile_chunk_scan_bwd_kernels(
         )
 
     def _launch_dc() -> None:
-        if compiled_dc_fast is not None:
-            _ = Z0_blk_fast_keepalive
-            compiled_dc_fast(
-                mU,
-                mB,
-                mC,
-                mM,
-                mK,
-                mDOut,
-                mU_prev0,
-                mB_prev0,
-                mZ0_fast,
-                mDLogp,
-                mDC,
-                mDR,
-            )
-        else:
-            compiled_dc(
-                mU,
-                mB,
-                mC,
-                mM,
-                mK,
-                mDOut,
-                mU_prev0,
-                mB_prev0,
-                mZ0,
-                mDLogp,
-                mDC,
-                mDR,
-            )
+        compiled_dc(
+            mU,
+            mB,
+            mC,
+            mM,
+            mK,
+            mDOut,
+            mU_prev0,
+            mB_prev0,
+            mZ0,
+            mDLogp,
+            mDC,
+            mDR,
+        )
 
     def _launch_param() -> None:
         compiled_param(
