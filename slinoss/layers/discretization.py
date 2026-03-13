@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 from torch import nn
@@ -124,6 +125,8 @@ class SLinOSSDiscretizer(nn.Module):
     """
 
     param_dim: int = 13
+    _sigmoid_param_idx = (0, 3, 5, 6, 7, 8)
+    _tanh_param_idx = (4, 9, 10, 11, 12)
 
     def __init__(
         self,
@@ -191,7 +194,43 @@ class SLinOSSDiscretizer(nn.Module):
         self.mix_k_curr_bias = nn.Parameter(
             torch.empty((self.n_heads,), device=device, dtype=fp32)
         )
+        self.register_buffer(
+            "_zero_bias",
+            torch.zeros((self.n_heads,), device=device, dtype=fp32),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_sigmoid_idx_tensor",
+            torch.tensor(self._sigmoid_param_idx, device=device, dtype=torch.long),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_tanh_idx_tensor",
+            torch.tensor(self._tanh_param_idx, device=device, dtype=torch.long),
+            persistent=False,
+        )
         self.reset_parameters()
+
+    def _flat_param_bias(self) -> torch.Tensor:
+        zero = cast(torch.Tensor, self._zero_bias)
+        return torch.stack(
+            (
+                self.dt_bias,
+                self.gamma_bias,
+                self.omega_bias,
+                zero,
+                zero,
+                self.mix_r_bias,
+                self.mix_theta_bias,
+                self.mix_k_prev_bias,
+                self.mix_k_curr_bias,
+                zero,
+                zero,
+                zero,
+                zero,
+            ),
+            dim=-1,
+        )
 
     def reset_parameters(self) -> None:
         dt_lo = max(self.dt_min, self.dt_init_floor)
@@ -245,6 +284,7 @@ class SLinOSSDiscretizer(nn.Module):
         # Run the coefficient algebra in the scan backend's native (B, H, T, *)
         # layout so we do not materialize transposed outputs afterward.
         p = params.permute(0, 2, 1, 3).to(torch.float32)
+        p = p + self._flat_param_bias().view(1, self.n_heads, 1, self.param_dim)
         (
             dt_raw,
             gamma_raw,
@@ -261,18 +301,7 @@ class SLinOSSDiscretizer(nn.Module):
             k_curr_im,
         ) = p.unbind(dim=-1)
 
-        head = (1, self.n_heads, 1)
-        sigmoid_inputs = torch.stack(
-            [
-                dt_raw + self.dt_bias.view(*head),
-                r_raw,
-                mix_r_raw + self.mix_r_bias.view(*head),
-                mix_theta_raw + self.mix_theta_bias.view(*head),
-                mix_k_prev_raw + self.mix_k_prev_bias.view(*head),
-                mix_k_curr_raw + self.mix_k_curr_bias.view(*head),
-            ],
-            dim=-1,
-        )
+        sigmoid_idx = cast(torch.Tensor, self._sigmoid_idx_tensor)
         (
             dt_u,
             r_direct_u,
@@ -280,17 +309,16 @@ class SLinOSSDiscretizer(nn.Module):
             mix_theta,
             mix_k_prev,
             mix_k_curr,
-        ) = torch.sigmoid(sigmoid_inputs).unbind(dim=-1)
+        ) = torch.sigmoid(p.index_select(-1, sigmoid_idx)).unbind(dim=-1)
         dt = self.dt_min + (self.dt_max - self.dt_min) * dt_u
-        gamma = F.softplus(gamma_raw + self.gamma_bias.view(*head))
-        omega = omega_raw + self.omega_bias.view(*head)
+        gamma = F.softplus(gamma_raw)
+        omega = omega_raw
 
         r_struct = self.r_min + (self.r_max - self.r_min) * torch.exp(-gamma * dt)
         theta_struct = omega * dt
 
-        tanh_outputs = torch.tanh(
-            torch.stack([theta_raw, k_prev_re, k_prev_im, k_curr_re, k_curr_im], dim=-1)
-        )
+        tanh_idx = cast(torch.Tensor, self._tanh_idx_tensor)
+        tanh_outputs = torch.tanh(p.index_select(-1, tanh_idx))
         theta_direct = self.theta_bound * tanh_outputs[..., 0]
         k_prev_learned = self.k_max * tanh_outputs[..., 1:3]
         k_curr_learned = self.k_max * tanh_outputs[..., 3:5]

@@ -21,16 +21,8 @@ class ProfiledSLinOSSMixer(SLinOSSMixer):
     ) -> ScanInputs:
         batch, T, _ = map(int, value.shape)
         bc = call_region("mixer.bc_proj", self._project_bc, value, batch, T)
-        B_sem = bc[..., :2, :]
-        C_sem = bc[..., 2:, :]
-        if self.normalize_bc:
-            B_sem, C_sem = call_region(
-                "mixer.bc_norm",
-                self._normalize_scan_bc,
-                B_sem,
-                C_sem,
-            )
-
+        U = call_region("mixer.scan_input_pack", self._pack_scan_u, value, batch, T)
+        bc = call_region("mixer.bc_norm", self._normalize_scan_bc_rows, bc)
         coeffs = call_region(
             "mixer.discretizer",
             self._scan_coeffs_from_flat_params,
@@ -38,16 +30,14 @@ class ProfiledSLinOSSMixer(SLinOSSMixer):
             batch,
             T,
         )
-        return call_region(
+        B, C = call_region(
             "mixer.scan_input_pack",
-            self._pack_scan_inputs,
-            value,
-            coeffs,
-            B_sem,
-            C_sem,
+            self._pack_scan_bc,
+            bc,
             batch,
             T,
         )
+        return ScanInputs(U=U, M=coeffs[0], K=coeffs[1], B=B, C=C)
 
     def forward(
         self,
@@ -103,7 +93,7 @@ class ProfiledSLinOSSMixer(SLinOSSMixer):
             "mixer.gate_skip",
             self._apply_gate_skip,
             scan_y,
-            value,
+            scan_inputs.U,
             gate,
             batch,
             T,

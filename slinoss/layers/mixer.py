@@ -219,13 +219,11 @@ class SLinOSSMixer(nn.Module):
     ) -> ScanInputs:
         batch, T, _ = map(int, value.shape)
         bc = self._project_bc(value, batch, T)
-        B_sem = bc[..., :2, :]
-        C_sem = bc[..., 2:, :]
-        if self.normalize_bc:
-            B_sem, C_sem = self._normalize_scan_bc(B_sem, C_sem)
-
+        U = self._pack_scan_u(value, batch, T)
+        bc = self._normalize_scan_bc_rows(bc)
+        B, C = self._pack_scan_bc(bc, batch, T)
         coeffs = self._scan_coeffs_from_flat_params(params, batch, T)
-        return self._pack_scan_inputs(value, coeffs, B_sem, C_sem, batch, T)
+        return ScanInputs(U=U, M=coeffs[0], K=coeffs[1], B=B, C=C)
 
     def forward(
         self,
@@ -266,7 +264,7 @@ class SLinOSSMixer(nn.Module):
             scan_y = cast(torch.Tensor, scan_result)
             scan_state = None
 
-        gated = self._apply_gate_skip(scan_y, value, gate, batch, T)
+        gated = self._apply_gate_skip(scan_y, scan_inputs.U, gate, batch, T)
         out = self.out_proj(gated)
 
         if not return_state:
@@ -280,14 +278,15 @@ class SLinOSSMixer(nn.Module):
     def _apply_gate_skip(
         self,
         scan_y: torch.Tensor,
-        value: torch.Tensor,
+        scan_u: torch.Tensor,
         gate: torch.Tensor,
         batch: int,
         T: int,
     ) -> torch.Tensor:
-        scan_y = scan_y.permute(0, 2, 1, 3).reshape(batch, T, self.d_inner).contiguous()
-        skip = self.skip.to(dtype=value.dtype).view(1, 1, self.d_inner)
-        y = (scan_y + value * skip) * F.silu(gate).to(dtype=value.dtype)
+        skip = self.skip.to(dtype=scan_u.dtype).view(1, self.n_heads, 1, self.d_head)
+        y = scan_y + scan_u * skip
+        y = y.permute(0, 2, 1, 3).reshape(batch, T, self.d_inner)
+        y = y * F.silu(gate).to(dtype=y.dtype)
         if self.output_norm is not None:
             y = self.output_norm(y)
         return y
@@ -295,16 +294,33 @@ class SLinOSSMixer(nn.Module):
     def _project_bc(self, value: torch.Tensor, batch: int, T: int) -> torch.Tensor:
         return self.bc_proj(value).view(batch, T, self.n_heads, 4, self.d_state)
 
-    def _normalize_scan_bc(
-        self,
-        B_sem: torch.Tensor,
-        C_sem: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert self.b_scale is not None and self.c_scale is not None
+    def _pack_scan_u(self, value: torch.Tensor, batch: int, T: int) -> torch.Tensor:
         return (
-            self._normalize_bc(B_sem, self.b_scale),
-            self._normalize_bc(C_sem, self.c_scale),
+            value.view(batch, T, self.n_heads, self.d_head)
+            .permute(0, 2, 1, 3)
+            .contiguous()
         )
+
+    def _normalize_scan_bc_rows(self, bc: torch.Tensor) -> torch.Tensor:
+        if self.normalize_bc:
+            assert self.b_scale is not None and self.c_scale is not None
+            return self._normalize_bc(
+                bc, torch.cat((self.b_scale, self.c_scale), dim=1)
+            )
+        return bc
+
+    def _pack_scan_bc(
+        self,
+        bc: torch.Tensor,
+        batch: int,
+        T: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        packed = bc.permute(0, 2, 1, 4, 3).reshape(
+            batch, self.n_heads, T, self.d_state, 4
+        )
+        B = packed[..., :2].reshape(batch, self.n_heads, T, 2 * self.d_state)
+        C = packed[..., 2:].reshape(batch, self.n_heads, T, 2 * self.d_state)
+        return B, C
 
     def _scan_coeffs_from_flat_params(
         self,
@@ -313,25 +329,6 @@ class SLinOSSMixer(nn.Module):
         T: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         return self.discretizer.scan_coeffs(params.view(batch, T, self.n_heads, -1))
-
-    def _pack_scan_inputs(
-        self,
-        value: torch.Tensor,
-        coeffs: tuple[torch.Tensor, torch.Tensor],
-        B_sem: torch.Tensor,
-        C_sem: torch.Tensor,
-        batch: int,
-        T: int,
-    ) -> ScanInputs:
-        return ScanInputs(
-            U=value.view(batch, T, self.n_heads, self.d_head)
-            .permute(0, 2, 1, 3)
-            .contiguous(),
-            M=coeffs[0],
-            K=coeffs[1],
-            B=_pack_interleaved_pairs(B_sem),
-            C=_pack_interleaved_pairs(C_sem),
-        )
 
     def _apply_causal_depthwise_conv_with_state(
         self,
