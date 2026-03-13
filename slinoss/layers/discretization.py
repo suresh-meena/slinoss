@@ -32,7 +32,10 @@ def principal_angle(theta: torch.Tensor) -> torch.Tensor:
 
 
 def _pack_complex(x: torch.Tensor) -> torch.Tensor:
-    return torch.view_as_real(x).to(torch.float32).contiguous()
+    packed = torch.view_as_real(x)
+    if packed.dtype != torch.float32:
+        packed = packed.to(torch.float32)
+    return packed if packed.is_contiguous() else packed.contiguous()
 
 
 def _foh_taps_from_normalized(
@@ -46,9 +49,8 @@ def _foh_taps_from_normalized(
     """FOH taps for already-normalized ``dt/log(r)/theta`` inputs."""
 
     z = torch.complex(log_r_f, theta_f)
-    z_abs = torch.abs(z)
     z_thresh = float(max(1.0e-4, math.sqrt(max(float(eps), 1.0e-12))))
-    small = z_abs < z_thresh
+    small = log_r_f.square() + theta_f.square() < (z_thresh * z_thresh)
     if bool(small.any()):
         safe_z = torch.where(small, torch.ones_like(z), z)
 
@@ -242,7 +244,7 @@ class SLinOSSDiscretizer(nn.Module):
 
         # Run the coefficient algebra in the scan backend's native (B, H, T, *)
         # layout so we do not materialize transposed outputs afterward.
-        p = params.to(torch.float32).permute(0, 2, 1, 3)
+        p = params.permute(0, 2, 1, 3).to(torch.float32)
         (
             dt_raw,
             gamma_raw,
@@ -294,13 +296,11 @@ class SLinOSSDiscretizer(nn.Module):
         k_curr_learned = self.k_max * tanh_outputs[..., 3:5]
         r_direct = self.r_min + (self.r_max - self.r_min) * r_direct_u
 
-        r = mix_r * r_struct + (1.0 - mix_r) * r_direct
-        theta = principal_angle(
-            mix_theta * theta_struct + (1.0 - mix_theta) * theta_direct
-        )
+        r = torch.lerp(r_direct, r_struct, mix_r)
+        theta = principal_angle(torch.lerp(theta_direct, theta_struct, mix_theta))
 
-        dt_f = dt.to(torch.float32).clamp_min(max(1e-6, float(self.eps)))
-        r_f = r.to(torch.float32).clamp(min=max(1e-12, float(self.eps)), max=1.0)
+        dt_f = dt
+        r_f = r
         theta_f = theta
         log_r_f = torch.log(r_f)
         rho = torch.polar(r_f, theta_f)
@@ -308,14 +308,8 @@ class SLinOSSDiscretizer(nn.Module):
         k_prev_struct, k_curr_struct = _foh_taps_from_normalized(
             dt_f, log_r_f, theta_f, rho, eps=self.eps
         )
-        k_prev = (
-            mix_k_prev.unsqueeze(-1) * k_prev_struct
-            + (1.0 - mix_k_prev.unsqueeze(-1)) * k_prev_learned
-        )
-        k_curr = (
-            mix_k_curr.unsqueeze(-1) * k_curr_struct
-            + (1.0 - mix_k_curr.unsqueeze(-1)) * k_curr_learned
-        )
+        k_prev = torch.lerp(k_prev_learned, k_prev_struct, mix_k_prev.unsqueeze(-1))
+        k_curr = torch.lerp(k_curr_learned, k_curr_struct, mix_k_curr.unsqueeze(-1))
 
         M = _pack_complex(rho)
         K = torch.stack([k_prev, k_curr], dim=-2)

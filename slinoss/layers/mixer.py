@@ -173,8 +173,8 @@ class SLinOSSMixer(nn.Module):
 
     def _normalize_bc(self, x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         x_f = F.rms_norm(x.to(torch.float32), (self.d_state,), eps=1e-5)
-        scaled = x_f * scale.view(1, 1, self.n_heads, x.shape[-2], self.d_state)
-        return scaled.to(dtype=x.dtype).contiguous()
+        scaled = x_f.mul(scale.view(1, 1, self.n_heads, x.shape[-2], self.d_state))
+        return scaled.to(dtype=x.dtype)
 
     def _apply_causal_depthwise_conv(
         self,
