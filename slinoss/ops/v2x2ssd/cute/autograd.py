@@ -7,40 +7,8 @@ from typing import cast
 import torch
 
 from slinoss.perf import record_region
-from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_increment import (
-    chunk_increment_bwd_cute,
-)
-from slinoss.ops.v2x2ssd.cute.kernels.bwd.chunk_scan import chunk_scan_bwd_cute
-from slinoss.ops.v2x2ssd.cute.kernels.bwd.state_passing import state_passing_bwd_cute
+from slinoss.ops.v2x2ssd.cute.kernels.bwd import v2x2ssd_bwd_cute
 from slinoss.ops.v2x2ssd.cute.kernels.fwd import v2x2ssd_fwd_cute
-
-
-_ZERO_FINAL_GRAD_CACHE: dict[tuple, torch.Tensor] = {}
-
-
-def _get_zero_final_grad(
-    *,
-    device: torch.device,
-    batch_size: int,
-    heads: int,
-    P: int,
-    D: int,
-) -> torch.Tensor:
-    key = (
-        device.type,
-        device.index if device.index is not None else -1,
-        int(batch_size),
-        int(heads),
-        int(P),
-        int(D),
-    )
-    cached = _ZERO_FINAL_GRAD_CACHE.get(key)
-    if cached is None:
-        cached = torch.zeros(
-            (batch_size, heads, P, D), device=device, dtype=torch.float32
-        )
-        _ZERO_FINAL_GRAD_CACHE[key] = cached
-    return cached
 
 
 class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
@@ -113,74 +81,27 @@ class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
             with record_region("backward.v2x2ssd.autograd_wrapper"):
                 dY_contig = dY if dY.is_contiguous() else dY.contiguous()
 
-            (
-                dU_scan,
-                dM_scan,
-                dK_scan,
-                dB_scan,
-                dC_scan,
-                d_chunk_starts,
-            ) = cast(
+            dU_scan, dM_scan, dK_scan, dB_scan, dC_scan = cast(
                 tuple[
                     torch.Tensor,
                     torch.Tensor,
                     torch.Tensor,
                     torch.Tensor,
                     torch.Tensor,
-                    torch.Tensor,
                 ],
-                chunk_scan_bwd_cute(
+                v2x2ssd_bwd_cute(
                     U,
                     M,
                     K,
                     B,
                     C,
+                    m_chunk,
                     chunk_starts,
                     dY_contig,
                     chunk_size=ctx.chunk_size,
                     compute_dtype=ctx.compute_dtype,
-                    return_prev_grads=False,
                 ),
             )
-
-            zero_final = _get_zero_final_grad(
-                device=U.device,
-                batch_size=U.shape[0],
-                heads=U.shape[1],
-                P=U.shape[-1],
-                D=B.shape[-1],
-            )
-            d_inc, d_m_chunk = cast(
-                tuple[torch.Tensor, torch.Tensor],
-                state_passing_bwd_cute(
-                    chunk_starts,
-                    m_chunk,
-                    d_chunk_starts=d_chunk_starts,
-                    d_final=zero_final,
-                    return_d_initial=False,
-                ),
-            )
-
-            dU_inc, dM_inc, dK_inc, dB_inc = cast(
-                tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
-                chunk_increment_bwd_cute(
-                    U,
-                    M,
-                    K,
-                    B,
-                    d_inc=d_inc,
-                    d_m_chunk=d_m_chunk,
-                    chunk_size=ctx.chunk_size,
-                    compute_dtype=ctx.compute_dtype,
-                    return_prev_grads=False,
-                ),
-            )
-
-            with record_region("backward.v2x2ssd.autograd_wrapper"):
-                dU_scan.add_(dU_inc)
-                dM_scan.add_(dM_inc)
-                dK_scan.add_(dK_inc)
-                dB_scan.add_(dB_inc)
 
             return (
                 dU_scan,
