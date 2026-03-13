@@ -11,7 +11,7 @@ from torch.nn import functional as F
 
 from slinoss.perf import call_region
 
-from .backend import AutoScanBackend, ScanBackend, ScanInputs
+from .backend import AutoScanBackend, CuteScanBackend, ScanBackend, ScanInputs
 from .discretization import SLinOSSDiscretizer
 from .state import SLinOSSMixerState, ScanState
 
@@ -290,13 +290,25 @@ class SLinOSSMixer(nn.Module):
 
         scan_inputs = self._build_scan_inputs(value=value, params=params)
         scan_state_in = None if state is None else state.scan
-        scan_result = call_region(
-            "v2x2ssd.total",
-            self._run_scan_backend,
-            scan_inputs,
-            scan_state_in,
-            return_state,
-        )
+        if (
+            scan_state_in is None
+            and not return_state
+            and isinstance(self.backend, (CuteScanBackend, AutoScanBackend))
+            and scan_inputs.U.device.type == "cuda"
+        ):
+            scan_result = self._run_scan_backend(
+                scan_inputs,
+                scan_state_in,
+                return_state,
+            )
+        else:
+            scan_result = call_region(
+                "v2x2ssd.total",
+                self._run_scan_backend,
+                scan_inputs,
+                scan_state_in,
+                return_state,
+            )
         if return_state:
             scan_y, scan_state = cast(tuple[torch.Tensor, ScanState], scan_result)
         else:
