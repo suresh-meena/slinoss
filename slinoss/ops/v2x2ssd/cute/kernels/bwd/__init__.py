@@ -38,6 +38,7 @@ from .state_passing.state import StatePassingBwdStateAmpere
 _BWD_HOST_CACHE: dict[tuple, object] = {}
 _ZERO_PREV_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 _ZERO_FINAL_GRAD_CACHE: dict[tuple, torch.Tensor] = {}
+_BWD_WORKSPACE_CACHE: dict[tuple, tuple[torch.Tensor, ...]] = {}
 
 
 def _get_zero_prev_tensors(
@@ -90,6 +91,80 @@ def _get_zero_final_grad(
             (batch_size, heads, P, D), device=device, dtype=torch.float32
         )
         _ZERO_FINAL_GRAD_CACHE[key] = cached
+    return cached
+
+
+def _get_bwd_workspace(
+    *,
+    device: torch.device,
+    tc_dtype: torch.dtype,
+    batch_size: int,
+    heads: int,
+    n_chunks: int,
+    chunk_size: int,
+    P: int,
+    D: int,
+    n_d_tiles: int,
+) -> tuple[torch.Tensor, ...]:
+    key = (
+        device.type,
+        device.index if device.index is not None else -1,
+        tc_dtype,
+        int(batch_size),
+        int(heads),
+        int(n_chunks),
+        int(chunk_size),
+        int(P),
+        int(D),
+        int(n_d_tiles),
+    )
+    cached = _BWD_WORKSPACE_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    BH = int(batch_size) * int(heads)
+    BHC = BH * int(n_chunks)
+    L = int(chunk_size)
+
+    cached = (
+        torch.empty((BH, n_chunks, P), device=device, dtype=tc_dtype),
+        torch.empty((BH, n_chunks, D), device=device, dtype=tc_dtype),
+        torch.empty((BHC, P, D), device=device, dtype=torch.float32),
+        torch.empty(
+            (batch_size, heads, n_chunks, P, D), device=device, dtype=torch.float32
+        ),
+        torch.empty((batch_size, heads, n_chunks, P, D), device=device, dtype=tc_dtype),
+        torch.empty((batch_size, heads, P, D), device=device, dtype=torch.float32),
+        torch.empty(
+            (batch_size, heads, n_chunks, 2), device=device, dtype=torch.float32
+        ),
+        torch.empty((BHC, L, 1, P), device=device, dtype=tc_dtype),
+        torch.empty((BHC, P), device=device, dtype=tc_dtype),
+        torch.empty((BHC, L, 1, D), device=device, dtype=tc_dtype),
+        torch.empty((BHC, D), device=device, dtype=tc_dtype),
+        torch.empty((BHC, L, 1, D), device=device, dtype=tc_dtype),
+        torch.empty((BHC, L, 1, P), device=device, dtype=tc_dtype),
+        torch.empty((BHC, P), device=device, dtype=tc_dtype),
+        torch.empty((BHC, L, 1, D), device=device, dtype=tc_dtype),
+        torch.empty((BHC, D), device=device, dtype=tc_dtype),
+        torch.empty((BHC, L), device=device, dtype=torch.float32),
+        torch.empty((BHC, L, 4), device=device, dtype=torch.float32),
+        torch.empty((BHC, L, 2), device=device, dtype=torch.float32),
+        torch.empty((BHC, L, 2), device=device, dtype=torch.float32),
+        torch.empty((BHC, 1, L, 2), device=device, dtype=torch.float32),
+        torch.empty((BHC, 1, L, 2), device=device, dtype=torch.float32),
+        torch.empty((BHC, 1, L, 2), device=device, dtype=torch.float32),
+        torch.empty((BHC, L, D), device=device, dtype=tc_dtype),
+        torch.empty((BHC, D), device=device, dtype=tc_dtype),
+        torch.empty((BHC, L, P), device=device, dtype=tc_dtype),
+        torch.empty((BHC, P), device=device, dtype=tc_dtype),
+        torch.empty((2, L, n_d_tiles, BHC), device=device, dtype=torch.float32),
+        torch.empty((2, BHC), device=device, dtype=torch.float32),
+        torch.empty((2, L, BHC), device=device, dtype=torch.float32),
+        torch.empty((2, L, BHC), device=device, dtype=torch.float32),
+        torch.empty((2, L, BHC), device=device, dtype=torch.float32),
+    )
+    _BWD_WORKSPACE_CACHE[key] = cached
     return cached
 
 
@@ -274,56 +349,63 @@ def _build_backward_args(
     )
 
     BH = Bsz * H
-    BHC = BH * n_chunks
     U_chunks = U_tc.reshape(BH, n_chunks, L, P)
     B_chunks = B_tc.reshape(BH, n_chunks, L, D)
-
-    U_prev_chunks = torch.empty((BH, n_chunks, P), device=U.device, dtype=tc_dtype)
-    B_prev_chunks = torch.empty((BH, n_chunks, D), device=U.device, dtype=tc_dtype)
-    U_prev_chunks[:, 0, :] = U_prev0.reshape(BH, P)
-    B_prev_chunks[:, 0, :] = B_prev0.reshape(BH, D)
-    if n_chunks > 1:
-        U_prev_chunks[:, 1:, :] = U_chunks[:, :-1, -1, :]
-        B_prev_chunks[:, 1:, :] = B_chunks[:, :-1, -1, :]
 
     cutlass_dtype = _torch_to_cutlass_dtype(tc_dtype)
     inc_db_kernel = ChunkIncrementBwdDBAmpere(cutlass_dtype, chunk_size=L, D=D, P=P)
     n_d_tiles = (D + inc_db_kernel.bN - 1) // inc_db_kernel.bN
 
-    dZ0 = torch.empty((BHC, P, D), device=U.device, dtype=torch.float32)
-    d_inc = torch.empty((Bsz, H, n_chunks, P, D), device=U.device, dtype=torch.float32)
-    d_inc_tc = torch.empty((Bsz, H, n_chunks, P, D), device=U.device, dtype=tc_dtype)
-    d_initial = torch.empty((Bsz, H, P, D), device=U.device, dtype=torch.float32)
-    d_m_chunk = torch.empty((Bsz, H, n_chunks, 2), device=U.device, dtype=torch.float32)
-
-    dU_scan = torch.empty((BHC, L, 1, P), device=U.device, dtype=tc_dtype)
-    dU_prev_scan = torch.empty((BHC, P), device=U.device, dtype=tc_dtype)
-    dB_scan = torch.empty((BHC, L, 1, D), device=U.device, dtype=tc_dtype)
-    dB_prev_scan = torch.empty((BHC, D), device=U.device, dtype=tc_dtype)
-    dC_scan = torch.empty((BHC, L, 1, D), device=U.device, dtype=tc_dtype)
-    dU_db_dummy = torch.empty((BHC, L, 1, P), device=U.device, dtype=tc_dtype)
-    dU_prev_db_dummy = torch.empty((BHC, P), device=U.device, dtype=tc_dtype)
-    dB_du_dummy = torch.empty((BHC, L, 1, D), device=U.device, dtype=tc_dtype)
-    dB_prev_du_dummy = torch.empty((BHC, D), device=U.device, dtype=tc_dtype)
-    dlogp = torch.empty((BHC, L), device=U.device, dtype=torch.float32)
-    dR = torch.empty((BHC, L, 4), device=U.device, dtype=torch.float32)
-    dMp_scratch = torch.empty((BHC, L, 2), device=U.device, dtype=torch.float32)
-    dMc_scratch = torch.empty((BHC, L, 2), device=U.device, dtype=torch.float32)
-    dM_scan = torch.empty((BHC, 1, L, 2), device=U.device, dtype=torch.float32)
-    dKprev_scan = torch.empty_like(dM_scan)
-    dKcurr_scan = torch.empty_like(dM_scan)
-
-    dB_inc = torch.empty((BHC, L, D), device=U.device, dtype=tc_dtype)
-    dB_prev_inc = torch.empty((BHC, D), device=U.device, dtype=tc_dtype)
-    dU_inc = torch.empty((BHC, L, P), device=U.device, dtype=tc_dtype)
-    dU_prev_inc = torch.empty((BHC, P), device=U.device, dtype=tc_dtype)
-    dMsum_part = torch.empty(
-        (2, L, n_d_tiles, BHC), device=U.device, dtype=torch.float32
+    (
+        U_prev_chunks,
+        B_prev_chunks,
+        dZ0,
+        d_inc,
+        d_inc_tc,
+        d_initial,
+        d_m_chunk,
+        dU_scan,
+        dU_prev_scan,
+        dB_scan,
+        dB_prev_scan,
+        dC_scan,
+        dU_db_dummy,
+        dU_prev_db_dummy,
+        dB_du_dummy,
+        dB_prev_du_dummy,
+        dlogp,
+        dR,
+        dMp_scratch,
+        dMc_scratch,
+        dM_scan,
+        dKprev_scan,
+        dKcurr_scan,
+        dB_inc,
+        dB_prev_inc,
+        dU_inc,
+        dU_prev_inc,
+        dMsum_part,
+        dMp0,
+        dM_inc,
+        dKprev_inc,
+        dKcurr_inc,
+    ) = _get_bwd_workspace(
+        device=U.device,
+        tc_dtype=tc_dtype,
+        batch_size=Bsz,
+        heads=H,
+        n_chunks=n_chunks,
+        chunk_size=L,
+        P=P,
+        D=D,
+        n_d_tiles=n_d_tiles,
     )
-    dMp0 = torch.empty((2, BHC), device=U.device, dtype=torch.float32)
-    dM_inc = torch.empty((2, L, BHC), device=U.device, dtype=torch.float32)
-    dKprev_inc = torch.empty_like(dM_inc)
-    dKcurr_inc = torch.empty_like(dM_inc)
+
+    U_prev_chunks[:, 0, :] = U_prev0.reshape(BH, P)
+    B_prev_chunks[:, 0, :] = B_prev0.reshape(BH, D)
+    if n_chunks > 1:
+        U_prev_chunks[:, 1:, :] = U_chunks[:, :-1, -1, :]
+        B_prev_chunks[:, 1:, :] = B_chunks[:, :-1, -1, :]
 
     state_cfg = _TileConfig(
         num_threads=int(state_num_threads),
