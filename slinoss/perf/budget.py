@@ -15,6 +15,7 @@ def summarize_scalar_samples(samples: list[float]) -> dict[str, float]:
             "min_ms": 0.0,
             "max_ms": 0.0,
             "stdev_ms": 0.0,
+            "num_samples": 0.0,
         }
     return {
         "mean_ms": float(statistics.fmean(samples)),
@@ -22,6 +23,7 @@ def summarize_scalar_samples(samples: list[float]) -> dict[str, float]:
         "min_ms": float(min(samples)),
         "max_ms": float(max(samples)),
         "stdev_ms": float(statistics.stdev(samples)) if len(samples) > 1 else 0.0,
+        "num_samples": float(len(samples)),
     }
 
 

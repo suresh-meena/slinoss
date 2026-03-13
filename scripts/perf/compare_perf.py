@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 import sys
 from typing import Any
@@ -49,6 +50,30 @@ def _case_workload(
     return workloads[backend]
 
 
+def _select_step_summary(workload: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    warm = workload["warm"]
+    repeat_summary = warm.get("repeat_step")
+    if isinstance(repeat_summary, dict):
+        return repeat_summary, "repeat_step"
+    return warm["step"], "step"
+
+
+def _select_tps_summary(workload: dict[str, Any]) -> tuple[dict[str, Any], str]:
+    warm = workload["warm"]
+    repeat_summary = warm.get("repeat_tokens_per_s")
+    if isinstance(repeat_summary, dict):
+        return repeat_summary, "repeat_tokens_per_s"
+    return warm["tokens_per_s"], "tokens_per_s"
+
+
+def _ci95_halfwidth(summary: dict[str, Any], *, key: str) -> float | None:
+    count = int(float(summary.get("num_samples", 0.0)))
+    if count <= 1:
+        return None
+    stdev = float(summary.get(key, 0.0))
+    return 1.96 * stdev / math.sqrt(count)
+
+
 def main() -> int:
     args = _parse_args()
     before = _load_payload(args.before)
@@ -61,22 +86,54 @@ def main() -> int:
     rows = compare_budget_trees(before_tree, after_tree)
     ranked = rank_budget_deltas(rows, top_k=args.top_k)
 
-    before_step = float(before_workload["warm"]["step"]["mean_ms"])
-    after_step = float(after_workload["warm"]["step"]["mean_ms"])
-    before_tps = float(before_workload["warm"]["tokens_per_s"]["mean"])
-    after_tps = float(after_workload["warm"]["tokens_per_s"]["mean"])
+    before_step_summary, before_step_basis = _select_step_summary(before_workload)
+    after_step_summary, after_step_basis = _select_step_summary(after_workload)
+    before_tps_summary, before_tps_basis = _select_tps_summary(before_workload)
+    after_tps_summary, after_tps_basis = _select_tps_summary(after_workload)
+    before_step = float(before_step_summary["mean_ms"])
+    after_step = float(after_step_summary["mean_ms"])
+    before_tps = float(before_tps_summary["mean"])
+    after_tps = float(after_tps_summary["mean"])
+    before_step_ci = _ci95_halfwidth(before_step_summary, key="stdev_ms")
+    after_step_ci = _ci95_halfwidth(after_step_summary, key="stdev_ms")
+    before_tps_ci = _ci95_halfwidth(before_tps_summary, key="stdev")
+    after_tps_ci = _ci95_halfwidth(after_tps_summary, key="stdev")
 
     print(f"backend={args.backend} case={args.case}")
     print(
-        "step_mean_ms "
-        f"{before_step:.6f} -> {after_step:.6f}  "
+        (
+            f"step_mean_ms[{before_step_basis}] "
+            if before_step_basis == after_step_basis
+            else f"step_mean_ms[{before_step_basis}->{after_step_basis}] "
+        )
+        + f"{before_step:.6f}"
+        + (f" +- {before_step_ci:.6f}" if before_step_ci is not None else "")
+        + f" -> {after_step:.6f}"
+        + (f" +- {after_step_ci:.6f}" if after_step_ci is not None else "")
+        + "  "
         f"delta={after_step - before_step:+.6f}"
     )
     print(
-        "tokens_per_s "
-        f"{before_tps:.2f} -> {after_tps:.2f}  "
+        (
+            f"tokens_per_s[{before_tps_basis}] "
+            if before_tps_basis == after_tps_basis
+            else f"tokens_per_s[{before_tps_basis}->{after_tps_basis}] "
+        )
+        + f"{before_tps:.2f}"
+        + (f" +- {before_tps_ci:.2f}" if before_tps_ci is not None else "")
+        + f" -> {after_tps:.2f}"
+        + (f" +- {after_tps_ci:.2f}" if after_tps_ci is not None else "")
+        + "  "
         f"delta={after_tps - before_tps:+.2f}"
     )
+    combined_step_ci = None
+    if before_step_ci is not None and after_step_ci is not None:
+        combined_step_ci = math.sqrt(before_step_ci**2 + after_step_ci**2)
+        if abs(after_step - before_step) <= combined_step_ci:
+            print(
+                "step_delta_note "
+                f"delta is within combined 95% repeat CI ({combined_step_ci:.6f} ms)"
+            )
 
     print("\nTop Regressions")
     for row in ranked["regressions"]:
@@ -99,15 +156,25 @@ def main() -> int:
         "case": args.case,
         "before": str(args.before),
         "after": str(args.after),
+        "step_basis": {"before": before_step_basis, "after": after_step_basis},
+        "tokens_per_s_basis": {
+            "before": before_tps_basis,
+            "after": after_tps_basis,
+        },
         "step_mean_ms": {
             "before": before_step,
             "after": after_step,
             "delta": after_step - before_step,
+            "before_ci95_halfwidth": before_step_ci,
+            "after_ci95_halfwidth": after_step_ci,
+            "combined_ci95_halfwidth": combined_step_ci,
         },
         "tokens_per_s": {
             "before": before_tps,
             "after": after_tps,
             "delta": after_tps - before_tps,
+            "before_ci95_halfwidth": before_tps_ci,
+            "after_ci95_halfwidth": after_tps_ci,
         },
         "ranked": ranked,
     }

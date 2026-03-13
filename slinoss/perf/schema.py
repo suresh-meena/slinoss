@@ -57,6 +57,11 @@ def validate_nextchar_bench_payload(payload: dict[str, Any]) -> None:
             _expect(workload, "backend")
             _expect(workload, "config")
             _expect(workload, "tokens_per_step")
+            methodology = workload.get("methodology")
+            if methodology is not None and not isinstance(methodology, dict):
+                raise ValueError(
+                    f"Workload {case_name}/{backend_name} methodology must be a dict."
+                )
 
             warm = _expect_dict(workload, "warm")
             cold = _expect_dict(workload, "cold")
@@ -87,6 +92,16 @@ def validate_nextchar_bench_payload(payload: dict[str, Any]) -> None:
 
             _expect_dict(warm, "step")
             _expect_dict(warm, "tokens_per_s")
+            repeat_step = warm.get("repeat_step")
+            if repeat_step is not None and not isinstance(repeat_step, dict):
+                raise ValueError(
+                    f"Warm repeat_step for {case_name}/{backend_name} must be a dict."
+                )
+            repeat_tps = warm.get("repeat_tokens_per_s")
+            if repeat_tps is not None and not isinstance(repeat_tps, dict):
+                raise ValueError(
+                    f"Warm repeat_tokens_per_s for {case_name}/{backend_name} must be a dict."
+                )
             _expect_path(warm["tree"], "backward.v2x2ssd.chunk_increment.__stats__")
             _expect_path(warm["tree"], "backward.v2x2ssd.state_passing.__stats__")
             _expect_path(warm["tree"], "backward.v2x2ssd.chunk_scan.__stats__")

@@ -99,6 +99,14 @@ def test_validate_nextchar_bench_payload_accepts_expected_schema() -> None:
                         "backend": "cute",
                         "config": {"batch_size": 4},
                         "tokens_per_step": 256,
+                        "methodology": {
+                            "deterministic_fixture": True,
+                            "fixture_model_seed": 0,
+                            "fixture_batch_seed": 1,
+                            "warmup_steps": 10,
+                            "steps_per_repeat": 20,
+                            "workload_repeat": 5,
+                        },
                         "cold": {
                             "regions": {},
                             "budget": {},
@@ -107,7 +115,9 @@ def test_validate_nextchar_bench_payload_accepts_expected_schema() -> None:
                         },
                         "warm": {
                             "step": {"mean_ms": 10.0},
+                            "repeat_step": {"mean_ms": 10.2},
                             "tokens_per_s": {"mean": 1000.0},
+                            "repeat_tokens_per_s": {"mean": 980.0},
                             "regions": {},
                             "budget": {},
                             "tree": tree,

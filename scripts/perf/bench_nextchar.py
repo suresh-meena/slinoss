@@ -34,7 +34,12 @@ from _common import (  # noqa: E402
     seed_all,
     PerfConfig,
 )
-from _nextchar import NextCharPerfConfig, run_bench_step  # noqa: E402
+from _nextchar import (  # noqa: E402
+    NextCharBenchFixture,
+    NextCharPerfConfig,
+    build_bench_fixture,
+    run_bench_step,
+)
 from slinoss.perf.schema import validate_nextchar_bench_payload  # noqa: E402
 
 
@@ -59,8 +64,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=("fp16", "bf16", "fp32"), default="fp16")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--warmup-steps", type=int, default=5)
-    parser.add_argument("--steps", type=int, default=10)
+    parser.add_argument("--warmup-steps", type=int, default=10)
+    parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument(
+        "--workload-repeat",
+        type=int,
+        default=5,
+        help="Independent clean end-to-end repeats per backend/case.",
+    )
     parser.add_argument("--stage-warmup", type=int, default=5)
     parser.add_argument("--stage-iterations", type=int, default=20)
     parser.add_argument("--stage-repeat", type=int, default=5)
@@ -132,12 +143,22 @@ def _summarize_workload(
     backend: str,
     warmup_steps: int,
     steps: int,
+    repeat: int,
+    fixture: NextCharBenchFixture,
 ) -> dict[str, object]:
-    result = run_bench_step(cfg, backend=backend, warmup=warmup_steps, steps=steps)
+    result = run_bench_step(
+        cfg,
+        backend=backend,
+        warmup=warmup_steps,
+        steps=steps,
+        repeat=repeat,
+        fixture=fixture,
+    )
     cold = result["cold_profile"]
     warm_steps = result["warm_profile"]
     tokens_per_step = int(result["tokens_per_step"])
     step_total_samples = [float(ms) for ms in result["warm_step_ms"]]
+    repeat_step_samples = [float(ms) for ms in result["warm_repeat_step_mean_ms"]]
 
     warm_region_samples = [step["regions_ms"] for step in warm_steps]
     warm_cache_samples = [step["cache_events"] for step in warm_steps]
@@ -149,9 +170,17 @@ def _summarize_workload(
         (1000.0 * tokens_per_step / ms) if ms > 0.0 else 0.0
         for ms in step_total_samples
     ]
+    repeat_tokens_per_s_samples = [
+        (1000.0 * tokens_per_step / ms) if ms > 0.0 else 0.0
+        for ms in repeat_step_samples
+    ]
     tokens_per_s_stats = {
         key.replace("_ms", ""): value
         for key, value in summarize_scalar_samples(tokens_per_s_samples).items()
+    }
+    repeat_tokens_per_s_stats = {
+        key.replace("_ms", ""): value
+        for key, value in summarize_scalar_samples(repeat_tokens_per_s_samples).items()
     }
 
     cold_budget = summarize_budget_samples([cold["regions_ms"]])
@@ -161,6 +190,17 @@ def _summarize_workload(
         "backend": backend,
         "config": cfg.perf_config_dict,
         "tokens_per_step": tokens_per_step,
+        "methodology": {
+            "timing": "cuda_event_per_step",
+            "deterministic_fixture": True,
+            "fixture_model_seed": int(result["fixture"]["model_seed"]),
+            "fixture_batch_seed": int(result["fixture"]["batch_seed"]),
+            "batch_count": int(result["fixture"]["batch_count"]),
+            "warmup_steps": int(warmup_steps),
+            "steps_per_repeat": int(steps),
+            "workload_repeat": int(result["repeat_count"]),
+            "profile_replay": "single_post_clean_replay",
+        },
         "cold": {
             "regions": summarize_named_samples([cold["regions_ms"]]),
             "budget": cold_budget,
@@ -169,7 +209,9 @@ def _summarize_workload(
         },
         "warm": {
             "step": summarize_scalar_samples(step_total_samples),
+            "repeat_step": summarize_scalar_samples(repeat_step_samples),
             "tokens_per_s": tokens_per_s_stats,
+            "repeat_tokens_per_s": repeat_tokens_per_s_stats,
             "regions": warm_regions,
             "budget": warm_budget,
             "tree": warm_tree,
@@ -250,12 +292,18 @@ def main() -> int:
     cases: dict[str, dict[str, Any]] = {}
     for case_name, case_cfg in _make_case_cfgs(nextchar_cfg, suite=args.suite).items():
         stage_cfg = _make_stage_cfg(case_cfg)
+        fixture = build_bench_fixture(
+            case_cfg,
+            total_batches=1 + int(args.warmup_steps) + int(args.steps),
+        )
         workload: dict[str, Any] = {
             backend: _summarize_workload(
                 case_cfg,
                 backend=backend,
                 warmup_steps=args.warmup_steps,
                 steps=args.steps,
+                repeat=args.workload_repeat,
+                fixture=fixture,
             )
             for backend in backends
         }

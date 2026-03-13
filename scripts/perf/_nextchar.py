@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import asdict, dataclass
+import statistics
 from time import perf_counter
 from typing import Any, Callable, TypeAlias, TypeVar
 
@@ -59,6 +60,14 @@ class NextCharPerfConfig:
         data = asdict(self)
         data["dtype"] = str(self.dtype)
         return data
+
+
+@dataclass(frozen=True)
+class NextCharBenchFixture:
+    initial_state: dict[str, torch.Tensor]
+    batches: list[tuple[torch.Tensor, torch.Tensor]]
+    model_seed: int
+    batch_seed: int
 
 
 def build_model(
@@ -120,6 +129,45 @@ def random_batch(cfg: NextCharPerfConfig) -> tuple[torch.Tensor, torch.Tensor]:
         dtype=torch.long,
     )
     return x, y
+
+
+def _rng_devices(device: torch.device) -> list[int]:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return []
+    if device.index is not None:
+        return [int(device.index)]
+    return [int(torch.cuda.current_device())]
+
+
+def _seed_fixture_rng(seed: int) -> None:
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+
+
+def build_bench_fixture(
+    cfg: NextCharPerfConfig,
+    *,
+    total_batches: int,
+) -> NextCharBenchFixture:
+    devices = _rng_devices(cfg.torch_device)
+    model_seed = int(cfg.seed)
+    batch_seed = int(cfg.seed) + 1
+    with torch.random.fork_rng(devices=devices):
+        _seed_fixture_rng(model_seed)
+        model, optimizer = build_model(cfg, backend="reference", instrumented=False)
+        initial_state = deepcopy(model.state_dict())
+        del model, optimizer
+
+        _seed_fixture_rng(batch_seed)
+        batches = [random_batch(cfg) for _ in range(total_batches)]
+
+    return NextCharBenchFixture(
+        initial_state=initial_state,
+        batches=batches,
+        model_seed=model_seed,
+        batch_seed=batch_seed,
+    )
 
 
 def _clip_params(model: NextCharModel) -> tuple[torch.nn.Parameter, ...]:
@@ -244,18 +292,20 @@ def _run_profiled_sequence(
     return cold, warm_steps
 
 
-def run_bench_step(
+def _run_clean_sequence(
     cfg: NextCharPerfConfig,
     *,
     backend: str,
+    initial_state: dict[str, torch.Tensor],
+    batches: list[tuple[torch.Tensor, torch.Tensor]],
     warmup: int,
     steps: int,
-) -> dict[str, Any]:
-    total_batches = 1 + int(warmup) + int(steps)
-    batches = [random_batch(cfg) for _ in range(total_batches)]
-
+) -> tuple[float, list[float]]:
     model, optimizer = build_model(cfg, backend=backend, instrumented=False)
-    initial_state = deepcopy(model.state_dict())
+    model.load_state_dict(initial_state)
+    model.perf_trainable_params = tuple(
+        p for p in model.parameters() if p.requires_grad
+    )
 
     cold_xb, cold_yb = batches[0]
     cold_step_ms, (logits, loss) = _time_step(
@@ -279,11 +329,57 @@ def run_bench_step(
         )
         warm_step_ms.append(step_ms)
 
+    return cold_step_ms, warm_step_ms
+
+
+def run_bench_step(
+    cfg: NextCharPerfConfig,
+    *,
+    backend: str,
+    warmup: int,
+    steps: int,
+    repeat: int = 1,
+    fixture: NextCharBenchFixture | None = None,
+) -> dict[str, Any]:
+    total_batches = 1 + int(warmup) + int(steps)
+    fixture = (
+        build_bench_fixture(cfg, total_batches=total_batches)
+        if fixture is None
+        else fixture
+    )
+    if len(fixture.batches) < total_batches:
+        raise ValueError(
+            f"Fixture has {len(fixture.batches)} batches, expected at least {total_batches}."
+        )
+
+    cold_step_ms = 0.0
+    warm_step_ms: list[float] = []
+    warm_repeat_step_mean_ms: list[float] = []
+    repeat_count = max(1, int(repeat))
+    for repeat_idx in range(repeat_count):
+        repeat_cold_ms, repeat_warm_step_ms = _run_clean_sequence(
+            cfg,
+            backend=backend,
+            initial_state=fixture.initial_state,
+            batches=fixture.batches,
+            warmup=warmup,
+            steps=steps,
+        )
+        if repeat_idx == 0:
+            cold_step_ms = repeat_cold_ms
+        warm_step_ms.extend(repeat_warm_step_ms)
+        if repeat_warm_step_ms:
+            warm_repeat_step_mean_ms.append(
+                float(statistics.fmean(repeat_warm_step_ms))
+            )
+        else:
+            warm_repeat_step_mean_ms.append(0.0)
+
     cold_profile, warm_profile = _run_profiled_sequence(
         cfg,
         backend=backend,
-        initial_state=initial_state,
-        batches=batches,
+        initial_state=fixture.initial_state,
+        batches=fixture.batches,
         warmup=warmup,
         steps=steps,
     )
@@ -291,7 +387,14 @@ def run_bench_step(
     return {
         "cold_step_ms": cold_step_ms,
         "warm_step_ms": warm_step_ms,
+        "warm_repeat_step_mean_ms": warm_repeat_step_mean_ms,
         "cold_profile": cold_profile,
         "warm_profile": warm_profile,
+        "repeat_count": repeat_count,
+        "fixture": {
+            "model_seed": fixture.model_seed,
+            "batch_seed": fixture.batch_seed,
+            "batch_count": len(fixture.batches),
+        },
         "tokens_per_step": cfg.batch_size * cfg.block_size,
     }
