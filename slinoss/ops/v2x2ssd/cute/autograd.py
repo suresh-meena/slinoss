@@ -8,7 +8,12 @@ import torch
 
 from slinoss.perf import record_region
 from slinoss.ops.v2x2ssd.cute.kernels.bwd import v2x2ssd_bwd_cute
-from slinoss.ops.v2x2ssd.cute.kernels.fwd import v2x2ssd_fwd_cute
+from slinoss.ops.v2x2ssd.cute.kernels.fwd import (
+    _prepare_m_operand,
+    _prepare_time_operand,
+    _tc_input_dtype,
+    v2x2ssd_fwd_cute,
+)
 
 
 class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
@@ -33,6 +38,16 @@ class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
         K_d = K.detach()
         B_d = B.detach()
         C_d = C.detach()
+        n_chunks = (int(U_d.shape[2]) + ctx.chunk_size - 1) // ctx.chunk_size
+        T_pad = n_chunks * ctx.chunk_size
+        tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
+        prepared_inputs = (
+            _prepare_time_operand(U_d, T_pad=T_pad, dtype=tc_dtype),
+            _prepare_m_operand(M_d, T_pad=T_pad),
+            _prepare_time_operand(K_d, T_pad=T_pad, dtype=torch.float32),
+            _prepare_time_operand(B_d, T_pad=T_pad, dtype=tc_dtype),
+            _prepare_time_operand(C_d, T_pad=T_pad, dtype=tc_dtype),
+        )
 
         Y, m_chunk, chunk_starts = v2x2ssd_fwd_cute(
             U_d,
@@ -43,9 +58,19 @@ class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
             chunk_size=ctx.chunk_size,
             compute_dtype=compute_dtype,
             output_dtype=output_dtype or U.dtype,
+            prepared_inputs=prepared_inputs,
         )
 
-        ctx.save_for_backward(U_d, M_d, K_d, B_d, C_d, m_chunk, chunk_starts)
+        ctx.save_for_backward(
+            U_d,
+            M_d,
+            K_d,
+            B_d,
+            C_d,
+            *prepared_inputs,
+            m_chunk,
+            chunk_starts,
+        )
         return Y
 
     @staticmethod
@@ -63,7 +88,9 @@ class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
         None,
     ]:
         with record_region("backward.v2x2ssd.custom_op_total"):
-            U, M, K, B, C, m_chunk, chunk_starts = ctx.saved_tensors
+            U, M, K, B, C, U_tc, M_f, K_f, B_tc, C_tc, m_chunk, chunk_starts = (
+                ctx.saved_tensors
+            )
 
             if dY is None:
                 with record_region("backward.v2x2ssd.autograd_wrapper"):
@@ -100,6 +127,7 @@ class _V2x2SSDCuTeTrainingFn(torch.autograd.Function):
                     dY_contig,
                     chunk_size=ctx.chunk_size,
                     compute_dtype=ctx.compute_dtype,
+                    prepared_inputs=(U_tc, M_f, K_f, B_tc, C_tc),
                 ),
             )
 

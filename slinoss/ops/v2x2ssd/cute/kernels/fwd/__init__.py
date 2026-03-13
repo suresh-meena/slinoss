@@ -844,6 +844,14 @@ def _build_forward_args(
     scan_num_threads: int,
     state_num_threads: int,
     state_vecs_per_thread: int,
+    prepared_inputs: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]
+    | None = None,
 ) -> tuple[
     list[object],
     tuple[int, ...],
@@ -883,11 +891,48 @@ def _build_forward_args(
     resolved_n_block = _resolve_chunk_scan_n_block_size(L, int(n_block_size))
     tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
 
-    U_tc = _prepare_time_operand(U, T_pad=T_pad, dtype=tc_dtype)
-    B_tc = _prepare_time_operand(B, T_pad=T_pad, dtype=tc_dtype)
-    C_tc = _prepare_time_operand(C, T_pad=T_pad, dtype=tc_dtype)
-    M_f = _prepare_m_operand(M, T_pad=T_pad)
-    K_f = _prepare_time_operand(K, T_pad=T_pad, dtype=torch.float32)
+    if prepared_inputs is None:
+        U_tc = _prepare_time_operand(U, T_pad=T_pad, dtype=tc_dtype)
+        M_f = _prepare_m_operand(M, T_pad=T_pad)
+        K_f = _prepare_time_operand(K, T_pad=T_pad, dtype=torch.float32)
+        B_tc = _prepare_time_operand(B, T_pad=T_pad, dtype=tc_dtype)
+        C_tc = _prepare_time_operand(C, T_pad=T_pad, dtype=tc_dtype)
+    else:
+        U_tc, M_f, K_f, B_tc, C_tc = prepared_inputs
+        expected_u_shape = (Bsz, H, T_pad, P)
+        expected_b_shape = (Bsz, H, T_pad, D)
+        expected_m_shape = (Bsz, H, T_pad, 2)
+        expected_k_shape = (Bsz, H, T_pad, 2, 2)
+        if (
+            tuple(U_tc.shape) != expected_u_shape
+            or U_tc.dtype != tc_dtype
+            or not U_tc.is_contiguous()
+        ):
+            raise ValueError("prepared U_tc must match padded scan input layout.")
+        if (
+            tuple(B_tc.shape) != expected_b_shape
+            or B_tc.dtype != tc_dtype
+            or not B_tc.is_contiguous()
+        ):
+            raise ValueError("prepared B_tc must match padded scan input layout.")
+        if (
+            tuple(C_tc.shape) != expected_b_shape
+            or C_tc.dtype != tc_dtype
+            or not C_tc.is_contiguous()
+        ):
+            raise ValueError("prepared C_tc must match padded scan input layout.")
+        if (
+            tuple(M_f.shape) != expected_m_shape
+            or M_f.dtype != torch.float32
+            or not M_f.is_contiguous()
+        ):
+            raise ValueError("prepared M_f must match padded scan parameter layout.")
+        if (
+            tuple(K_f.shape) != expected_k_shape
+            or K_f.dtype != torch.float32
+            or not K_f.is_contiguous()
+        ):
+            raise ValueError("prepared K_f must match padded scan parameter layout.")
 
     U_prev0, B_prev0 = _get_zero_prev_tensors(
         device=U.device,
@@ -1290,6 +1335,14 @@ def v2x2ssd_fwd_cute(
     scan_num_threads: int = 128,
     state_num_threads: int = 128,
     state_vecs_per_thread: int = 8,
+    prepared_inputs: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]
+    | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     with record_region("forward.v2x2ssd.total"):
         dynamic_args, alignments, spec, cfg, outputs = _build_forward_args(
@@ -1306,6 +1359,7 @@ def v2x2ssd_fwd_cute(
             scan_num_threads=scan_num_threads,
             state_num_threads=state_num_threads,
             state_vecs_per_thread=state_vecs_per_thread,
+            prepared_inputs=prepared_inputs,
         )
         cache_key = _fwd_host_cache_key(
             device_index=(U.device.index if U.device.index is not None else -1),

@@ -272,6 +272,14 @@ def _build_backward_args(
     scan_num_threads_param: int,
     state_num_threads: int,
     state_pairs_per_thread: int,
+    prepared_inputs: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]
+    | None = None,
 ) -> tuple[
     list[object],
     tuple[int, ...],
@@ -323,14 +331,59 @@ def _build_backward_args(
 
     tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
 
-    U_tc = _pad_zero_time(U, T_pad=T_pad, dtype=tc_dtype)
-    B_tc = _pad_zero_time(B, T_pad=T_pad, dtype=tc_dtype)
-    C_tc = _pad_zero_time(C, T_pad=T_pad, dtype=tc_dtype)
+    if prepared_inputs is None:
+        U_tc = _pad_zero_time(U, T_pad=T_pad, dtype=tc_dtype)
+        M_f = _pad_m_identity(M, T_pad=T_pad)
+        K_f = _pad_zero_time(K, T_pad=T_pad, dtype=torch.float32)
+        B_tc = _pad_zero_time(B, T_pad=T_pad, dtype=tc_dtype)
+        C_tc = _pad_zero_time(C, T_pad=T_pad, dtype=tc_dtype)
+    else:
+        U_tc, M_f, K_f, B_tc, C_tc = prepared_inputs
+        expected_u_shape = (Bsz, H, T_pad, P)
+        expected_b_shape = (Bsz, H, T_pad, D)
+        expected_m_shape = (Bsz, H, T_pad, 2)
+        expected_k_shape = (Bsz, H, T_pad, 2, 2)
+        if (
+            tuple(U_tc.shape) != expected_u_shape
+            or U_tc.dtype != tc_dtype
+            or not U_tc.is_contiguous()
+        ):
+            raise ValueError("prepared U_tc must match padded scan input layout.")
+        if (
+            tuple(B_tc.shape) != expected_b_shape
+            or B_tc.dtype != tc_dtype
+            or not B_tc.is_contiguous()
+        ):
+            raise ValueError("prepared B_tc must match padded scan input layout.")
+        if (
+            tuple(C_tc.shape) != expected_b_shape
+            or C_tc.dtype != tc_dtype
+            or not C_tc.is_contiguous()
+        ):
+            raise ValueError("prepared C_tc must match padded scan input layout.")
+        if (
+            tuple(M_f.shape) != expected_m_shape
+            or M_f.dtype != torch.float32
+            or not M_f.is_contiguous()
+        ):
+            raise ValueError("prepared M_f must match padded scan parameter layout.")
+        if (
+            tuple(K_f.shape) != expected_k_shape
+            or K_f.dtype != torch.float32
+            or not K_f.is_contiguous()
+        ):
+            raise ValueError("prepared K_f must match padded scan parameter layout.")
     d_out_tc = _pad_zero_time(d_out, T_pad=T_pad, dtype=tc_dtype)
-    M_f = _pad_m_identity(M, T_pad=T_pad)
-    K_f = _pad_zero_time(K, T_pad=T_pad, dtype=torch.float32)
-    m_chunk_f = m_chunk.to(dtype=torch.float32).contiguous()
-    chunk_starts_f = chunk_starts.to(dtype=torch.float32).contiguous()
+    m_chunk_f = (
+        m_chunk
+        if m_chunk.dtype == torch.float32 and m_chunk.is_contiguous()
+        else m_chunk.to(dtype=torch.float32).contiguous()
+    )
+    chunk_starts_f = (
+        chunk_starts
+        if chunk_starts.dtype == torch.float32 and chunk_starts.is_contiguous()
+        else chunk_starts.to(dtype=torch.float32).contiguous()
+    )
 
     U_prev0, B_prev0 = _get_zero_prev_tensors(
         device=U.device,
@@ -1066,6 +1119,14 @@ def v2x2ssd_bwd_cute(
     scan_num_threads_param: int = 32,
     state_num_threads: int = 128,
     state_pairs_per_thread: int = 8,
+    prepared_inputs: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]
+    | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     with record_region("backward.v2x2ssd.total"):
         dynamic_args, alignments, spec, cfg, outputs = _build_backward_args(
@@ -1085,6 +1146,7 @@ def v2x2ssd_bwd_cute(
             scan_num_threads_param=scan_num_threads_param,
             state_num_threads=state_num_threads,
             state_pairs_per_thread=state_pairs_per_thread,
+            prepared_inputs=prepared_inputs,
         )
         cache_key = _bwd_host_cache_key(
             device_index=(U.device.index if U.device.index is not None else -1),
