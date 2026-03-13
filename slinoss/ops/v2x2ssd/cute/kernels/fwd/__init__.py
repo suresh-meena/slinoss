@@ -28,6 +28,7 @@ _STATE_PASSING_CACHE: dict[tuple, object] = {}
 _CHUNK_SCAN_CACHE: dict[tuple, object] = {}
 _FWD_HOST_CACHE: dict[tuple, object] = {}
 _ZERO_PREV_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+_FWD_WORKSPACE_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 
 
 def _get_zero_prev_tensors(
@@ -55,6 +56,38 @@ def _get_zero_prev_tensors(
             torch.zeros((batch_size, heads, D), device=device, dtype=dtype),
         )
         _ZERO_PREV_CACHE[key] = cached
+    return cached
+
+
+def _get_fwd_workspace(
+    *,
+    device: torch.device,
+    batch_size: int,
+    heads: int,
+    n_chunks: int,
+    P: int,
+    D: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    key = (
+        device.type,
+        device.index if device.index is not None else -1,
+        int(batch_size),
+        int(heads),
+        int(n_chunks),
+        int(P),
+        int(D),
+    )
+    cached = _FWD_WORKSPACE_CACHE.get(key)
+    if cached is None:
+        cached = (
+            torch.empty(
+                (batch_size, heads, n_chunks, P, D),
+                device=device,
+                dtype=torch.float32,
+            ),
+            torch.empty((batch_size, heads, P, D), device=device, dtype=torch.float32),
+        )
+        _FWD_WORKSPACE_CACHE[key] = cached
     return cached
 
 
@@ -865,12 +898,18 @@ def _build_forward_args(
         D=D,
     )
 
-    inc = torch.empty((Bsz, H, n_chunks, P, D), device=U.device, dtype=torch.float32)
+    inc, final_state = _get_fwd_workspace(
+        device=U.device,
+        batch_size=Bsz,
+        heads=H,
+        n_chunks=n_chunks,
+        P=P,
+        D=D,
+    )
     m_chunk = torch.empty((Bsz, H, n_chunks, 2), device=U.device, dtype=torch.float32)
     chunk_starts = torch.empty(
         (Bsz, H, n_chunks, P, D), device=U.device, dtype=torch.float32
     )
-    final_state = torch.empty((Bsz, H, P, D), device=U.device, dtype=torch.float32)
     out_pad = torch.empty((Bsz, H, T_pad, P), device=U.device, dtype=output_dtype)
 
     state_copy_bits_in = _choose_copy_bits_for_linear_tiles(
