@@ -1,0 +1,31 @@
+# UEA Experiment Configuration
+
+# Dataset settings
+dataset: "ArticularyWordRecognition"
+data_root: "experiments/UEA/data"
+val_fraction: 0.15
+include_time: false
+normalize: true
+
+# Training settings
+seed: 7
+epochs: 50
+batch_size: 64
+num_workers: 0
+lr: 0.0003
+weight_decay: 0.05
+grad_clip: 1.0
+
+# Model architecture
+d_model: 128
+n_layers: 3
+d_state: 32
+expand: 2
+d_head: 32
+d_conv: 4
+chunk_size: 64
+dropout: 0.1
+
+# Backend settings
+# options: "auto", "cute", "reference"
+scan_backend: "cute"
