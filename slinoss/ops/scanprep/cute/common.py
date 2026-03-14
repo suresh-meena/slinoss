@@ -12,6 +12,8 @@ import cutlass.cute.math as cute_math
 from cutlass.cute.runtime import make_ptr
 
 _cutlass_max = cast(Any, getattr(cutlass, "max"))
+_PTR_ARG_CACHE: dict[tuple[object, ...], tuple[object, int]] = {}
+_PTR_ARG_CACHE_LIMIT = 32768
 
 
 def make_row_major_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
@@ -38,14 +40,30 @@ def assumed_align(tensor: torch.Tensor) -> int:
 
 
 def make_ptr_arg(tensor: torch.Tensor) -> tuple[object, int]:
-    align = assumed_align(tensor)
-    ptr = make_ptr(
-        torch_to_cutlass_dtype(tensor.dtype),
-        tensor.data_ptr(),
-        cute.AddressSpace.gmem,
-        assumed_align=align,
+    device_index = (
+        int(tensor.device.index)
+        if tensor.device.type == "cuda" and tensor.device.index is not None
+        else -1
     )
-    return ptr, align
+    key = (tensor.device.type, device_index, int(tensor.data_ptr()), tensor.dtype)
+    cached = _PTR_ARG_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    align = assumed_align(tensor)
+    cached = (
+        make_ptr(
+            torch_to_cutlass_dtype(tensor.dtype),
+            tensor.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=align,
+        ),
+        align,
+    )
+    if len(_PTR_ARG_CACHE) >= _PTR_ARG_CACHE_LIMIT:
+        _PTR_ARG_CACHE.clear()
+    _PTR_ARG_CACHE[key] = cached
+    return cached
 
 
 def sigmoid(x):

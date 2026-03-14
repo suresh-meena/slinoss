@@ -26,6 +26,8 @@ class ScanPrepBwdFused:
         self,
         *,
         spec: tuple[int, int, int, int, int, int],
+        du_stride: tuple[int, int, int, int] | None = None,
+        params_in_stride: tuple[int, int, int] | None = None,
         normalize_bc: bool,
         dt_min: float,
         dt_max: float,
@@ -34,8 +36,8 @@ class ScanPrepBwdFused:
         theta_bound: float,
         k_max: float,
         eps: float,
-        block_size: int = 128,
-        reduce_block_size: int = 128,
+        pack_block_size: int = 32,
+        coeff_block_size: int = 128,
     ) -> None:
         batch, t_size, h_size, p_size, n_size, param_dim = spec
         self.batch = int(batch)
@@ -47,7 +49,11 @@ class ScanPrepBwdFused:
         self.normalize_bc = bool(normalize_bc)
 
         self.du_shape = (self.batch, self.h_size, self.t_size, self.p_size)
-        self.du_stride = make_row_major_stride(self.du_shape)
+        self.du_stride = (
+            tuple(int(s) for s in du_stride)
+            if du_stride is not None
+            else make_row_major_stride(self.du_shape)
+        )
         self.value_shape = (self.batch, self.t_size, self.h_size * self.p_size)
         self.value_stride = make_row_major_stride(self.value_shape)
         self.bc_shape = (self.batch, self.t_size, self.h_size, 4, self.n_size)
@@ -56,47 +62,43 @@ class ScanPrepBwdFused:
         self.grad_stride = make_row_major_stride(self.grad_shape)
         self.bc_scale_shape = (self.h_size, 2, self.n_size)
         self.bc_scale_stride = make_row_major_stride(self.bc_scale_shape)
-        self.scale_part_shape = (
-            self.batch,
-            self.h_size,
-            self.t_size,
-            4,
-            self.n_size,
+        self.scale_grad_shape = (self.h_size, 4, self.n_size)
+        self.scale_grad_stride = make_row_major_stride(self.scale_grad_shape)
+        self.param_flat_size = self.h_size * self.param_dim
+        self.params_in_shape = (self.batch, self.t_size, self.param_flat_size)
+        self.params_in_stride = (
+            tuple(int(s) for s in params_in_stride)
+            if params_in_stride is not None
+            else make_row_major_stride(self.params_in_shape)
         )
-        self.scale_part_stride = make_row_major_stride(self.scale_part_shape)
-        self.params_shape = (self.batch, self.t_size, self.h_size, self.param_dim)
-        self.params_stride = make_row_major_stride(self.params_shape)
+        self.dparams_shape = (self.batch, self.t_size, self.param_flat_size)
+        self.dparams_stride = make_row_major_stride(self.dparams_shape)
         self.m_shape = (self.batch, self.h_size, self.t_size, 2)
         self.m_stride = make_row_major_stride(self.m_shape)
         self.k_shape = (self.batch, self.h_size, self.t_size, 2, 2)
         self.k_stride = make_row_major_stride(self.k_shape)
         self.bias_shape = (self.h_size,)
         self.bias_stride = make_row_major_stride(self.bias_shape)
-        self.bias_part_shape = (self.batch, self.h_size, self.t_size, 7)
-        self.bias_part_stride = make_row_major_stride(self.bias_part_shape)
         self.bias_grad_shape = (self.h_size, 7)
         self.bias_grad_stride = make_row_major_stride(self.bias_grad_shape)
 
         self.total_rows = self.batch * self.h_size * self.t_size
-        self.block_size = int(block_size)
-        if self.block_size % 32 != 0:
-            raise ValueError("block_size must be a multiple of 32.")
-        self.warps_per_block = self.block_size // 32
+        self.pack_block_size = int(pack_block_size)
+        if self.pack_block_size % 32 != 0:
+            raise ValueError("pack_block_size must be a multiple of 32.")
+        self.pack_group_size = 16 if self.n_size <= 16 else 32
+        if self.pack_block_size % self.pack_group_size != 0:
+            raise ValueError("pack_block_size must be divisible by pack_group_size.")
+        self.pack_groups_per_block = self.pack_block_size // self.pack_group_size
         self.pack_grid_size = (
-            self.total_rows + self.warps_per_block - 1
-        ) // self.warps_per_block
+            self.total_rows + self.pack_groups_per_block - 1
+        ) // self.pack_groups_per_block
+        self.coeff_block_size = int(coeff_block_size)
+        if self.coeff_block_size % 32 != 0:
+            raise ValueError("coeff_block_size must be a multiple of 32.")
         self.coeff_grid_size = (
-            self.total_rows + self.block_size - 1
-        ) // self.block_size
-        self.reduce_block_size = int(reduce_block_size)
-        self.scale_reduce_rows = self.h_size * 4 * self.n_size
-        self.scale_reduce_grid = (
-            self.scale_reduce_rows + self.reduce_block_size - 1
-        ) // self.reduce_block_size
-        self.bias_reduce_rows = self.h_size * 7
-        self.bias_reduce_grid = (
-            self.bias_reduce_rows + self.reduce_block_size - 1
-        ) // self.reduce_block_size
+            self.total_rows + self.coeff_block_size - 1
+        ) // self.coeff_block_size
 
         self.dt_min = float(dt_min)
         self.dt_scale = float(dt_max - dt_min)
@@ -118,14 +120,15 @@ class ScanPrepBwdFused:
         mCScale: cute.Tensor,
         mValueGrad: cute.Tensor,
         mBCGrad: cute.Tensor,
-        mScalePartials: cute.Tensor,
+        mScaleGrad: cute.Tensor,
         total_rows_,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        lane = cute.arch.lane_idx()
-        warp = cute.arch.warp_idx()
-        row = bidx * self.warps_per_block + warp
+        subwarp_size = self.pack_group_size
+        group = tidx // subwarp_size
+        lane = tidx - group * subwarp_size
+        row = bidx * self.pack_groups_per_block + group
         if row < total_rows_:
             rows_per_batch = self.h_size * self.t_size
             b = row // rows_per_batch
@@ -134,9 +137,9 @@ class ScanPrepBwdFused:
             t = rem - h * self.t_size
 
             base = h * self.p_size
-            num_p_iters = (self.p_size + 31) // 32
+            num_p_iters = (self.p_size + subwarp_size - 1) // subwarp_size
             for p_iter in cutlass.range_constexpr(num_p_iters):
-                p = lane + p_iter * 32
+                p = lane + p_iter * subwarp_size
                 if p < self.p_size:
                     mValueGrad[b, t, base + p] = mDU[b, h, t, p]
 
@@ -145,9 +148,9 @@ class ScanPrepBwdFused:
                 s1 = cutlass.Float32(0.0)
                 s2 = cutlass.Float32(0.0)
                 s3 = cutlass.Float32(0.0)
-                num_n_iters = (self.n_size + 31) // 32
+                num_n_iters = (self.n_size + subwarp_size - 1) // subwarp_size
                 for n_iter in cutlass.range_constexpr(num_n_iters):
-                    n = lane + n_iter * 32
+                    n = lane + n_iter * subwarp_size
                     if n < self.n_size:
                         x0 = cutlass.Float32(mBC[b, t, h, 0, n])
                         x1 = cutlass.Float32(mBC[b, t, h, 1, n])
@@ -157,10 +160,10 @@ class ScanPrepBwdFused:
                         s1 = s1 + x1 * x1
                         s2 = s2 + x2 * x2
                         s3 = s3 + x3 * x3
-                s0 = cute.arch.warp_reduction_sum(s0)
-                s1 = cute.arch.warp_reduction_sum(s1)
-                s2 = cute.arch.warp_reduction_sum(s2)
-                s3 = cute.arch.warp_reduction_sum(s3)
+                s0 = cute.arch.warp_reduction_sum(s0, threads_in_group=subwarp_size)
+                s1 = cute.arch.warp_reduction_sum(s1, threads_in_group=subwarp_size)
+                s2 = cute.arch.warp_reduction_sum(s2, threads_in_group=subwarp_size)
+                s3 = cute.arch.warp_reduction_sum(s3, threads_in_group=subwarp_size)
                 denom = cutlass.Float32(self.n_size)
                 eps_bc = cutlass.Float32(1.0e-5)
                 inv0 = cute.rsqrt(s0 / denom + eps_bc)
@@ -177,7 +180,7 @@ class ScanPrepBwdFused:
                 dot2 = cutlass.Float32(0.0)
                 dot3 = cutlass.Float32(0.0)
                 for n_iter in cutlass.range_constexpr(num_n_iters):
-                    n = lane + n_iter * 32
+                    n = lane + n_iter * subwarp_size
                     if n < self.n_size:
                         db0 = cutlass.Float32(mDB[b, h, t, 2 * n])
                         db1 = cutlass.Float32(mDB[b, h, t, 2 * n + 1])
@@ -195,12 +198,12 @@ class ScanPrepBwdFused:
                         dot1 = dot1 + (db1 * scale1) * x1
                         dot2 = dot2 + (dc0 * scale2) * x2
                         dot3 = dot3 + (dc1 * scale3) * x3
-                dot0 = cute.arch.warp_reduction_sum(dot0)
-                dot1 = cute.arch.warp_reduction_sum(dot1)
-                dot2 = cute.arch.warp_reduction_sum(dot2)
-                dot3 = cute.arch.warp_reduction_sum(dot3)
+                dot0 = cute.arch.warp_reduction_sum(dot0, threads_in_group=subwarp_size)
+                dot1 = cute.arch.warp_reduction_sum(dot1, threads_in_group=subwarp_size)
+                dot2 = cute.arch.warp_reduction_sum(dot2, threads_in_group=subwarp_size)
+                dot3 = cute.arch.warp_reduction_sum(dot3, threads_in_group=subwarp_size)
                 for n_iter in cutlass.range_constexpr(num_n_iters):
-                    n = lane + n_iter * 32
+                    n = lane + n_iter * subwarp_size
                     if n < self.n_size:
                         db0 = cutlass.Float32(mDB[b, h, t, 2 * n])
                         db1 = cutlass.Float32(mDB[b, h, t, 2 * n + 1])
@@ -222,27 +225,47 @@ class ScanPrepBwdFused:
                         dy1 = db1 * scale1
                         dy2 = dc0 * scale2
                         dy3 = dc1 * scale3
-                        mBCGrad[b, t, h, 0, n] = inv0 * dy0 - x0 * inv0_cubed * dot0
-                        mBCGrad[b, t, h, 1, n] = inv1 * dy1 - x1 * inv1_cubed * dot1
-                        mBCGrad[b, t, h, 2, n] = inv2 * dy2 - x2 * inv2_cubed * dot2
-                        mBCGrad[b, t, h, 3, n] = inv3 * dy3 - x3 * inv3_cubed * dot3
-                        mScalePartials[b, h, t, 0, n] = db0 * y0
-                        mScalePartials[b, h, t, 1, n] = db1 * y1
-                        mScalePartials[b, h, t, 2, n] = dc0 * y2
-                        mScalePartials[b, h, t, 3, n] = dc1 * y3
+                        mBCGrad[b, t, h, 0, n] = (
+                            inv0 * dy0 - x0 * inv0_cubed * dot0
+                        ).to(mBCGrad.element_type)
+                        mBCGrad[b, t, h, 1, n] = (
+                            inv1 * dy1 - x1 * inv1_cubed * dot1
+                        ).to(mBCGrad.element_type)
+                        mBCGrad[b, t, h, 2, n] = (
+                            inv2 * dy2 - x2 * inv2_cubed * dot2
+                        ).to(mBCGrad.element_type)
+                        mBCGrad[b, t, h, 3, n] = (
+                            inv3 * dy3 - x3 * inv3_cubed * dot3
+                        ).to(mBCGrad.element_type)
+                        h_base = h * 4 * self.n_size
+                        cute.arch.atomic_add(
+                            (mScaleGrad.iterator + h_base + n).llvm_ptr, db0 * y0
+                        )
+                        cute.arch.atomic_add(
+                            (mScaleGrad.iterator + h_base + self.n_size + n).llvm_ptr,
+                            db1 * y1,
+                        )
+                        cute.arch.atomic_add(
+                            (
+                                mScaleGrad.iterator + h_base + 2 * self.n_size + n
+                            ).llvm_ptr,
+                            dc0 * y2,
+                        )
+                        cute.arch.atomic_add(
+                            (
+                                mScaleGrad.iterator + h_base + 3 * self.n_size + n
+                            ).llvm_ptr,
+                            dc1 * y3,
+                        )
             else:
-                num_n_iters = (self.n_size + 31) // 32
+                num_n_iters = (self.n_size + subwarp_size - 1) // subwarp_size
                 for n_iter in cutlass.range_constexpr(num_n_iters):
-                    n = lane + n_iter * 32
+                    n = lane + n_iter * subwarp_size
                     if n < self.n_size:
-                        mBCGrad[b, t, h, 0, n] = cutlass.Float32(mDB[b, h, t, 2 * n])
-                        mBCGrad[b, t, h, 1, n] = cutlass.Float32(
-                            mDB[b, h, t, 2 * n + 1]
-                        )
-                        mBCGrad[b, t, h, 2, n] = cutlass.Float32(mDC[b, h, t, 2 * n])
-                        mBCGrad[b, t, h, 3, n] = cutlass.Float32(
-                            mDC[b, h, t, 2 * n + 1]
-                        )
+                        mBCGrad[b, t, h, 0, n] = mDB[b, h, t, 2 * n]
+                        mBCGrad[b, t, h, 1, n] = mDB[b, h, t, 2 * n + 1]
+                        mBCGrad[b, t, h, 2, n] = mDC[b, h, t, 2 * n]
+                        mBCGrad[b, t, h, 3, n] = mDC[b, h, t, 2 * n + 1]
 
     @cute.kernel
     def coeff_kernel(
@@ -258,12 +281,12 @@ class ScanPrepBwdFused:
         mMixKPrevBias: cute.Tensor,
         mMixKCurrBias: cute.Tensor,
         mDParams: cute.Tensor,
-        mBiasPartials: cute.Tensor,
+        mBiasGrad: cute.Tensor,
         total_rows_,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        row = bidx * self.block_size + tidx
+        row = bidx * self.coeff_block_size + tidx
         if row < total_rows_:
             rows_per_batch = self.h_size * self.t_size
             b = row // rows_per_batch
@@ -271,31 +294,34 @@ class ScanPrepBwdFused:
             h = rem // self.t_size
             t = rem - h * self.t_size
 
-            dt_raw = cutlass.Float32(mParams[b, t, h, 0]) + cutlass.Float32(mDtBias[h])
-            gamma_raw = cutlass.Float32(mParams[b, t, h, 1]) + cutlass.Float32(
+            p_base = h * self.param_dim
+            dt_raw = cutlass.Float32(mParams[b, t, p_base + 0]) + cutlass.Float32(
+                mDtBias[h]
+            )
+            gamma_raw = cutlass.Float32(mParams[b, t, p_base + 1]) + cutlass.Float32(
                 mGammaBias[h]
             )
-            omega_raw = cutlass.Float32(mParams[b, t, h, 2]) + cutlass.Float32(
+            omega_raw = cutlass.Float32(mParams[b, t, p_base + 2]) + cutlass.Float32(
                 mOmegaBias[h]
             )
-            r_raw = cutlass.Float32(mParams[b, t, h, 3])
-            theta_raw = cutlass.Float32(mParams[b, t, h, 4])
-            mix_r_raw = cutlass.Float32(mParams[b, t, h, 5]) + cutlass.Float32(
+            r_raw = cutlass.Float32(mParams[b, t, p_base + 3])
+            theta_raw = cutlass.Float32(mParams[b, t, p_base + 4])
+            mix_r_raw = cutlass.Float32(mParams[b, t, p_base + 5]) + cutlass.Float32(
                 mMixRBias[h]
             )
-            mix_theta_raw = cutlass.Float32(mParams[b, t, h, 6]) + cutlass.Float32(
-                mMixThetaBias[h]
-            )
-            mix_k_prev_raw = cutlass.Float32(mParams[b, t, h, 7]) + cutlass.Float32(
-                mMixKPrevBias[h]
-            )
-            mix_k_curr_raw = cutlass.Float32(mParams[b, t, h, 8]) + cutlass.Float32(
-                mMixKCurrBias[h]
-            )
-            k_prev_re_raw = cutlass.Float32(mParams[b, t, h, 9])
-            k_prev_im_raw = cutlass.Float32(mParams[b, t, h, 10])
-            k_curr_re_raw = cutlass.Float32(mParams[b, t, h, 11])
-            k_curr_im_raw = cutlass.Float32(mParams[b, t, h, 12])
+            mix_theta_raw = cutlass.Float32(
+                mParams[b, t, p_base + 6]
+            ) + cutlass.Float32(mMixThetaBias[h])
+            mix_k_prev_raw = cutlass.Float32(
+                mParams[b, t, p_base + 7]
+            ) + cutlass.Float32(mMixKPrevBias[h])
+            mix_k_curr_raw = cutlass.Float32(
+                mParams[b, t, p_base + 8]
+            ) + cutlass.Float32(mMixKCurrBias[h])
+            k_prev_re_raw = cutlass.Float32(mParams[b, t, p_base + 9])
+            k_prev_im_raw = cutlass.Float32(mParams[b, t, p_base + 10])
+            k_curr_re_raw = cutlass.Float32(mParams[b, t, p_base + 11])
+            k_curr_im_raw = cutlass.Float32(mParams[b, t, p_base + 12])
 
             dt_u = sigmoid(dt_raw)
             gamma = softplus(gamma_raw)
@@ -608,71 +634,27 @@ class ScanPrepBwdFused:
                 * (cutlass.Float32(1.0) - k_curr_tanh_im * k_curr_tanh_im)
             )
 
-            mDParams[b, t, h, 0] = d0
-            mDParams[b, t, h, 1] = d1
-            mDParams[b, t, h, 2] = d2
-            mDParams[b, t, h, 3] = d3
-            mDParams[b, t, h, 4] = d4
-            mDParams[b, t, h, 5] = d5
-            mDParams[b, t, h, 6] = d6
-            mDParams[b, t, h, 7] = d7
-            mDParams[b, t, h, 8] = d8
-            mDParams[b, t, h, 9] = d9
-            mDParams[b, t, h, 10] = d10
-            mDParams[b, t, h, 11] = d11
-            mDParams[b, t, h, 12] = d12
-            mBiasPartials[b, h, t, 0] = d0
-            mBiasPartials[b, h, t, 1] = d1
-            mBiasPartials[b, h, t, 2] = d2
-            mBiasPartials[b, h, t, 3] = d5
-            mBiasPartials[b, h, t, 4] = d6
-            mBiasPartials[b, h, t, 5] = d7
-            mBiasPartials[b, h, t, 6] = d8
-
-    @cute.kernel
-    def reduce_scale_kernel(
-        self,
-        mPartials: cute.Tensor,
-        mScaleGrad: cute.Tensor,
-        total_rows,
-    ):
-        tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        block_dim, _, _ = cute.arch.block_dim()
-        row = bidx * block_dim + tidx
-        if row < total_rows:
-            channels = mPartials.shape[3]
-            n_size = mPartials.shape[4]
-            h = row // (channels * n_size)
-            rem = row - h * channels * n_size
-            c = rem // n_size
-            n = rem - c * n_size
-            acc = cutlass.Float32(0.0)
-            for b in range(mPartials.shape[0]):
-                for t in range(mPartials.shape[2]):
-                    acc = acc + cutlass.Float32(mPartials[b, h, t, c, n])
-            mScaleGrad[h, c, n] = acc
-
-    @cute.kernel
-    def reduce_bias_kernel(
-        self,
-        mPartials: cute.Tensor,
-        mBiasGrad: cute.Tensor,
-        total_rows,
-    ):
-        tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
-        block_dim, _, _ = cute.arch.block_dim()
-        row = bidx * block_dim + tidx
-        if row < total_rows:
-            channels = mPartials.shape[3]
-            h = row // channels
-            c = row - h * channels
-            acc = cutlass.Float32(0.0)
-            for b in range(mPartials.shape[0]):
-                for t in range(mPartials.shape[2]):
-                    acc = acc + cutlass.Float32(mPartials[b, h, t, c])
-            mBiasGrad[h, c] = acc
+            mDParams[b, t, p_base + 0] = d0.to(mDParams.element_type)
+            mDParams[b, t, p_base + 1] = d1.to(mDParams.element_type)
+            mDParams[b, t, p_base + 2] = d2.to(mDParams.element_type)
+            mDParams[b, t, p_base + 3] = d3.to(mDParams.element_type)
+            mDParams[b, t, p_base + 4] = d4.to(mDParams.element_type)
+            mDParams[b, t, p_base + 5] = d5.to(mDParams.element_type)
+            mDParams[b, t, p_base + 6] = d6.to(mDParams.element_type)
+            mDParams[b, t, p_base + 7] = d7.to(mDParams.element_type)
+            mDParams[b, t, p_base + 8] = d8.to(mDParams.element_type)
+            mDParams[b, t, p_base + 9] = d9.to(mDParams.element_type)
+            mDParams[b, t, p_base + 10] = d10.to(mDParams.element_type)
+            mDParams[b, t, p_base + 11] = d11.to(mDParams.element_type)
+            mDParams[b, t, p_base + 12] = d12.to(mDParams.element_type)
+            h_bias = h * 7
+            cute.arch.atomic_add((mBiasGrad.iterator + h_bias + 0).llvm_ptr, d0)
+            cute.arch.atomic_add((mBiasGrad.iterator + h_bias + 1).llvm_ptr, d1)
+            cute.arch.atomic_add((mBiasGrad.iterator + h_bias + 2).llvm_ptr, d2)
+            cute.arch.atomic_add((mBiasGrad.iterator + h_bias + 3).llvm_ptr, d5)
+            cute.arch.atomic_add((mBiasGrad.iterator + h_bias + 4).llvm_ptr, d6)
+            cute.arch.atomic_add((mBiasGrad.iterator + h_bias + 5).llvm_ptr, d7)
+            cute.arch.atomic_add((mBiasGrad.iterator + h_bias + 6).llvm_ptr, d8)
 
     @cute.jit
     def __call__(
@@ -695,9 +677,7 @@ class ScanPrepBwdFused:
         mix_k_curr_bias_ptr: cute.Pointer,
         value_grad_ptr: cute.Pointer,
         bc_grad_ptr: cute.Pointer,
-        scale_part_ptr: cute.Pointer,
         dparams_ptr: cute.Pointer,
-        bias_part_ptr: cute.Pointer,
         scale_grad_ptr: cute.Pointer,
         bias_grad_ptr: cute.Pointer,
     ):
@@ -722,7 +702,8 @@ class ScanPrepBwdFused:
             cute.make_layout(self.bc_scale_shape, stride=self.bc_scale_stride),
         )
         mParams = cute.make_tensor(
-            params_ptr, cute.make_layout(self.params_shape, stride=self.params_stride)
+            params_ptr,
+            cute.make_layout(self.params_in_shape, stride=self.params_in_stride),
         )
         mDM = cute.make_tensor(
             dm_ptr, cute.make_layout(self.m_shape, stride=self.m_stride)
@@ -760,22 +741,13 @@ class ScanPrepBwdFused:
         mBCGrad = cute.make_tensor(
             bc_grad_ptr, cute.make_layout(self.bc_shape, stride=self.bc_stride)
         )
-        mScalePartials = cute.make_tensor(
-            scale_part_ptr,
-            cute.make_layout(self.scale_part_shape, stride=self.scale_part_stride),
-        )
         mDParams = cute.make_tensor(
-            dparams_ptr, cute.make_layout(self.params_shape, stride=self.params_stride)
-        )
-        mBiasPartials = cute.make_tensor(
-            bias_part_ptr,
-            cute.make_layout(self.bias_part_shape, stride=self.bias_part_stride),
+            dparams_ptr,
+            cute.make_layout(self.dparams_shape, stride=self.dparams_stride),
         )
         mScaleGrad = cute.make_tensor(
             scale_grad_ptr,
-            cute.make_layout(
-                (self.h_size, 4, self.n_size), stride=(4 * self.n_size, self.n_size, 1)
-            ),
+            cute.make_layout(self.scale_grad_shape, stride=self.scale_grad_stride),
         )
         mBiasGrad = cute.make_tensor(
             bias_grad_ptr,
@@ -791,9 +763,9 @@ class ScanPrepBwdFused:
             mCScale,
             mValueGrad,
             mBCGrad,
-            mScalePartials,
+            mScaleGrad,
             self.total_rows,
-        ).launch(grid=(self.pack_grid_size, 1, 1), block=(self.block_size, 1, 1))
+        ).launch(grid=(self.pack_grid_size, 1, 1), block=(self.pack_block_size, 1, 1))
         self.coeff_kernel(
             mParams,
             mDM,
@@ -806,20 +778,9 @@ class ScanPrepBwdFused:
             mMixKPrevBias,
             mMixKCurrBias,
             mDParams,
-            mBiasPartials,
+            mBiasGrad,
             self.total_rows,
-        ).launch(grid=(self.coeff_grid_size, 1, 1), block=(self.block_size, 1, 1))
-        if self.normalize_bc:
-            self.reduce_scale_kernel(
-                mScalePartials, mScaleGrad, self.scale_reduce_rows
-            ).launch(
-                grid=(self.scale_reduce_grid, 1, 1),
-                block=(self.reduce_block_size, 1, 1),
-            )
-        self.reduce_bias_kernel(mBiasPartials, mBiasGrad, self.bias_reduce_rows).launch(
-            grid=(self.bias_reduce_grid, 1, 1),
-            block=(self.reduce_block_size, 1, 1),
-        )
+        ).launch(grid=(self.coeff_grid_size, 1, 1), block=(self.coeff_block_size, 1, 1))
 
 
 __all__ = ["ScanPrepBwdFused"]
