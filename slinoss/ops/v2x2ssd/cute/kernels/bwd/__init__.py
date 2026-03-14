@@ -37,6 +37,8 @@ _BWD_HOST_CACHE: dict[tuple, object] = {}
 _ZERO_PREV_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 _ZERO_FINAL_GRAD_CACHE: dict[tuple, torch.Tensor] = {}
 _BWD_WORKSPACE_CACHE: dict[tuple, tuple[torch.Tensor, ...]] = {}
+_PTR_ARG_CACHE: dict[tuple[object, ...], tuple[object, int]] = {}
+_PTR_ARG_CACHE_LIMIT = 32768
 
 
 def _get_zero_prev_tensors(
@@ -178,14 +180,30 @@ def _make_row_major_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
 
 
 def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
-    align = _assumed_align(t)
-    ptr = make_ptr(
-        _torch_to_cutlass_dtype(t.dtype),
-        t.data_ptr(),
-        cute.AddressSpace.gmem,
-        assumed_align=align,
+    device_index = (
+        int(t.device.index)
+        if t.device.type == "cuda" and t.device.index is not None
+        else -1
     )
-    return ptr, align
+    key = (t.device.type, device_index, int(t.data_ptr()), t.dtype)
+    cached = _PTR_ARG_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    align = _assumed_align(t)
+    cached = (
+        make_ptr(
+            _torch_to_cutlass_dtype(t.dtype),
+            t.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=align,
+        ),
+        align,
+    )
+    if len(_PTR_ARG_CACHE) >= _PTR_ARG_CACHE_LIMIT:
+        _PTR_ARG_CACHE.clear()
+    _PTR_ARG_CACHE[key] = cached
+    return cached
 
 
 def _make_cast_f32_to_tc(*, total_elems: int, num_threads: int = 256):
