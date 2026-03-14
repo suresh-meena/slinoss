@@ -7,11 +7,15 @@ name = "slinoss"
 version = "0.1.0"
 description = "Selective linear oscillatory state-space models."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11, <3.13"
 license = { file = "LICENSE" }
 dependencies = [
   "torch>=2.4",
   "numpy>=1.26",
+  "tqdm>=4.66",
+  "matplotlib>=3.8",
+  "seaborn>=0.13",
+  "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
