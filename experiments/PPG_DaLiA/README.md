@@ -1,49 +1,43 @@
 # PPG-DaLiA Heart-Rate Regression Experiments
 
-This directory contains experiments for training the SLinOSS mixer on the PPG-DaLiA dataset for heart-rate estimation.
+This directory contains SLinOSS experiments for heart-rate estimation on PPG-DaLiA.
 
-## New Structure
+## Layout
 
-- `run.py`: Main entry point for training.
-- `config.yaml`: Central configuration for hyperparameters and dataset settings.
-- `dataloader.py`: Optimized data loading with caching of processed splits.
-- `model.py`: Modular implementation of the `PPGRegressor` using SLinOSS.
-- `trainer.py`: Encapsulated training and evaluation logic for regression.
-- `analysis.py`: Script to generate detailed reports (`report.txt`) and plots (`metrics_plot.png`).
-- `utils.py`: Logging, seeding, and configuration utilities.
-- `hyperparameters/sweep.py`: Grid search utility for hyperparameter optimization.
+- `config.yaml`: Nested runtime defaults and sweep search space.
+- `run.py`: Single-run training entry point.
+- `hyperparameters/sweep.py`: Config-driven sweep runner.
+- `dataloader.py`: Dataset download, processing, caching, and split creation.
+- `model.py`: `PPGRegressor` built on `SLinOSSMixer`.
+- `trainer.py`: Regression training and evaluation loop.
+- `analysis.py`: Summary plots and text report generation.
+- `utils.py`: Config resolution, validation, logging, and optimizer setup.
+
+## Config model
+
+- Shared settings live under `experiment`, `data`, `training`, `model`, `backend`, and `sweep`.
+- The default backend is `auto`, which matches `examples/nextchar.py` and avoids forcing CuTe on unsupported setups.
+- `target_mode` is validated explicitly; use `mean`, `center`, or `sequence`.
 
 ## Usage
 
-### Single Run
+### Single run
 
-To run an experiment with the default configuration:
 ```bash
-python run.py
+./scripts/guix-run python3 experiments/PPG_DaLiA/run.py
+./scripts/guix-run python3 experiments/PPG_DaLiA/run.py --run-name my_ppg_run
 ```
 
-To specify a custom run name:
+### Hyperparameter sweep
+
 ```bash
-python run.py --run-name my_ppg_run
+./scripts/guix-run python3 experiments/PPG_DaLiA/hyperparameters/sweep.py
 ```
 
-### Hyperparameter Sweep
-
-To run a grid search:
-```bash
-python hyperparameters/sweep.py
-```
+The sweep script reads its search space from `config.yaml` instead of using a hard-coded grid.
 
 ### Analysis
 
-Analyze a completed run:
 ```bash
-python analysis.py runs/<run_name>
+./scripts/guix-run python3 experiments/PPG_DaLiA/analysis.py experiments/PPG_DaLiA/runs/<run_name>
 ```
-
-## Features
-
-- **CuTe Backend**: Fully supports the high-performance CuTe scan kernel.
-- **Efficient Loading**: Processes all subjects, performs windowing, and caches the resulting splits.
-- **Regression Optimized**: Focuses on MAE (BPM) and RMSE metrics.
-- **Beautiful Plots**: Automatic generation of MAE and MSE curves.

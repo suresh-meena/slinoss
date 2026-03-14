@@ -12,7 +12,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -95,9 +95,13 @@ def _ensure_raw_data(data_root: Path) -> Path:
             zf.extractall(extracted_dir)
 
     ts_root = extracted_dir / "Multivariate_ts"
-    if ts_root.exists(): return ts_root
+    if ts_root.exists():
+        return ts_root
     arff_root = extracted_dir / "Multivariate_arff"
-    if arff_root.exists(): return arff_root
+    if arff_root.exists():
+        raise RuntimeError(
+            "Downloaded the UEA ARFF archive, but this experiment loader only supports the TS archive."
+        )
     return extracted_dir
 
 
@@ -119,10 +123,14 @@ def _parse_ts_file(path: Path) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
             dims = [np.asarray([float(v) if v not in {"", "?", "NaN", "nan"} else np.nan 
                                for v in chunk.strip().split(",")], dtype=np.float32) 
                     for chunk in parts[:-1]]
-            
-            # Ensure consistent lengths within a sample
-            min_len = min(len(d) for d in dims)
-            samples.append([d[:min_len] for d in dims])
+
+            lengths = {len(dim) for dim in dims}
+            if len(lengths) != 1:
+                raise ValueError(
+                    f"Inconsistent per-dimension lengths in {path.name}: {sorted(lengths)}. "
+                    "This loader expects synchronized multivariate series."
+                )
+            samples.append(dims)
 
     n_samples = len(samples)
     n_dims = len(samples[0])
@@ -135,6 +143,37 @@ def _parse_ts_file(path: Path) -> Tuple[torch.Tensor, torch.Tensor, List[str]]:
             data[i, :len(series), d] = np.nan_to_num(series, nan=0.0)
 
     return torch.from_numpy(data), lengths, labels
+
+
+def _length_mask(lengths: torch.Tensor, max_len: int) -> torch.Tensor:
+    steps = torch.arange(max_len, device=lengths.device).unsqueeze(0)
+    return steps < lengths.unsqueeze(1)
+
+
+def _normalize_valid_timesteps(
+    train_x: torch.Tensor,
+    train_lengths: torch.Tensor,
+    *others: Tuple[torch.Tensor, torch.Tensor],
+) -> Tuple[torch.Tensor, ...]:
+    mask = _length_mask(train_lengths, train_x.shape[1]).unsqueeze(-1).to(train_x.dtype)
+    count = mask.sum(dim=(0, 1), keepdim=True).clamp_min(1.0)
+    mean = (train_x * mask).sum(dim=(0, 1), keepdim=True) / count
+    centered = (train_x - mean) * mask
+    std = torch.sqrt(centered.square().sum(dim=(0, 1), keepdim=True) / count).clamp_min(1e-5)
+
+    normalized: list[torch.Tensor] = []
+    for x, lengths in ((train_x, train_lengths),) + others:
+        x_mask = _length_mask(lengths, x.shape[1]).unsqueeze(-1).to(x.dtype)
+        normalized.append(((x - mean) / std) * x_mask)
+    return tuple(normalized)
+
+
+def _append_time_feature(x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    time_feature = torch.linspace(0, 1, x.shape[1], dtype=x.dtype).view(1, -1, 1)
+    time_feature = time_feature.expand(x.shape[0], -1, 1)
+    x = torch.cat([time_feature, x], dim=-1)
+    mask = _length_mask(lengths, x.shape[1]).unsqueeze(-1).to(x.dtype)
+    return x * mask
 
 
 def _encode_labels(train_labels: List[str], test_labels: List[str]) -> Tuple[torch.Tensor, torch.Tensor, int]:
@@ -154,7 +193,9 @@ def load_uea_splits(
     normalize: bool = True,
     include_time: bool = False,
 ) -> UEASplits:
-    cache_path = data_root / "cache" / f"{dataset_name}_v{val_fraction}_s{seed}_t{include_time}.pt"
+    cache_path = data_root / "cache" / (
+        f"{dataset_name}_v{val_fraction}_s{seed}_n{int(normalize)}_t{int(include_time)}.pt"
+    )
     if cache_path.exists():
         try:
             return torch.load(cache_path, weights_only=False)
@@ -163,31 +204,40 @@ def load_uea_splits(
     ts_root = _ensure_raw_data(data_root)
     dataset_dir = ts_root / dataset_name
     
-    train_x, train_lengths, train_labels = _parse_ts_file(dataset_dir / f"{dataset_name}_TRAIN.ts")
-    test_x, test_lengths, test_labels = _parse_ts_file(dataset_dir / f"{dataset_name}_TEST.ts")
+    train_path = dataset_dir / f"{dataset_name}_TRAIN.ts"
+    test_path = dataset_dir / f"{dataset_name}_TEST.ts"
+    if not train_path.exists() or not test_path.exists():
+        raise FileNotFoundError(
+            f"Expected TS files for dataset {dataset_name} in {dataset_dir}, "
+            "but one or both split files are missing."
+        )
+
+    train_x, train_lengths, train_labels = _parse_ts_file(train_path)
+    test_x, test_lengths, test_labels = _parse_ts_file(test_path)
     train_y_full, test_y, num_classes = _encode_labels(train_labels, test_labels)
 
     # Split train/val
     n = len(train_y_full)
     indices = list(range(n))
     random.Random(seed).shuffle(indices)
-    n_val = max(1, int(n * val_fraction))
+    n_val = min(n - 1, max(1, int(n * val_fraction)))
     val_idx, train_idx = indices[:n_val], indices[n_val:]
 
     val_x, val_lengths, val_y = train_x[val_idx], train_lengths[val_idx], train_y_full[val_idx]
     train_x, train_lengths, train_y = train_x[train_idx], train_lengths[train_idx], train_y_full[train_idx]
 
     if normalize:
-        mean, std = train_x.mean(dim=(0, 1), keepdim=True), train_x.std(dim=(0, 1), keepdim=True).clamp_min(1e-5)
-        train_x = (train_x - mean) / std
-        val_x = (val_x - mean) / std
-        test_x = (test_x - mean) / std
+        train_x, val_x, test_x = _normalize_valid_timesteps(
+            train_x,
+            train_lengths,
+            (val_x, val_lengths),
+            (test_x, test_lengths),
+        )
 
     if include_time:
-        def _add_time(x):
-            t = torch.linspace(0, 1, x.shape[1], dtype=x.dtype).view(1, -1, 1).expand(x.shape[0], -1, 1)
-            return torch.cat([t, x], dim=-1)
-        train_x, val_x, test_x = _add_time(train_x), _add_time(val_x), _add_time(test_x)
+        train_x = _append_time_feature(train_x, train_lengths)
+        val_x = _append_time_feature(val_x, val_lengths)
+        test_x = _append_time_feature(test_x, test_lengths)
 
     splits = UEASplits(train_x, train_lengths, train_y, val_x, val_lengths, val_y, 
                        test_x, test_lengths, test_y, int(train_x.shape[-1]), num_classes)
@@ -207,7 +257,13 @@ def create_dataloaders(config: dict) -> Tuple[Dict[str, DataLoader], UEASplits]:
         include_time=config.get("include_time", False),
     )
 
-    common = dict(batch_size=config["batch_size"], num_workers=config["num_workers"], pin_memory=True)
+    num_workers = int(config["num_workers"])
+    common = dict(
+        batch_size=config["batch_size"],
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=num_workers > 0,
+    )
     return {
         "train": DataLoader(PaddedTimeSeriesDataset(splits.train_x, splits.train_lengths, splits.train_y), shuffle=True, **common),
         "val": DataLoader(PaddedTimeSeriesDataset(splits.val_x, splits.val_lengths, splits.val_y), shuffle=False, **common),

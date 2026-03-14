@@ -1,49 +1,44 @@
 # UEA Multivariate Classification Experiments
 
-This directory contains experiments for training the SLinOSS mixer on the UEA multivariate time series classification benchmark.
+This directory contains SLinOSS experiments for the UEA multivariate classification benchmark.
 
-## New Structure
+## Layout
 
-- `run.py`: Main entry point for training.
-- `config.yaml`: Central configuration for hyperparameters and dataset settings.
-- `dataloader.py`: Optimized data loading with caching to speed up repeated runs.
-- `model.py`: Modular implementation of the `UEAClassifier` using SLinOSS.
-- `trainer.py`: Encapsulated training and evaluation logic.
-- `analysis.py`: Script to generate detailed reports (`report.txt`) and plots (`metrics_plot.png`).
-- `utils.py`: Logging, seeding, and configuration utilities.
-- `hyperparameters/sweep.py`: Grid search utility for hyperparameter optimization.
+- `config.yaml`: Nested defaults, per-dataset overrides, and per-dataset sweep spaces.
+- `run.py`: Single-run training entry point.
+- `hyperparameters/sweep.py`: Config-driven sweep runner.
+- `dataloader.py`: UEA download, parsing, caching, and split creation.
+- `model.py`: `UEAClassifier` built on `SLinOSSMixer`.
+- `trainer.py`: Training and evaluation loop.
+- `analysis.py`: Summary plots and text report generation.
+- `utils.py`: Config resolution, validation, logging, and optimizer setup.
+
+## Config model
+
+- Shared settings live under `experiment`, `data`, `training`, `model`, `backend`, and `sweep`.
+- Dataset-specific overrides live under `datasets.<dataset_name>`.
+- Dataset-specific sweep grids live under `datasets.<dataset_name>.sweep.grid`.
+- The default backend is `auto`, which matches `examples/nextchar.py` and avoids forcing CuTe on unsupported setups.
 
 ## Usage
 
-### Single Run
+### Single run
 
-To run an experiment with the default configuration:
 ```bash
-python run.py
+./scripts/guix-run python3 experiments/UEA/run.py
+./scripts/guix-run python3 experiments/UEA/run.py --dataset ArticularyWordRecognition --run-name my_first_run
 ```
 
-To override the dataset or specify a run name:
+### Hyperparameter sweep
+
 ```bash
-python run.py --dataset ArticularyWordRecognition --run-name my_first_run
+./scripts/guix-run python3 experiments/UEA/hyperparameters/sweep.py --datasets ArticularyWordRecognition AtrialFibrillation
 ```
 
-### Hyperparameter Sweep
-
-To run a grid search over predefined hyperparameters:
-```bash
-python hyperparameters/sweep.py --datasets ArticularyWordRecognition AtrialFibrillation
-```
+The sweep script reads its search space from `config.yaml` instead of from hard-coded grids.
 
 ### Analysis
 
-After a run is complete, analyze the results and generate plots:
 ```bash
-python analysis.py runs/ArticularyWordRecognition/<run_name>
+./scripts/guix-run python3 experiments/UEA/analysis.py experiments/UEA/runs/ArticularyWordRecognition/<run_name>
 ```
-
-## Features
-
-- **CuTe Backend**: Uses the high-performance CuTe scan kernel on NVIDIA GPUs.
-- **Optimized Loading**: First-time runs parse `.ts` files; subsequent runs load from a fast binary cache.
-- **Beautiful Plots**: Automatic generation of high-quality loss and accuracy curves.
-- **Detailed Logging**: Comprehensive logs saved to each run directory.

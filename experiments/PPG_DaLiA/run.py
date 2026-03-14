@@ -5,20 +5,24 @@ from __future__ import annotations
 
 import argparse
 import json
-import logging
-import math
 import time
 from dataclasses import asdict
 from pathlib import Path
 
 import torch
-from torch import nn
-from tqdm.auto import tqdm
 
 from dataloader import create_dataloaders
 from model import PPGRegressor
-from trainer import Trainer, EpochMetrics
-from utils import set_seed, load_config, setup_logging, get_run_dir, count_parameters
+from trainer import EpochMetrics, Trainer
+from utils import (
+    configure_optimizer,
+    count_parameters,
+    get_run_dir,
+    load_config,
+    set_seed,
+    setup_logging,
+    specialize_config,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -30,14 +34,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main():
     args = build_parser().parse_args()
-    config = load_config(args.config)
-    
-    if args.run_name: config["run_name"] = args.run_name
-    else: config["run_name"] = time.strftime("%Y%m%d-%H%M%S")
+    config = specialize_config(load_config(args.config))
+
+    if args.run_name:
+        config["run_name"] = args.run_name
+    else:
+        config["run_name"] = time.strftime("%Y%m%d-%H%M%S")
 
     set_seed(config["seed"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    run_dir = get_run_dir(Path("experiments/PPG_DaLiA/runs"), config["run_name"])
+    run_dir = get_run_dir(Path(config["runs_root"]), config["run_name"])
     logger = setup_logging(run_dir, "train")
 
     logger.info(f"Starting PPG experiment: {config['run_name']}")
@@ -63,14 +69,12 @@ def main():
     
     logger.info(f"Model parameters: {count_parameters(model)/1e6:.3f}M")
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), 
-        lr=config["lr"], 
-        weight_decay=config["weight_decay"], 
-        betas=(0.9, 0.95), 
-        fused=device.type == "cuda"
+    optimizer = configure_optimizer(
+        model,
+        lr=config["lr"],
+        weight_decay=config["weight_decay"],
     )
-    
+
     trainer = Trainer(model, optimizer, device, logger, grad_clip=config["grad_clip"])
 
     history: list[EpochMetrics] = []

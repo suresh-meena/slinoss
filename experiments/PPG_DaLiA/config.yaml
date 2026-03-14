@@ -1,31 +1,46 @@
 # PPG-DaLiA Experiment Configuration
 
-# Dataset settings
-data_root: "experiments/PPG_DaLiA/data"
-include_time: false
-x_window: 49920
-x_hop: 4992
-target_mode: "mean"
+experiment:
+  runs_root: "experiments/PPG_DaLiA/runs"
 
-# Training settings
-seed: 7
-epochs: 50
-batch_size: 8
-num_workers: 0
-lr: 0.001
-weight_decay: 0.05
-grad_clip: 1.0
+data:
+  root: "experiments/PPG_DaLiA/data"
+  include_time: false
+  x_window: 49920
+  x_hop: 4992
+  target_mode: "mean"
 
-# Model architecture
-d_model: 64
-n_layers: 4
-d_state: 64
-expand: 2
-d_head: 32
-d_conv: 4
-chunk_size: 64
-dropout: 0.1
+training:
+  seed: 7
+  epochs: 50
+  batch_size: 8
+  num_workers: 0
+  lr: 0.001
+  weight_decay: 0.05
+  grad_clip: 1.0
 
-# Backend settings
-# options: "auto", "cute", "reference"
-scan_backend: "cute"
+model:
+  d_model: 64
+  n_layers: 4
+  d_state: 64
+  expand: 2
+  d_head: 32
+  d_conv: 4
+  chunk_size: 64
+  dropout: 0.1
+
+backend:
+  # `auto` keeps parity with examples/nextchar.py and avoids forcing CuTe.
+  scan_backend: "auto"
+
+sweep:
+  metric: "val_mae"
+  goal: "min"
+  fixed: {}
+  grid:
+    lr: [0.0001, 0.0003, 0.001]
+    batch_size: [4, 8]
+    d_model: [64, 128]
+    n_layers: [2, 4]
+    d_state: [64, 128]
+    dropout: [0.0, 0.1]

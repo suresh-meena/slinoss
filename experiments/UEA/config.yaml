@@ -1,31 +1,186 @@
 # UEA Experiment Configuration
+#
+# Layout:
+# - top-level sections define shared defaults
+# - `datasets.<name>` applies per-dataset overrides
+# - `datasets.<name>.sweep` can tighten or expand the search space for that dataset
 
-# Dataset settings
-dataset: "ArticularyWordRecognition"
-data_root: "experiments/UEA/data"
-val_fraction: 0.15
-include_time: false
-normalize: true
+experiment:
+  dataset: "ArticularyWordRecognition"
+  runs_root: "experiments/UEA/runs"
 
-# Training settings
-seed: 7
-epochs: 50
-batch_size: 64
-num_workers: 0
-lr: 0.0003
-weight_decay: 0.05
-grad_clip: 1.0
+data:
+  root: "experiments/UEA/data"
+  val_fraction: 0.15
+  include_time: false
+  normalize: true
 
-# Model architecture
-d_model: 128
-n_layers: 3
-d_state: 32
-expand: 2
-d_head: 32
-d_conv: 4
-chunk_size: 64
-dropout: 0.1
+training:
+  seed: 7
+  epochs: 50
+  batch_size: 64
+  num_workers: 0
+  lr: 0.0003
+  weight_decay: 0.05
+  grad_clip: 1.0
 
-# Backend settings
-# options: "auto", "cute", "reference"
-scan_backend: "cute"
+model:
+  d_model: 128
+  n_layers: 3
+  d_state: 32
+  expand: 2
+  d_head: 32
+  d_conv: 4
+  chunk_size: 64
+  dropout: 0.1
+
+backend:
+  # `auto` matches the reference example and avoids forcing CuTe on unsupported setups.
+  scan_backend: "auto"
+
+sweep:
+  metric: "val_acc"
+  goal: "max"
+  fixed: {}
+  grid:
+    lr: [0.0001, 0.0003, 0.001]
+    d_model: [64, 128]
+    n_layers: [2, 3]
+    d_state: [32, 64]
+    dropout: [0.0, 0.1, 0.2]
+
+datasets:
+  ArticularyWordRecognition:
+    training:
+      batch_size: 32
+    model:
+      d_model: 128
+      d_state: 64
+      n_layers: 3
+    sweep:
+      grid:
+        lr: [0.0001, 0.0003, 0.001]
+        d_model: [96, 128, 160]
+        n_layers: [2, 3, 4]
+        d_state: [32, 64]
+
+  Worms:
+    training:
+      lr: 0.001
+      batch_size: 32
+    model:
+      d_model: 128
+      d_state: 64
+      n_layers: 2
+    data:
+      include_time: false
+    sweep:
+      grid:
+        lr: [0.0003, 0.001, 0.003]
+        d_model: [64, 128]
+        n_layers: [2, 3]
+        d_state: [32, 64]
+
+  SelfRegulationSCP1:
+    training:
+      lr: 0.0001
+      batch_size: 16
+    model:
+      d_model: 128
+      d_state: 256
+      n_layers: 6
+    data:
+      include_time: true
+    sweep:
+      grid:
+        lr: [0.00003, 0.0001, 0.0003]
+        d_state: [128, 256]
+        n_layers: [4, 6]
+        dropout: [0.0, 0.1]
+
+  SelfRegulationSCP2:
+    training:
+      lr: 0.00001
+      batch_size: 16
+    model:
+      d_model: 128
+      d_state: 64
+      n_layers: 6
+    data:
+      include_time: false
+    sweep:
+      grid:
+        lr: [0.00001, 0.00003, 0.0001]
+        d_state: [64, 128]
+        n_layers: [4, 6]
+
+  EthanolConcentration:
+    training:
+      lr: 0.00001
+      batch_size: 32
+    model:
+      d_model: 16
+      d_state: 256
+      n_layers: 4
+      d_head: 16
+    data:
+      include_time: false
+    sweep:
+      grid:
+        lr: [0.00001, 0.00003, 0.0001]
+        d_model: [16, 32, 64]
+        d_state: [128, 256]
+        n_layers: [3, 4]
+
+  Heartbeat:
+    training:
+      lr: 0.0001
+      batch_size: 32
+    model:
+      d_model: 16
+      d_state: 16
+      n_layers: 2
+      d_head: 16
+    data:
+      include_time: false
+    sweep:
+      grid:
+        lr: [0.00003, 0.0001, 0.0003]
+        d_model: [16, 32]
+        d_state: [16, 32]
+        n_layers: [2, 3]
+
+  MotorImagery:
+    training:
+      lr: 0.001
+      batch_size: 16
+    model:
+      d_model: 16
+      d_state: 64
+      n_layers: 4
+      d_head: 16
+    data:
+      include_time: false
+    sweep:
+      grid:
+        lr: [0.0003, 0.001, 0.003]
+        d_model: [16, 32, 64]
+        d_state: [32, 64]
+        n_layers: [3, 4]
+
+  Weather:
+    training:
+      lr: 0.0000795
+      batch_size: 32
+    model:
+      d_model: 128
+      d_state: 128
+      n_layers: 3
+    data:
+      include_time: false
+    sweep:
+      grid:
+        lr: [0.00003, 0.0000795, 0.0001, 0.0003]
+        d_model: [96, 128, 160]
+        d_state: [64, 128]
+        dropout: [0.0, 0.1]
