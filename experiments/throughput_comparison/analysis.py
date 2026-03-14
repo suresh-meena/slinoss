@@ -213,7 +213,30 @@ def _write_report(path: Path, rows: list[dict[str, Any]], *, baseline: str) -> N
 
 
 def _configure_theme() -> None:
-    sns.set_theme(style="whitegrid", context="talk", palette="deep")
+    sns.set_theme(
+        style="whitegrid",
+        context="talk",
+        palette="deep",
+        rc={
+            "figure.facecolor": "#f7f6f3",
+            "axes.facecolor": "#ffffff",
+            "axes.edgecolor": "#4a4a4a",
+            "grid.color": "#e5e5e5",
+            "grid.linestyle": "-",
+            "grid.linewidth": 0.8,
+            "legend.frameon": False,
+            "text.color": "#241f1f",
+            "axes.labelcolor": "#241f1f",
+            "axes.titleweight": "bold",
+        },
+    )
+    plt.rc("font", family="DejaVu Sans", size=11)
+
+
+def _beautify_axes(ax: plt.Axes) -> None:
+    ax.set_axisbelow(True)
+    sns.despine(ax=ax, trim=True, left=False, bottom=False)
+    ax.grid(True, color="#e5e5e5", linewidth=0.8, linestyle="-")
 
 
 def _plot_default_bars(
@@ -236,6 +259,7 @@ def _plot_default_bars(
     ax.set_ylabel(ylabel)
     ax.set_title(f"default: {measure} {ylabel}")
     ax.set_xlabel("Model")
+    _beautify_axes(ax)
     plt.tight_layout()
     plt.savefig(output_path, dpi=200)
     plt.close()
@@ -272,6 +296,7 @@ def _plot_suite_lines(
     ax.set_ylabel("Warm timesteps/s")
     ax.set_title(f"{suite}: {measure} throughput scaling")
     ax.legend()
+    _beautify_axes(ax)
     plt.tight_layout()
     plt.savefig(output_path, dpi=200)
     plt.close()
@@ -302,6 +327,7 @@ def _plot_param_scatter(rows: list[dict[str, Any]], *, output_path: Path) -> Non
     ax.set_xlabel("Parameters (M)")
     ax.set_ylabel("Warm train-step timesteps/s")
     ax.set_title("default: throughput versus parameter count")
+    _beautify_axes(ax)
     plt.tight_layout()
     plt.savefig(output_path, dpi=200)
     plt.close()

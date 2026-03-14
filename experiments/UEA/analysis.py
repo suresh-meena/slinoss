@@ -29,7 +29,30 @@ def _summary_kind(summary: Any) -> str | None:
 
 
 def _configure_theme() -> None:
-    sns.set_theme(style="whitegrid", context="talk", palette="deep")
+    sns.set_theme(
+        style="whitegrid",
+        context="talk",
+        palette="deep",
+        rc={
+            "figure.facecolor": "#f7f6f3",
+            "axes.facecolor": "#ffffff",
+            "axes.edgecolor": "#4a4a4a",
+            "grid.color": "#e5e5e5",
+            "grid.linestyle": "-",
+            "grid.linewidth": 0.8,
+            "legend.frameon": False,
+            "text.color": "#241f1f",
+            "axes.labelcolor": "#241f1f",
+            "axes.titleweight": "bold",
+        },
+    )
+    plt.rc("font", family="DejaVu Sans", size=11)
+
+
+def _beautify_axes(ax: plt.Axes) -> None:
+    ax.set_axisbelow(True)
+    sns.despine(ax=ax, trim=True, left=False, bottom=False)
+    ax.grid(True, color="#e5e5e5", linewidth=0.8, linestyle="-")
 
 
 def _safe_resolve(path: Path) -> Path:
@@ -94,6 +117,8 @@ def plot_run_metrics(summary: dict[str, Any], out_dir: Path) -> None:
     axes[1].set_ylabel("Accuracy")
     axes[1].set_ylim(0.0, 1.05)
     axes[1].legend()
+    for ax in axes:
+        _beautify_axes(ax)
 
     fig.suptitle(title, fontsize=18, fontweight="bold")
     fig.text(
@@ -216,6 +241,10 @@ def plot_sweep_results(results: list[dict[str, Any]], out_dir: Path) -> None:
     axes[1].set_xlabel("Dataset")
     axes[1].set_ylabel("best_val_acc")
     axes[1].tick_params(axis="x", rotation=35)
+    for ax in axes:
+        _beautify_axes(ax)
+    for ax in axes:
+        _beautify_axes(ax)
 
     fig.suptitle("UEA Sweep Summary", fontsize=18, fontweight="bold")
     plt.tight_layout(rect=(0, 0, 1, 0.95))
