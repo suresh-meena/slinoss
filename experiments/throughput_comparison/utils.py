@@ -1,4 +1,4 @@
-"""Utilities for the synthetic throughput comparison experiment."""
+"""Utilities for the nextchar throughput comparison experiment."""
 
 from __future__ import annotations
 
@@ -103,6 +103,13 @@ def _build_case(*, defaults: dict[str, Any], raw_case: Any) -> CaseSpec:
     _require(seq_len > 0, f"{merged['name']}: seq_len must be positive.")
     _require(input_dim > 0, f"{merged['name']}: input_dim must be positive.")
     _require(output_dim > 0, f"{merged['name']}: output_dim must be positive.")
+    _require(
+        input_dim == output_dim,
+        (
+            f"{merged['name']}: nextchar contract requires input_dim == output_dim "
+            f"(vocab size), got {input_dim} and {output_dim}."
+        ),
+    )
     _require(hidden_dim > 0, f"{merged['name']}: hidden_dim must be positive.")
     _require(layers > 0, f"{merged['name']}: layers must be positive.")
     _require(state_dim > 0, f"{merged['name']}: state_dim must be positive.")

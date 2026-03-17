@@ -16,8 +16,8 @@ experiment:
 defaults:
   batch_size: 16
   seq_len: 1024
-  input_dim: 96
-  output_dim: 96
+  input_dim: 256
+  output_dim: 256
   hidden_dim: 256
   layers: 4
   state_dim: 64

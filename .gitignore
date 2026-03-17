@@ -212,3 +212,7 @@ experiments/UEA/runs
 
 experiments/PPG_DaLiA/data
 experiments/PPG_DaLiA/runs
+
+experiments/throughput_comparison/runs
+
+reference/

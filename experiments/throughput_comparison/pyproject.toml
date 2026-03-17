@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slinoss-throughput-comparison"
+version = "0.1.0"
+description = "Synthetic throughput benchmark dependencies for SLinOSS vs Mamba2/LinOSS variants"
+requires-python = ">=3.10"
+dependencies = [
+  "jax[cuda12]>=0.6.2",
+  "equinox>=0.13.0",
+  "optax>=0.2.5",
+  "jaxtyping>=0.2.36",
+  "sympy>=1.13",
+  "transformers>=4.40,<5",
+]
+
+[project.optional-dependencies]
+cuda12-compat = [
+  "cuda-python>=12.4,<13.0",
+  "nvidia-cutlass-dsl>=4.4.0,<4.5",
+  "nvidia-cuda-runtime-cu12>=12.1,<12.9",
+  "nvidia-cuda-nvcc-cu12>=12.1,<12.9",
+]
+
+# Works by default only where prebuilt wheels are available.
+mamba = [
+  "mamba-ssm[causal-conv1d]>=2.2.2,<2.3.0; python_version < '3.12'",
+]
+
+# Use this on Python >=3.12 only when CUDA toolkit + nvcc are present and
+# source builds are intended.
+mamba-source = [
+  "mamba-ssm[causal-conv1d]>=2.2.2,<2.3.0",
+]

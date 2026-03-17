@@ -1,186 +1,125 @@
-# UEA Experiment Configuration
-#
-# Layout:
-# - top-level sections define shared defaults
-# - `datasets.<name>` applies per-dataset overrides
-# - `datasets.<name>.sweep` can tighten or expand the search space for that dataset
-
 experiment:
-  dataset: "ArticularyWordRecognition"
+  dataset: "EigenWorms"
   runs_root: "experiments/UEA/runs"
-
 data:
-  root: "experiments/UEA/data"
+  root: experiments/UEA/data
   val_fraction: 0.15
   include_time: false
   normalize: true
-
+  split_strategy: linoss_701515
 training:
-  seed: 7
-  epochs: 50
-  batch_size: 64
+  seed: 2345
+  seeds: [2345, 3456, 4567, 5678, 6789]
+  num_steps: 100000
+  print_steps: 1000
+  early_stopping_evals: 10
+  mixed_precision: bf16
+  torch_compile: false
+  torch_compile_mode: default
+  batch_size: 32
   num_workers: 0
-  lr: 0.0003
+  lr: 0.001
   weight_decay: 0.05
   grad_clip: 1.0
-
 model:
   d_model: 128
-  n_layers: 3
-  d_state: 32
+  n_layers: 2
+  ffn_activation: silu
+  d_state: 64
   expand: 2
   d_head: 32
   d_conv: 4
   chunk_size: 64
   dropout: 0.1
-
 backend:
-  # `auto` matches the reference example and avoids forcing CuTe on unsupported setups.
-  scan_backend: "auto"
-
+  scan_backend: auto
 sweep:
-  metric: "val_acc"
-  goal: "max"
-  fixed: {}
+  metric: val_acc
+  goal: max
+  fixed:
+    d_head: 16
   grid:
-    lr: [0.0001, 0.0003, 0.001]
-    d_model: [64, 128]
-    n_layers: [2, 3]
-    d_state: [32, 64]
-    dropout: [0.0, 0.1, 0.2]
-
+    lr:
+    - 0.001
+    - 0.0001
+    - 1.0e-05
+    d_model:
+    - 16
+    - 64
+    - 128
+    d_state:
+    - 16
+    - 64
+    - 256
+    n_layers:
+    - 2
+    - 4
+    - 6
+    include_time:
+    - true
+    - false
 datasets:
-  ArticularyWordRecognition:
-    training:
-      batch_size: 32
-    model:
-      d_model: 128
-      d_state: 64
-      n_layers: 3
-    sweep:
-      grid:
-        lr: [0.0001, 0.0003, 0.001]
-        d_model: [96, 128, 160]
-        n_layers: [2, 3, 4]
-        d_state: [32, 64]
-
-  Worms:
+  EigenWorms:
     training:
       lr: 0.001
-      batch_size: 32
+      batch_size: 4
     model:
       d_model: 128
       d_state: 64
       n_layers: 2
+      ffn_activation: silu
     data:
       include_time: false
-    sweep:
-      grid:
-        lr: [0.0003, 0.001, 0.003]
-        d_model: [64, 128]
-        n_layers: [2, 3]
-        d_state: [32, 64]
-
   SelfRegulationSCP1:
     training:
       lr: 0.0001
-      batch_size: 16
+      batch_size: 32
     model:
       d_model: 128
       d_state: 256
       n_layers: 6
     data:
       include_time: true
-    sweep:
-      grid:
-        lr: [0.00003, 0.0001, 0.0003]
-        d_state: [128, 256]
-        n_layers: [4, 6]
-        dropout: [0.0, 0.1]
-
   SelfRegulationSCP2:
     training:
-      lr: 0.00001
-      batch_size: 16
-    model:
-      d_model: 128
-      d_state: 64
-      n_layers: 6
-    data:
-      include_time: false
-    sweep:
-      grid:
-        lr: [0.00001, 0.00003, 0.0001]
-        d_state: [64, 128]
-        n_layers: [4, 6]
-
-  EthanolConcentration:
-    training:
-      lr: 0.00001
+      lr: 1.0e-05
       batch_size: 32
     model:
-      d_model: 16
+      d_model: 64
       d_state: 256
-      n_layers: 4
-      d_head: 16
+      n_layers: 6
     data:
-      include_time: false
-    sweep:
-      grid:
-        lr: [0.00001, 0.00003, 0.0001]
-        d_model: [16, 32, 64]
-        d_state: [128, 256]
-        n_layers: [3, 4]
-
-  Heartbeat:
+      include_time: true
+  EthanolConcentration:
     training:
-      lr: 0.0001
+      lr: 1.0e-05
       batch_size: 32
     model:
       d_model: 16
       d_state: 16
-      n_layers: 2
-      d_head: 16
-    data:
-      include_time: false
-    sweep:
-      grid:
-        lr: [0.00003, 0.0001, 0.0003]
-        d_model: [16, 32]
-        d_state: [16, 32]
-        n_layers: [2, 3]
-
-  MotorImagery:
-    training:
-      lr: 0.001
-      batch_size: 16
-    model:
-      d_model: 16
-      d_state: 64
       n_layers: 4
       d_head: 16
     data:
       include_time: false
-    sweep:
-      grid:
-        lr: [0.0003, 0.001, 0.003]
-        d_model: [16, 32, 64]
-        d_state: [32, 64]
-        n_layers: [3, 4]
-
-  Weather:
+  Heartbeat:
     training:
-      lr: 0.0000795
+      lr: 0.001
+      batch_size: 32
+    model:
+      d_model: 16
+      d_state: 16
+      n_layers: 6
+      d_head: 16
+    data:
+      include_time: true
+  MotorImagery:
+    training:
+      lr: 1.0e-05
       batch_size: 32
     model:
       d_model: 128
-      d_state: 128
-      n_layers: 3
+      d_state: 256
+      n_layers: 2
+      d_head: 16
     data:
       include_time: false
-    sweep:
-      grid:
-        lr: [0.00003, 0.0000795, 0.0001, 0.0003]
-        d_model: [96, 128, 160]
-        d_state: [64, 128]
-        dropout: [0.0, 0.1]

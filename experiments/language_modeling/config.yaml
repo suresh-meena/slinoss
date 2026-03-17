@@ -1,0 +1,97 @@
+experiment:
+  name: fineweb_edu_lm
+  preset: slinoss_180m
+  output_root: experiments/language_modeling/runs
+  seed: 7
+
+data:
+  dataset_name: HuggingFaceFW/fineweb-edu
+  dataset_config_name: sample-100BT
+  dataset_split: train
+  text_field: text
+  streaming: true
+  shuffle_buffer_size: 10000
+  validation_docs: 2048
+  tokenizer_name: meta-llama/Llama-3.1-8B
+  tokenizer_use_fast: true
+  tokenizer_batch_size: 32
+  add_eos_token: true
+  cache_dir: experiments/language_modeling/cache
+
+training:
+  seq_len: 2048
+  micro_batch_size: 1
+  eval_batch_size: 1
+  gradient_accumulation_steps: 64
+  train_tokens: 100000000000
+  max_steps: null
+  warmup_steps: 2000
+  learning_rate: 0.0005
+  min_lr_ratio: 0.1
+  weight_decay: 0.1
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1.0e-8
+  grad_clip: 1.0
+  mixed_precision: bf16
+  torch_compile: false
+  torch_compile_mode: default
+  log_interval: 10
+  eval_interval: 1000
+  save_interval: 1000
+  max_eval_batches: 64
+  num_workers: 0
+  pin_memory: true
+  resume_from: null
+
+model:
+  type: slinoss
+  target_params: 180000000
+  d_model: 640
+  n_layers: 12
+  d_state: 32
+  expand: 2
+  d_head: 64
+  d_conv: 4
+  chunk_size: 128
+  ffn_hidden_dim: 1500
+  tie_embeddings: true
+  normalize_bc: true
+
+backend:
+  scan_backend: auto
+
+presets:
+  slinoss_180m:
+    model:
+      type: slinoss
+      target_params: 180000000
+      d_model: 640
+      n_layers: 12
+      d_state: 32
+      expand: 2
+      d_head: 64
+      d_conv: 4
+      chunk_size: 128
+      ffn_hidden_dim: 1500
+      tie_embeddings: true
+      normalize_bc: true
+    training:
+      learning_rate: 0.0005
+
+  mamba2_180m:
+    model:
+      type: mamba2
+      target_params: 180000000
+      d_model: 768
+      n_layers: 12
+      d_state: 128
+      expand: 2
+      d_head: 64
+      d_conv: 4
+      chunk_size: 128
+      ffn_hidden_dim: 1500
+      tie_embeddings: true
+      normalize_bc: true
+    training:
+      learning_rate: 0.0005

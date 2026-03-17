@@ -1,4 +1,4 @@
-"""PyTorch model wrappers for the throughput comparison experiment."""
+"""PyTorch model wrappers for nextchar-style throughput comparison."""
 
 from __future__ import annotations
 
@@ -75,6 +75,7 @@ class ContinuousSLinOSSModel(nn.Module):
         input_dim: int,
         hidden_dim: int,
         output_dim: int,
+        block_size: int,
         layers: int,
         d_state: int,
         expand: int,
@@ -85,7 +86,13 @@ class ContinuousSLinOSSModel(nn.Module):
         backend: str,
     ) -> None:
         super().__init__()
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        if int(input_dim) != int(output_dim):
+            raise ValueError(
+                f"nextchar expects input_dim == output_dim (vocab), got {input_dim} and {output_dim}."
+            )
+        self.block_size = int(block_size)
+        self.token_embed = nn.Embedding(input_dim, hidden_dim)
+        self.pos_embed = nn.Parameter(torch.empty(1, self.block_size, hidden_dim))
         self.blocks = nn.ModuleList(
             [
                 SLinOSSResidualBlock(
@@ -101,18 +108,24 @@ class ContinuousSLinOSSModel(nn.Module):
             ]
         )
         self.norm_f = nn.RMSNorm(hidden_dim)
-        self.output_proj = nn.Linear(hidden_dim, output_dim)
+        self.output_proj = nn.Linear(hidden_dim, output_dim, bias=False)
+        self.output_proj.weight = self.token_embed.weight
         self.reset_parameters()
         configure_slinoss_backends(self, backend=backend)
 
     def reset_parameters(self) -> None:
-        nn.init.xavier_uniform_(self.input_proj.weight)
-        nn.init.zeros_(self.input_proj.bias)
-        nn.init.xavier_uniform_(self.output_proj.weight)
-        nn.init.zeros_(self.output_proj.bias)
+        nn.init.normal_(self.token_embed.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.pos_embed, mean=0.0, std=0.01)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.input_proj(x)
+        if x.ndim != 2:
+            raise ValueError(f"Expected token ids shape (batch, T), got {tuple(x.shape)}")
+        if x.shape[1] > self.block_size:
+            raise ValueError(
+                f"Sequence length {x.shape[1]} exceeds block_size {self.block_size}."
+            )
+        x = self.token_embed(x)
+        x = x + self.pos_embed[:, : x.shape[1], :]
         for block in self.blocks:
             x = block(x)
         x = self.norm_f(x)
@@ -155,13 +168,20 @@ class ContinuousMamba2Model(nn.Module):
         input_dim: int,
         hidden_dim: int,
         output_dim: int,
+        block_size: int,
         layers: int,
         d_state: int,
         d_conv: int,
         expand: int,
     ) -> None:
         super().__init__()
-        self.input_proj = nn.Linear(input_dim, hidden_dim)
+        if int(input_dim) != int(output_dim):
+            raise ValueError(
+                f"nextchar expects input_dim == output_dim (vocab), got {input_dim} and {output_dim}."
+            )
+        self.block_size = int(block_size)
+        self.token_embed = nn.Embedding(input_dim, hidden_dim)
+        self.pos_embed = nn.Parameter(torch.empty(1, self.block_size, hidden_dim))
         self.blocks = nn.ModuleList(
             [
                 Mamba2ResidualBlock(
@@ -174,17 +194,23 @@ class ContinuousMamba2Model(nn.Module):
             ]
         )
         self.norm_f = nn.RMSNorm(hidden_dim)
-        self.output_proj = nn.Linear(hidden_dim, output_dim)
+        self.output_proj = nn.Linear(hidden_dim, output_dim, bias=False)
+        self.output_proj.weight = self.token_embed.weight
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        nn.init.xavier_uniform_(self.input_proj.weight)
-        nn.init.zeros_(self.input_proj.bias)
-        nn.init.xavier_uniform_(self.output_proj.weight)
-        nn.init.zeros_(self.output_proj.bias)
+        nn.init.normal_(self.token_embed.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.pos_embed, mean=0.0, std=0.01)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.input_proj(x)
+        if x.ndim != 2:
+            raise ValueError(f"Expected token ids shape (batch, T), got {tuple(x.shape)}")
+        if x.shape[1] > self.block_size:
+            raise ValueError(
+                f"Sequence length {x.shape[1]} exceeds block_size {self.block_size}."
+            )
+        x = self.token_embed(x)
+        x = x + self.pos_embed[:, : x.shape[1], :]
         for block in self.blocks:
             x = block(x)
         x = self.norm_f(x)

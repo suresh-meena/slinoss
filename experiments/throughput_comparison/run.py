@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Benchmark synthetic throughput for SLinOSS, Mamba2, LinOSS, and D-LinOSS."""
+"""Benchmark nextchar-style throughput for SLinOSS, Mamba2, LinOSS, and D-LinOSS."""
 
 from __future__ import annotations
 
 import argparse
 import copy
 import importlib
-import os
 from pathlib import Path
 import random
 import sys
@@ -28,6 +27,7 @@ from models import (  # noqa: E402
     ContinuousSLinOSSModel,
     count_torch_parameters,
 )
+import dlinoss_jax as local_dlinoss  # noqa: E402
 from utils import (  # noqa: E402
     CaseSpec,
     filter_cases,
@@ -75,7 +75,7 @@ def _parse_args() -> argparse.Namespace:
         "--damped-linoss-root",
         type=Path,
         default=None,
-        help="Path to a checkout of https://github.com/jaredbmit/damped-linoss.",
+        help="Deprecated. Kept for backward compatibility; local JAX implementation is used.",
     )
     return parser.parse_args()
 
@@ -142,7 +142,6 @@ def _torch_batches(
     case: CaseSpec,
     *,
     device: torch.device,
-    dtype: torch.dtype,
     total_steps: int,
     seed: int,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
@@ -150,16 +149,17 @@ def _torch_batches(
     generator.manual_seed(seed)
     batches: list[tuple[torch.Tensor, torch.Tensor]] = []
     for _ in range(total_steps):
-        x = torch.randn(
-            (case.batch_size, case.seq_len, case.input_dim),
+        stream = torch.randint(
+            low=0,
+            high=case.input_dim,
+            size=(case.batch_size, case.seq_len + 1),
             generator=generator,
-            dtype=dtype,
-        ).to(device=device)
-        y = torch.randn(
-            (case.batch_size, case.seq_len, case.output_dim),
-            generator=generator,
-            dtype=dtype,
-        ).to(device=device)
+            dtype=torch.long,
+        )
+        x = stream[:, :-1]
+        y = stream[:, 1:]
+        x = x.to(device=device)
+        y = y.to(device=device)
         batches.append((x, y))
     return batches
 
@@ -178,6 +178,7 @@ def _build_torch_model(
             input_dim=case.input_dim,
             hidden_dim=case.hidden_dim,
             output_dim=case.output_dim,
+            block_size=case.seq_len,
             layers=case.layers,
             d_state=case.state_dim,
             expand=int(model_cfg.get("expand", case.expand)),
@@ -194,6 +195,7 @@ def _build_torch_model(
             input_dim=case.input_dim,
             hidden_dim=case.hidden_dim,
             output_dim=case.output_dim,
+            block_size=case.seq_len,
             layers=case.layers,
             d_state=case.state_dim,
             d_conv=int(model_cfg.get("d_conv", case.d_conv)),
@@ -227,7 +229,7 @@ def _torch_measure(
         model.train()
         optimizer.zero_grad(set_to_none=True)
         output = model(xb)
-        loss = F.mse_loss(output, yb)
+        loss = F.cross_entropy(output.reshape(-1, output.shape[-1]), yb.reshape(-1))
         loss.backward()
         if measure == "train_step":
             optimizer.step()
@@ -296,7 +298,6 @@ def benchmark_torch_model(
     batches = _torch_batches(
         case,
         device=torch_device,
-        dtype=torch_dtype,
         total_steps=total_steps,
         seed=seed,
     )
@@ -333,37 +334,16 @@ def benchmark_torch_model(
 
 
 class DampedLinossApi:
-    def __init__(self, root: Path) -> None:
-        src_root = root / "src"
-        if not src_root.is_dir():
-            raise FileNotFoundError(
-                f"Expected damped-linoss source tree under {src_root}."
-            )
-        if str(src_root) not in sys.path:
-            sys.path.insert(0, str(src_root))
-
-        create_model_mod = importlib.import_module("damped_linoss.models.create_model")
-        train_mod = importlib.import_module("damped_linoss.train")
+    def __init__(self) -> None:
         self.jax = importlib.import_module("jax")
         self.jnp = importlib.import_module("jax.numpy")
         self.jr = importlib.import_module("jax.random")
-        self.create_model = create_model_mod.create_model
-        self.create_optimizer = train_mod.create_optimizer
-        self.calc_output = train_mod.calc_output
-        self.regression_loss = train_mod.regression_loss
-        self.make_step = train_mod.make_step
-        self.count_params = train_mod.count_params
-
-
-def _resolve_damped_linoss_root(arg_root: Path | None) -> Path:
-    if arg_root is not None:
-        return arg_root.resolve()
-    env_root = os.environ.get("DAMPED_LINOSS_ROOT")
-    if env_root:
-        return Path(env_root).resolve()
-    raise RuntimeError(
-        "Damped-LinOSS checkout is required. Pass --damped-linoss-root or set DAMPED_LINOSS_ROOT."
-    )
+        self.create_model = local_dlinoss.create_model
+        self.create_optimizer = local_dlinoss.create_optimizer
+        self.calc_output = local_dlinoss.calc_output
+        self.regression_loss = local_dlinoss.regression_loss
+        self.make_step = local_dlinoss.make_step
+        self.count_params = local_dlinoss.count_params
 
 
 def _resolve_jax_dtype(api: DampedLinossApi, name: str) -> Any:
@@ -401,11 +381,18 @@ def _time_jax_call(api: DampedLinossApi, fn: Any) -> tuple[float, Any]:
     return (ended - started) * 1000.0, out
 
 
+def _prime_jax_cuda_timer(api: DampedLinossApi, *, device: Any) -> None:
+    """Run a tiny untimed device workload so JAX CUDA timing is initialized."""
+    x = api.jax.device_put(api.jnp.arange(4096, dtype=api.jnp.float32), device)
+    for _ in range(3):
+        x = api.jnp.sin(x) + 1.0
+        _block_jax_tree(api, x)
+
+
 def _jax_batches(
     api: DampedLinossApi,
     case: CaseSpec,
     *,
-    dtype: Any,
     device: Any,
     total_steps: int,
     seed: int,
@@ -413,17 +400,16 @@ def _jax_batches(
     key = api.jr.PRNGKey(seed)
     batches: list[tuple[Any, Any]] = []
     for _ in range(total_steps):
-        key, x_key, y_key = api.jr.split(key, 3)
-        x = api.jr.normal(
-            x_key,
-            (case.batch_size, case.seq_len, case.input_dim),
-            dtype=dtype,
+        key, stream_key = api.jr.split(key)
+        stream = api.jr.randint(
+            stream_key,
+            (case.batch_size, case.seq_len + 1),
+            minval=0,
+            maxval=case.input_dim,
+            dtype=api.jnp.int32,
         )
-        y = api.jr.normal(
-            y_key,
-            (case.batch_size, case.seq_len, case.output_dim),
-            dtype=dtype,
-        )
+        x = stream[:, :-1]
+        y = stream[:, 1:]
         batches.append((api.jax.device_put(x, device), api.jax.device_put(y, device)))
     return batches
 
@@ -431,6 +417,9 @@ def _jax_batches(
 def _build_jax_hparams(case: CaseSpec, model_cfg: dict[str, Any]) -> dict[str, Any]:
     return {
         "model_name": "LinOSS",
+        "task": "nextchar",
+        "vocab_size": int(case.input_dim),
+        "seq_len": int(case.seq_len),
         "layer_name": str(model_cfg["layer_name"]),
         "input_dim": int(case.input_dim),
         "state_dim": int(case.state_dim),
@@ -588,7 +577,8 @@ def benchmark_jax_model(
 ) -> dict[str, Any]:
     jax_device = _resolve_jax_device(api, str(experiment_cfg["jax_platform"]))
     jax_dtype_name = str(experiment_cfg["jax_dtype"])
-    jax_dtype = _resolve_jax_dtype(api, jax_dtype_name)
+    _resolve_jax_dtype(api, jax_dtype_name)
+    _prime_jax_cuda_timer(api, device=jax_device)
     warmup_steps = int(experiment_cfg["warmup_steps"])
     measure_steps = int(experiment_cfg["measure_steps"])
     total_steps = 1 + warmup_steps + measure_steps
@@ -611,7 +601,6 @@ def benchmark_jax_model(
     batches = _jax_batches(
         api,
         case,
-        dtype=jax_dtype,
         device=jax_device,
         total_steps=total_steps,
         seed=seed,
@@ -680,10 +669,9 @@ def main() -> int:
         for model_cfg in selected_models.values()
     )
     damped_api = None
-    damped_root = None
+    damped_root = None if args.damped_linoss_root is None else args.damped_linoss_root.resolve()
     if needs_damped_linoss:
-        damped_root = _resolve_damped_linoss_root(args.damped_linoss_root)
-        damped_api = DampedLinossApi(damped_root)
+        damped_api = DampedLinossApi()
 
     output_root = (
         args.output_root

@@ -1,0 +1,13 @@
+# Install from the SLinOSS repo root:
+#   pip install -r experiments/language_modeling/requirements.txt
+#
+# This experiment keeps LM-pretraining dependencies local so the repository-wide
+# package surface stays focused on the core SLinOSS code.
+
+-e .[cuda]
+datasets>=2.18
+transformers>=4.46,<5
+tiktoken>=0.8
+sentencepiece>=0.2
+# mamba-ssm is optional and only needed for side-by-side Mamba2 runs.
+mamba-ssm[causal-conv1d]>=2.2.2,<2.3.0; python_version < "3.12"
