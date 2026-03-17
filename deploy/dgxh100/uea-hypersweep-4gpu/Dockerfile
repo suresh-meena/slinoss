@@ -41,6 +41,8 @@ RUN set -eux; \
     wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh; \
     bash /tmp/miniconda.sh -b -p "${CONDA_DIR}"; \
     rm -f /tmp/miniconda.sh; \
+    "${CONDA_DIR}/bin/conda" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main; \
+    "${CONDA_DIR}/bin/conda" tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r; \
     "${CONDA_DIR}/bin/conda" create -y -n "${CONDA_ENV}" python=3.11 pip; \
     "${CONDA_DIR}/bin/conda" clean -afy; \
     if ! getent group "${GID}" >/dev/null; then groupadd -g "${GID}" "${USERNAME}"; fi; \
