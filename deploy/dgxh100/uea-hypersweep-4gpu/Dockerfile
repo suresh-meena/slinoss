@@ -43,15 +43,19 @@ COPY experiments/UEA /opt/slinoss/experiments/UEA
 COPY scripts /opt/slinoss/scripts
 COPY slinoss /opt/slinoss/slinoss
 
+ENV PYTHONPATH=/opt/slinoss
+
 RUN python -m pip install --upgrade pip setuptools wheel 'packaging>=24.2' && \
     python -m pip install --no-build-isolation \
     accelerate numpy tqdm matplotlib seaborn pyyaml && \
     MAX_JOBS=1 python3 setup.py build_ext --inplace && \
-    python -m pip install --no-build-isolation --no-deps -e . && \
     python - <<'PY'
+import sys
 import torch
+import slinoss
 from slinoss.ops.cconv1d import cconv1d_is_available, cconv1d_load_error
 
+print("pythonpath_ok", slinoss.__file__)
 print("torch", torch.__version__)
 print("torch_cuda", torch.version.cuda)
 print("cconv1d_cuda_available", cconv1d_is_available())
