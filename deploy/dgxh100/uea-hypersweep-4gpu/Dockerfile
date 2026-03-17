@@ -44,9 +44,10 @@ COPY scripts /opt/slinoss/scripts
 COPY slinoss /opt/slinoss/slinoss
 
 RUN python -m pip install --upgrade pip setuptools wheel 'packaging>=24.2' && \
-    python -m pip install --no-build-isolation accelerate numpy tqdm matplotlib seaborn pyyaml && \
+    python -m pip install --no-build-isolation \
+    accelerate numpy tqdm matplotlib seaborn pyyaml && \
     MAX_JOBS=1 python3 setup.py build_ext --inplace && \
-    MAX_JOBS=1 python -m pip install --no-build-isolation -e '.[cuda]' && \
+    python -m pip install --no-build-isolation --no-deps -e . && \
     python - <<'PY'
 import torch
 from slinoss.ops.cconv1d import cconv1d_is_available, cconv1d_load_error
@@ -56,6 +57,7 @@ print("torch_cuda", torch.version.cuda)
 print("cconv1d_cuda_available", cconv1d_is_available())
 print("cconv1d_load_error", cconv1d_load_error())
 PY
+
 
 ENV HOME=/home/${USERNAME}
 USER ${USERNAME}
