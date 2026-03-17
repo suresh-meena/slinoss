@@ -63,9 +63,13 @@ COPY experiments/UEA /opt/slinoss/experiments/UEA
 COPY scripts /opt/slinoss/scripts
 COPY slinoss /opt/slinoss/slinoss
 
-# The extension build imports torch from setup.py, so no-build-isolation is
-# required to make the already-installed torch visible during the editable build.
-RUN python -m pip install --no-build-isolation -e '.[cuda]' && \
+# Build the vendored causal-conv1d extension in-place once, then install the
+# package. This matches the requested repo workflow for the latest pull.
+RUN python3 setup.py build_ext --inplace && \
+    \
+    # The extension build imports torch from setup.py, so no-build-isolation is
+    # required to make the already-installed torch visible during the editable build.
+    python -m pip install --no-build-isolation -e '.[cuda]' && \
     python - <<'PY'
 import torch
 from slinoss.ops.cconv1d import cconv1d_is_available, cconv1d_load_error
@@ -78,4 +82,3 @@ PY
 
 ENV HOME=/home/${USERNAME}
 USER ${USERNAME}
-
