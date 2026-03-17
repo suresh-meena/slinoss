@@ -95,7 +95,8 @@ def plot_run_metrics(summary: dict[str, Any], out_dir: Path) -> None:
 
     fig, axes = plt.subplots(1, 2, figsize=(16, 6))
     config = summary["config"]
-    title = f"{config['dataset']} | {config['run_name']}"
+    run_name = config.get("run_name", out_dir.name)
+    title = f"{config['dataset']} | {run_name}"
 
     sns.lineplot(data=history, x="epoch", y="train_loss", ax=axes[0], label="Train", linewidth=2.0)
     sns.lineplot(data=history, x="epoch", y="val_loss", ax=axes[0], label="Val", linewidth=2.0)
@@ -148,13 +149,14 @@ def generate_run_report(summary: dict[str, Any], out_dir: Path) -> None:
 
     best = _best_epoch_row(history)
     last = history.iloc[-1]
+    run_name = config.get("run_name", out_dir.name)
 
     report: list[str] = []
     report.append("=" * 64)
     report.append("UEA SLinOSS RUN REPORT")
     report.append("=" * 64)
     report.append(f"Dataset:         {config['dataset']}")
-    report.append(f"Run name:        {config['run_name']}")
+    report.append(f"Run name:        {run_name}")
     report.append(f"Epochs trained:  {int(last['epoch'])}")
     report.append(f"Best epoch:      {int(best['epoch'])}")
     report.append(f"Best val acc:    {best['val_acc']:.4f}")
@@ -394,7 +396,8 @@ def main() -> None:
 
     if results_path.exists():
         results = _load_json(results_path)
-        _require(isinstance(results, list), f"Expected {results_path} to contain a list.")
+        if not isinstance(results, list):
+            raise ValueError(f"Expected {results_path} to contain a list.")
         plot_sweep_results(results, path)
         generate_sweep_report(results, path)
         return

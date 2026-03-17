@@ -26,10 +26,18 @@ _SECTION_FIELDS: dict[str, dict[str, str]] = {
         "val_fraction": "val_fraction",
         "include_time": "include_time",
         "normalize": "normalize",
+        "split_strategy": "split_strategy",
     },
     "training": {
         "seed": "seed",
+        "seeds": "seeds",
         "epochs": "epochs",
+        "num_steps": "num_steps",
+        "print_steps": "print_steps",
+        "early_stopping_evals": "early_stopping_evals",
+        "mixed_precision": "mixed_precision",
+        "torch_compile": "torch_compile",
+        "torch_compile_mode": "torch_compile_mode",
         "batch_size": "batch_size",
         "num_workers": "num_workers",
         "lr": "lr",
@@ -39,12 +47,24 @@ _SECTION_FIELDS: dict[str, dict[str, str]] = {
     "model": {
         "d_model": "d_model",
         "n_layers": "n_layers",
+        "norm_type": "norm_type",
+        "ffn_activation": "ffn_activation",
+        "ffn_mult": "ffn_mult",
         "d_state": "d_state",
         "expand": "expand",
         "d_head": "d_head",
         "d_conv": "d_conv",
         "chunk_size": "chunk_size",
         "dropout": "dropout",
+        "dt_min": "dt_min",
+        "dt_max": "dt_max",
+        "dt_init_floor": "dt_init_floor",
+        "r_min": "r_min",
+        "r_max": "r_max",
+        "theta_bound": "theta_bound",
+        "k_max": "k_max",
+        "eps": "eps",
+        "normalize_bc": "normalize_bc",
     },
     "backend": {
         "scan_backend": "scan_backend",
@@ -52,7 +72,7 @@ _SECTION_FIELDS: dict[str, dict[str, str]] = {
 }
 _KNOWN_SECTION_KEYS = set(_SECTION_FIELDS) | {"datasets", "sweep"}
 _DEFAULT_RUNS_ROOT = "experiments/UEA/runs"
-_DEFAULT_SCAN_BACKEND = "auto"
+_DEFAULT_SCAN_BACKEND = "reference"
 _VALID_SCAN_BACKENDS = {"auto", "cute", "reference"}
 
 
@@ -116,11 +136,6 @@ def _validate_top_level_config(config: Mapping[str, Any]) -> None:
         if section_values is None:
             continue
         _require(isinstance(section_values, dict), f"{section} must be a mapping.")
-        unknown_fields = sorted(set(section_values) - set(fields))
-        _require(
-            not unknown_fields,
-            f"Unsupported keys in {section}: {', '.join(unknown_fields)}.",
-        )
 
     datasets = _ensure_mapping(config.get("datasets"), label="datasets")
     for dataset_name, dataset_cfg in datasets.items():
@@ -141,20 +156,16 @@ def _validate_top_level_config(config: Mapping[str, Any]) -> None:
                 isinstance(section_values, dict),
                 f"datasets.{dataset_name}.{section} must be a mapping.",
             )
-            unknown_fields = sorted(set(section_values) - set(fields))
-            _require(
-                not unknown_fields,
-                (
-                    f"Unsupported keys in datasets.{dataset_name}.{section}: "
-                    f"{', '.join(unknown_fields)}."
-                ),
-            )
 
 
 def _flatten_sections(config: Mapping[str, Any]) -> dict[str, Any]:
     flat: dict[str, Any] = {}
     for section, fields in _SECTION_FIELDS.items():
         values = _ensure_mapping(config.get(section), label=section)
+        # Add all fields as-is from the section
+        for k, v in values.items():
+            flat[k] = deepcopy(v)
+        # Apply specific renames (e.g., 'root' -> 'data_root')
         for source_key, dest_key in fields.items():
             if source_key in values:
                 flat[dest_key] = deepcopy(values[source_key])
@@ -166,6 +177,12 @@ def _runtime_defaults() -> dict[str, Any]:
         "runs_root": _DEFAULT_RUNS_ROOT,
         "scan_backend": _DEFAULT_SCAN_BACKEND,
         "normalize": True,
+        "split_strategy": "official",
+        "print_steps": 1000,
+        "early_stopping_evals": 10,
+        "mixed_precision": "bf16" if torch.cuda.is_available() else "no",
+        "torch_compile": False,
+        "torch_compile_mode": "default",
     }
 
 
@@ -175,7 +192,6 @@ def _validate_runtime_config(config: Mapping[str, Any]) -> None:
         "data_root",
         "val_fraction",
         "seed",
-        "epochs",
         "batch_size",
         "num_workers",
         "lr",
@@ -197,7 +213,17 @@ def _validate_runtime_config(config: Mapping[str, Any]) -> None:
 
     _require(0.0 < float(config["val_fraction"]) < 1.0, "val_fraction must be in (0, 1).")
     _require(int(config["seed"]) >= 0, "seed must be non-negative.")
-    _require(int(config["epochs"]) > 0, "epochs must be positive.")
+    if "epochs" in config:
+        _require(int(config["epochs"]) > 0, "epochs must be positive.")
+    if "num_steps" in config:
+        _require(int(config["num_steps"]) > 0, "num_steps must be positive.")
+    if "print_steps" in config:
+        _require(int(config["print_steps"]) > 0, "print_steps must be positive.")
+    _require(
+        "epochs" in config or "num_steps" in config,
+        "Either epochs or num_steps must be provided.",
+    )
+    _require(int(config.get("early_stopping_evals", 10)) >= 0, "early_stopping_evals must be non-negative.")
     _require(int(config["batch_size"]) > 0, "batch_size must be positive.")
     _require(int(config["num_workers"]) >= 0, "num_workers must be non-negative.")
     _require(float(config["lr"]) > 0.0, "lr must be positive.")
@@ -219,6 +245,15 @@ def _validate_runtime_config(config: Mapping[str, Any]) -> None:
         config["scan_backend"] in _VALID_SCAN_BACKENDS,
         f"scan_backend must be one of {sorted(_VALID_SCAN_BACKENDS)}.",
     )
+    _require(
+        str(config.get("split_strategy", "official")) in {"official", "linoss_701515"},
+        "split_strategy must be one of ['official', 'linoss_701515'].",
+    )
+    seeds = config.get("seeds")
+    if seeds is not None:
+        _require(isinstance(seeds, list) and len(seeds) > 0, "seeds must be a non-empty list.")
+        for s in seeds:
+            _require(int(s) >= 0, "all seeds must be non-negative.")
 
 
 def get_available_datasets(config: Mapping[str, Any]) -> list[str]:
@@ -351,6 +386,24 @@ def configure_optimizer(
     ]
     use_fused = any(param.is_cuda for param in decay) or any(param.is_cuda for param in no_decay)
     return torch.optim.AdamW(groups, lr=lr, betas=(0.9, 0.95), fused=use_fused)
+
+
+def resolve_mixed_precision(value: Any) -> str:
+    """Normalize config mixed precision values for Accelerate."""
+    if isinstance(value, bool):
+        return "bf16" if value and torch.cuda.is_available() else "no"
+
+    if value is None:
+        return "bf16" if torch.cuda.is_available() else "no"
+
+    normalized = str(value).strip().lower()
+    if normalized in {"false", "no", "off", "none"}:
+        return "no"
+    if normalized in {"true", "on"}:
+        return "bf16" if torch.cuda.is_available() else "no"
+    if normalized in {"no", "fp8", "fp16", "bf16"}:
+        return normalized
+    raise ValueError("mixed_precision must be one of ['no', 'fp8', 'fp16', 'bf16'].")
 
 
 def setup_logging(log_dir: Path, run_name: str) -> logging.Logger:
