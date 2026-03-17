@@ -1,21 +1,17 @@
 #!/bin/bash
-#SBATCH --job-name=uea_hypersweep4
-#SBATCH --gres=gpu:4
+#SBATCH --job-name=uea_hypersweep2
+#SBATCH --partition=q_1day-2G
+#SBATCH --gres=gpu:2
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=32
-#SBATCH --mem=192G
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=96G
 #SBATCH --time=24:00:00
 #SBATCH --signal=B:USR1@600
 #SBATCH --output=%x_%j.out
 #SBATCH --error=%x_%j.err
 
-# Submit with an explicit 4-GPU partition after confirming it exists on DGX-H100:
-#   sinfo
-#   sbatch --partition <4gpu_partition_name> deploy/dgxh100/uea-hypersweep-4gpu/job.sbatch
-#
-# The audited SERC DGX-H100 queue notes bundled in this repo were last updated on
-# 2026-03-08 and list only 1-GPU and 2-GPU partitions, so do not hardcode a
-# 4-GPU partition here unless you have verified one on your account.
+# DGX-H100 currently exposes q_1day-2G in sinfo, so this job targets the
+# published 1-day 2-GPU queue directly.
 
 set -euo pipefail
 
@@ -45,8 +41,8 @@ fi
 
 mkdir -p "${HOME_HOST}"
 
-CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-32}"
-THREADS_PER_RANK="${OMP_NUM_THREADS_OVERRIDE:-$(( (CPUS_PER_TASK + 3) / 4 ))}"
+CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-16}"
+THREADS_PER_RANK="${OMP_NUM_THREADS_OVERRIDE:-$(( (CPUS_PER_TASK + 1) / 2 ))}"
 export OMP_NUM_THREADS="${THREADS_PER_RANK}"
 export MKL_NUM_THREADS="${THREADS_PER_RANK}"
 export NCCL_DEBUG="${NCCL_DEBUG:-warn}"
@@ -98,8 +94,8 @@ count = torch.cuda.device_count()
 print(f"[container] visible_gpus={count}")
 for i in range(count):
     print(f"[container] gpu[{i}]={torch.cuda.get_device_name(i)}")
-if count != 4:
-    raise SystemExit(f"Expected 4 visible GPUs, got {count}.")
+if count != 2:
+    raise SystemExit(f"Expected 2 visible GPUs, got {count}.")
 PY
 
 read -r -a DATASETS <<< "$DATASETS_STR"
@@ -116,7 +112,7 @@ fi
 
 launch_args=(
   --multi_gpu
-  --num_processes 4
+  --num_processes 2
   --num_machines 1
   --mixed_precision "${MIXED_PRECISION}"
   --main_process_port "${MASTER_PORT}"
@@ -145,4 +141,3 @@ trap "echo \"[container] got SIGTERM -> forwarding\"; kill -TERM -${LAUNCH_PID} 
 wait "${LAUNCH_PID}"
 echo "[container] sweep complete"
 '
-
