@@ -43,7 +43,7 @@ COPY experiments/UEA /opt/slinoss/experiments/UEA
 COPY scripts /opt/slinoss/scripts
 COPY slinoss /opt/slinoss/slinoss
 
-RUN python -m pip install --upgrade pip setuptools wheel && \
+RUN python -m pip install --upgrade pip setuptools wheel packaging>=24.2 && \
     python -m pip install --no-build-isolation accelerate numpy tqdm matplotlib seaborn pyyaml && \
     python3 setup.py build_ext --inplace && \
     python -m pip install --no-build-isolation -e '.[cuda]' && \
