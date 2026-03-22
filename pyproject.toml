@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = ["setuptools>=69", "wheel", "torch==2.10.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.11, <3.13"
 license = "MIT"
 dependencies = [
-  "torch>=2.4,<2.10",
+  "torch==2.10.0,<2.10",
   "accelerate>=1.13.0",
   "numpy>=1.26",
   "tqdm>=4.66",
@@ -27,6 +27,7 @@ cuda = [
   "nvidia-cuda-nvcc-cu12>=12.1,<12.9",
 ]
 dev = [
+  "build>=1.2",
   "pytest>=8",
   "ruff>=0.9.5",
   "pyright>=1.1.400",

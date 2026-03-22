@@ -5,8 +5,6 @@ from __future__ import annotations
 import torch
 
 from slinoss.layers.backend import ScanInputs
-from slinoss.ops.scanprep.cute.autograd import scanprep_cute_training_autograd
-from slinoss.ops.scanprep.cute.fwd import scanprep_fwd_cute
 
 
 def scanprep_cute(
@@ -40,11 +38,11 @@ def scanprep_cute(
     Public contract:
     - ``value``: ``(B, T, H * P)`` post-conv/post-activation mixer values
     - ``params``: ``(B, T, H * 13)`` flat scanprep parameter stream
-    - ``bc``: ``(B, T, H, 4, N)`` projected ``bc_proj(value)`` output
+    - ``bc``: ``(B, T, H, 4, N)`` mixer-emitted BC tensor
     - output: packed scan-native ``(U, M, K, B, C)``
 
     Design constraints:
-    - ``bc_proj`` stays outside this backend
+    - BC generation stays outside this backend
     - this boundary is training-only for now
     - the default eager/reference backend remains the source of truth until the
       fused CuTe implementation is complete
@@ -94,6 +92,8 @@ def scanprep_cute(
         )
     )
     if grads_enabled:
+        from slinoss.ops.scanprep.cute.autograd import scanprep_cute_training_autograd
+
         U, M, K, B, C = scanprep_cute_training_autograd(
             value,
             params,
@@ -120,6 +120,8 @@ def scanprep_cute(
             c_scale=c_scale,
         )
         return ScanInputs(U=U, M=M, K=K, B=B, C=C)
+
+    from slinoss.ops.scanprep.cute.fwd import scanprep_fwd_cute
 
     U, M, K, B, C = scanprep_fwd_cute(
         value,
