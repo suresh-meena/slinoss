@@ -41,6 +41,9 @@ The end-to-end kernel consumes raw stage inputs:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+import torch
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
@@ -48,8 +51,36 @@ import cutlass.utils as utils
 LOG2_E = 1.4426950408889634
 
 
+@dataclass(frozen=True)
+class ChunkScanSupportInfo:
+    tile_family_ok: bool
+    expected_m_block_size: int | None
+    smem_capacity_bytes: int
+    compute_smem_bytes: int
+    output_smem_bytes: int
+
+    @property
+    def required_smem_bytes(self) -> int:
+        return max(self.compute_smem_bytes, self.output_smem_bytes)
+
+    @property
+    def supported(self) -> bool:
+        return (
+            self.tile_family_ok and self.required_smem_bytes <= self.smem_capacity_bytes
+        )
+
+
 class ChunkScanFwdInnerAmpere:
     """Ampere tensor-core inner kernel for the ``v2`` chunk-scan stage."""
+
+    _SUPPORTED_TILE_FAMILIES: tuple[tuple[int, int], ...] = (
+        (64, 128),
+        (32, 64),
+        (16, 32),
+    )
+    _EXPECTED_M_BLOCK_BY_THREADS = {
+        threads: m_block for m_block, threads in _SUPPORTED_TILE_FAMILIES
+    }
 
     def __init__(
         self,
@@ -95,35 +126,90 @@ class ChunkScanFwdInnerAmpere:
     def n_complex(self) -> int:
         return self.D // 2
 
+    @property
+    def num_warps(self) -> int:
+        return self.num_threads // 32
+
+    def _expected_m_block_size(self) -> int | None:
+        return self._EXPECTED_M_BLOCK_BY_THREADS.get(self.num_threads)
+
+    def _tile_family_supported(self) -> bool:
+        expected = self._expected_m_block_size()
+        return (
+            expected is not None
+            and self.m_block_size == expected
+            and self.m_block_size <= self.L
+        )
+
+    def _smem_capacity_bytes(self, device_index: int | None = None) -> int:
+        if torch.cuda.is_available():
+            if device_index is None:
+                device_index = torch.cuda.current_device()
+            props = torch.cuda.get_device_properties(int(device_index))
+            capacity = int(getattr(props, "shared_memory_per_block_optin", 0))
+            if capacity > 0:
+                return capacity
+            cc = f"sm_{props.major}{props.minor}"
+            return int(utils.get_smem_capacity_in_bytes(cc))
+        return int(utils.get_smem_capacity_in_bytes("sm_80"))
+
+    def _q_smem_elems(self) -> int:
+        return int(self.m_block_size) * int(self.D_padded)
+
+    def _b_smem_elems(self) -> int:
+        return int(max(self.P_padded, self.n_block_size)) * int(self.D_padded)
+
+    def _v_smem_elems(self) -> int:
+        return int(self.n_block_size) * int(self.P_padded)
+
+    def _o_smem_elems(self) -> int:
+        return int(self.m_block_size) * int(self.P_padded)
+
+    def _compute_smem_bytes(self, dtype: type[cutlass.Numeric]) -> int:
+        in_bytes = dtype.width // 8
+        # The swizzled shared layouts preserve the dense tile extent; they only
+        # permute addresses within the allocated tile.
+        return (
+            self._q_smem_elems() * in_bytes
+            + self._b_smem_elems() * in_bytes
+            + self._v_smem_elems() * in_bytes
+            + (self.m_block_size + self.n_block_size) * 4
+        )
+
+    def _output_smem_bytes(self, out_dtype: type[cutlass.Numeric]) -> int:
+        out_bytes = out_dtype.width // 8
+        return self._o_smem_elems() * out_bytes
+
+    def support_info(
+        self,
+        dtype: type[cutlass.Numeric],
+        out_dtype: type[cutlass.Numeric],
+        *,
+        device_index: int | None = None,
+    ) -> ChunkScanSupportInfo:
+        if dtype not in (cutlass.Float16, cutlass.BFloat16):
+            return ChunkScanSupportInfo(False, self._expected_m_block_size(), 0, 0, 0)
+        if out_dtype not in (cutlass.Float16, cutlass.BFloat16, cutlass.Float32):
+            return ChunkScanSupportInfo(False, self._expected_m_block_size(), 0, 0, 0)
+        if self.D % 8 != 0 or self.P % 8 != 0:
+            return ChunkScanSupportInfo(False, self._expected_m_block_size(), 0, 0, 0)
+
+        return ChunkScanSupportInfo(
+            tile_family_ok=self._tile_family_supported(),
+            expected_m_block_size=self._expected_m_block_size(),
+            smem_capacity_bytes=self._smem_capacity_bytes(device_index),
+            compute_smem_bytes=self._compute_smem_bytes(dtype),
+            output_smem_bytes=self._output_smem_bytes(out_dtype),
+        )
+
     def can_implement(
         self,
         dtype: type[cutlass.Numeric],
         out_dtype: type[cutlass.Numeric],
+        *,
+        device_index: int | None = None,
     ) -> bool:
-        if dtype not in (cutlass.Float16, cutlass.BFloat16):
-            return False
-        if out_dtype not in (cutlass.Float16, cutlass.BFloat16, cutlass.Float32):
-            return False
-        if self.D % 8 != 0 or self.P % 8 != 0:
-            return False
-
-        smem_capacity = utils.get_smem_capacity_in_bytes("sm_80")
-        in_bytes = dtype.width // 8
-        out_bytes = out_dtype.width // 8
-
-        Dp = self.D_padded
-        Pp = self.P_padded
-        m = self.m_block_size
-        n = self.n_block_size
-
-        compute_smem = 0
-        compute_smem += m * Dp * in_bytes
-        compute_smem += max(Pp, n) * Dp * in_bytes
-        compute_smem += n * Pp * in_bytes
-        compute_smem += (m + n) * 4
-
-        out_smem = (m * Pp) * out_bytes
-        return max(compute_smem, out_smem) <= smem_capacity
+        return self.support_info(dtype, out_dtype, device_index=device_index).supported
 
     @cute.jit
     def __call__(
@@ -838,29 +924,16 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
         self,
         dtype: type[cutlass.Numeric],
         out_dtype: type[cutlass.Numeric],
+        *,
+        device_index: int | None = None,
     ) -> bool:
-        if not super().can_implement(dtype, out_dtype):
-            return False
+        return self.support_info(dtype, out_dtype, device_index=device_index).supported
 
-        smem_capacity = utils.get_smem_capacity_in_bytes("sm_80")
-        in_bytes = dtype.width // 8
-        out_bytes = out_dtype.width // 8
-        Dp = self.D_padded
-        Pp = self.P_padded
-        m = self.m_block_size
-        n = self.n_block_size
-
-        compute_smem = 0
-        compute_smem += m * Dp * in_bytes
-        compute_smem += max(Pp, n) * Dp * in_bytes
-        compute_smem += n * Pp * in_bytes
-        compute_smem += (m + n) * 4
-
-        compute_smem += (1 + 2 + 4) * self.L * 4
-        compute_smem += (32 + 32 + 32 * 2 + 32 * 2) * 4
-
-        out_smem = (m * Pp) * out_bytes
-        return max(compute_smem, out_smem) <= smem_capacity
+    def _compute_smem_bytes(self, dtype: type[cutlass.Numeric]) -> int:
+        base = super()._compute_smem_bytes(dtype)
+        meta_bytes = (1 + 2) * self.L * 4
+        meta_bytes += 6 * self.num_warps * 4
+        return base + meta_bytes
 
     @cute.jit
     def __call__(
@@ -978,8 +1051,8 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
 
         in_bytes = in_dtype.width // 8
         out_bytes = out_dtype.width // 8
-        meta_bytes = (1 + 2 + 4) * self.L * 4
-        meta_bytes += (32 + 32 + 32 * 2 + 32 * 2) * 4
+        meta_bytes = (1 + 2) * self.L * 4
+        meta_bytes += 6 * self.num_warps * 4
         compute_smem = (
             cute.cosize(sQ_layout) * in_bytes
             + cute.cosize(sB_layout) * in_bytes
@@ -1066,22 +1139,18 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
         s_logpref = smem.allocate_tensor(cutlass.Float32, cute.make_layout((L,)), 4)
         s_phase_re = smem.allocate_tensor(cutlass.Float32, cute.make_layout((L,)), 4)
         s_phase_im = smem.allocate_tensor(cutlass.Float32, cute.make_layout((L,)), 4)
-        s_tp_re = smem.allocate_tensor(cutlass.Float32, cute.make_layout((L,)), 4)
-        s_tp_im = smem.allocate_tensor(cutlass.Float32, cute.make_layout((L,)), 4)
-        s_tc_re = smem.allocate_tensor(cutlass.Float32, cute.make_layout((L,)), 4)
-        s_tc_im = smem.allocate_tensor(cutlass.Float32, cute.make_layout((L,)), 4)
-
+        num_warps = self.num_warps
         warp_log_total = smem.allocate_tensor(
-            cutlass.Float32, cute.make_layout((32,), stride=(1,)), 4
+            cutlass.Float32, cute.make_layout((num_warps,), stride=(1,)), 4
         )
         warp_log_offset = smem.allocate_tensor(
-            cutlass.Float32, cute.make_layout((32,), stride=(1,)), 4
+            cutlass.Float32, cute.make_layout((num_warps,), stride=(1,)), 4
         )
         warp_phase_total = smem.allocate_tensor(
-            cutlass.Float32, cute.make_layout((32, 2), stride=(2, 1)), 8
+            cutlass.Float32, cute.make_layout((num_warps, 2), stride=(2, 1)), 8
         )
         warp_phase_offset = smem.allocate_tensor(
-            cutlass.Float32, cute.make_layout((32, 2), stride=(2, 1)), 8
+            cutlass.Float32, cute.make_layout((num_warps, 2), stride=(2, 1)), 8
         )
 
         sVt = cute.composition(sV, cute.make_layout((Pp, n), stride=(n, 1)))
@@ -1092,10 +1161,6 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
         lp = cutlass.Float32(0.0)
         pr = cutlass.Float32(1.0)
         pi = cutlass.Float32(0.0)
-        kp_re = cutlass.Float32(0.0)
-        kp_im = cutlass.Float32(0.0)
-        kc_re = cutlass.Float32(0.0)
-        kc_im = cutlass.Float32(0.0)
 
         if tidx < L:
             mr = cutlass.Float32(mM[bhc, tt, 0])
@@ -1105,11 +1170,6 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
             pr = mr * inv_mag
             pi = mi * inv_mag
             lp = cute.math.log2(mag2, fastmath=False) * cutlass.Float32(0.5 / LOG2_E)
-
-            kp_re = cutlass.Float32(mK[bhc, tt, 0, 0])
-            kp_im = cutlass.Float32(mK[bhc, tt, 0, 1])
-            kc_re = cutlass.Float32(mK[bhc, tt, 1, 0])
-            kc_im = cutlass.Float32(mK[bhc, tt, 1, 1])
 
         logp = lp
         for offset in (1, 2, 4, 8, 16):
@@ -1196,15 +1256,6 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
             s_logpref[tt] = logp
             s_phase_re[tt] = pr
             s_phase_im[tt] = pi
-
-            tpr = kp_re * pr + kp_im * pi
-            tpi = kp_im * pr - kp_re * pi
-            tcr = kc_re * pr + kc_im * pi
-            tci = kc_im * pr - kc_re * pi
-            s_tp_re[tt] = tpr
-            s_tp_im[tt] = tpi
-            s_tc_re[tt] = tcr
-            s_tc_im[tt] = tci
 
         cute.arch.barrier()
 
@@ -1443,12 +1494,13 @@ class ChunkScanFwdAmpere(ChunkScanFwdInnerAmpere):
                 tr = cutlass.Float32(0.0)
                 ti = cutlass.Float32(0.0)
                 if cute.elem_less(key_idx, L):
-                    if prev:
-                        tr = cutlass.Float32(s_tp_re[key_idx])
-                        ti = cutlass.Float32(s_tp_im[key_idx])
-                    else:
-                        tr = cutlass.Float32(s_tc_re[key_idx])
-                        ti = cutlass.Float32(s_tc_im[key_idx])
+                    tap_idx = 0 if cutlass.const_expr(prev) else 1
+                    tap_re = cutlass.Float32(mK[bhc, key_idx, tap_idx, 0])
+                    tap_im = cutlass.Float32(mK[bhc, key_idx, tap_idx, 1])
+                    phase_re = cutlass.Float32(s_phase_re[key_idx])
+                    phase_im = cutlass.Float32(s_phase_im[key_idx])
+                    tr = tap_re * phase_re + tap_im * phase_im
+                    ti = tap_im * phase_re - tap_re * phase_im
 
                 kre = bre * tr - bim * ti
                 kim = bre * ti + bim * tr

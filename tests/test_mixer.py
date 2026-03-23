@@ -154,6 +154,31 @@ def test_mixer_backward_supports_issue_2_shape() -> None:
             assert torch.isfinite(param.grad).all()
 
 
+def test_mixer_forward_supports_issue_3_shape() -> None:
+    if not torch.cuda.is_available():
+        return
+
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+    mixer = SLinOSSMixer(
+        256,
+        d_state=256,
+        expand=1,
+        d_head=64,
+        d_conv=4,
+        chunk_size=64,
+        normalize_bc=True,
+        device="cuda",
+        dtype=torch.float16,
+    )
+    x = torch.randn((1, 65, 256), device="cuda", dtype=torch.float16)
+
+    y = mixer(x)
+
+    assert y.shape == (1, 65, 256)
+    assert torch.isfinite(y).all()
+
+
 def test_mixer_step_matches_full_forward() -> None:
     torch.manual_seed(1)
     mixer = _make_mixer()

@@ -6,6 +6,7 @@ import torch
 
 from slinoss.ops.v2x2ssd import v2x2ssd, v2x2ssd_cute
 from slinoss.ops.v2x2ssd.cute.kernels.fwd import (
+    _resolve_chunk_scan_launch_cfg,
     compile_chunk_scan_kernel,
     chunk_scan_cute,
     state_passing_cute,
@@ -30,6 +31,7 @@ def _make_scan_inputs(
     N: int,
     P: int,
     device: torch.device,
+    value_dtype: torch.dtype = torch.float32,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -50,9 +52,9 @@ def _make_scan_inputs(
     ) * 0.1
     K = torch.view_as_real(K_complex).to(torch.float32).contiguous()
 
-    U = torch.randn((batch, heads, T, P), device=device, dtype=torch.float32)
-    B = torch.randn((batch, heads, T, 2 * N), device=device, dtype=torch.float32) * 0.1
-    C = torch.randn((batch, heads, T, 2 * N), device=device, dtype=torch.float32) * 0.1
+    U = torch.randn((batch, heads, T, P), device=device, dtype=value_dtype)
+    B = torch.randn((batch, heads, T, 2 * N), device=device, dtype=value_dtype) * 0.1
+    C = torch.randn((batch, heads, T, 2 * N), device=device, dtype=value_dtype) * 0.1
     initial_states = torch.randn(
         (batch, heads, P, 2 * N), device=device, dtype=torch.float32
     )
@@ -64,6 +66,36 @@ def _make_scan_inputs(
     B_prev = _pack_complex_pairs(b_prev, real_dtype=torch.float32)
     U_prev = torch.randn((batch, heads, P), device=device, dtype=torch.float32)
     return U, M, K, B, C, initial_states, B_prev, U_prev
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_chunk_scan_launch_cfg_falls_back_for_issue_3_shape() -> None:
+    pytest.importorskip("cutlass")
+
+    device_index = torch.cuda.current_device()
+    assert _resolve_chunk_scan_launch_cfg(
+        D=512,
+        P=64,
+        L=64,
+        tc_dtype=torch.float16,
+        output_dtype=torch.float16,
+        device_index=device_index,
+        requested_m_block_size=None,
+        requested_n_block_size=64,
+        requested_num_threads=128,
+    ) == (32, 16, 64)
+
+    assert _resolve_chunk_scan_launch_cfg(
+        D=256,
+        P=64,
+        L=64,
+        tc_dtype=torch.float16,
+        output_dtype=torch.float16,
+        device_index=device_index,
+        requested_m_block_size=None,
+        requested_n_block_size=64,
+        requested_num_threads=128,
+    ) == (64, 64, 128)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -230,6 +262,71 @@ def test_chunk_scan_cute_matches_reference_stage() -> None:
     )
 
     torch.testing.assert_close(y_cute, y_ref, atol=2e-2, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_chunk_scan_cute_matches_reference_stage_issue_3_shape() -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    U, M, K, B, C, _initial_states, _B_prev, _U_prev = _make_scan_inputs(
+        batch=2,
+        heads=4,
+        T=65,
+        N=256,
+        P=64,
+        device=torch.device("cuda"),
+        value_dtype=torch.float16,
+    )
+    chunk_size = 64
+
+    inc_ref, m_ref = chunk_increment(
+        U,
+        M,
+        K,
+        B,
+        B_prev=None,
+        U_prev=None,
+        T=U.shape[2],
+        chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+    )
+    starts_ref, _ = state_passing(
+        inc_ref,
+        m_ref,
+        initial_states=None,
+        compute_dtype=torch.float32,
+    )
+
+    y_ref = chunk_scan(
+        U,
+        M,
+        K,
+        B,
+        C,
+        starts_ref,
+        B_prev=None,
+        U_prev=None,
+        T=U.shape[2],
+        chunk_size=chunk_size,
+        output_dtype=torch.float32,
+        compute_dtype=torch.float32,
+    )
+    y_cute = chunk_scan_cute(
+        U,
+        M,
+        K,
+        B,
+        C,
+        starts_ref,
+        B_prev=None,
+        U_prev=None,
+        chunk_size=chunk_size,
+        output_dtype=torch.float32,
+        compute_dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(y_cute, y_ref, atol=1e-3, rtol=0.0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

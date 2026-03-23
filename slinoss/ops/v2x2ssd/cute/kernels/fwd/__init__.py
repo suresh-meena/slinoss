@@ -110,6 +110,129 @@ def _resolve_chunk_scan_n_block_size(L: int, requested: int) -> int:
     )
 
 
+def _iter_chunk_scan_n_block_candidates(L: int, requested: int):
+    candidate = _resolve_chunk_scan_n_block_size(L, requested)
+    while candidate >= 16:
+        if L % candidate == 0:
+            yield candidate
+        candidate -= 16
+
+
+def _chunk_scan_supported_tile_families(L: int) -> tuple[tuple[int, int], ...]:
+    return tuple(
+        (m_block_size, num_threads)
+        for m_block_size, num_threads in ChunkScanFwdAmpere._SUPPORTED_TILE_FAMILIES
+        if m_block_size <= L
+    )
+
+
+def _chunk_scan_device_label(device_index: int) -> str:
+    props = torch.cuda.get_device_properties(device_index)
+    return f"{props.name} (sm_{props.major}{props.minor})"
+
+
+def _resolve_chunk_scan_launch_cfg(
+    *,
+    D: int,
+    P: int,
+    L: int,
+    tc_dtype: torch.dtype,
+    output_dtype: torch.dtype,
+    device_index: int,
+    requested_m_block_size: int | None,
+    requested_n_block_size: int,
+    requested_num_threads: int,
+) -> tuple[int, int, int]:
+    supported_families = _chunk_scan_supported_tile_families(L)
+    if not supported_families:
+        raise ValueError(
+            f"chunk_size={L} is too small for the CuTe chunk_scan tile families; "
+            "supported chunk sizes must be at least 16."
+        )
+
+    requested_num_threads = int(requested_num_threads)
+    if requested_m_block_size is not None:
+        resolved_m_block_size = int(requested_m_block_size)
+        family = next(
+            (
+                (m_block_size, num_threads)
+                for m_block_size, num_threads in supported_families
+                if m_block_size == resolved_m_block_size
+            ),
+            None,
+        )
+        if family is None:
+            supported_m = ", ".join(
+                str(m_block_size) for m_block_size, _ in supported_families
+            )
+            raise ValueError(
+                f"Unsupported chunk_scan m_block_size={resolved_m_block_size} for chunk_size={L}. "
+                f"Supported tile families use m_block_size in {{{supported_m}}}."
+            )
+
+        expected_num_threads = int(family[1])
+        if requested_num_threads not in (128, expected_num_threads):
+            raise ValueError(
+                f"chunk_scan m_block_size={resolved_m_block_size} requires "
+                f"num_threads={expected_num_threads}; got {requested_num_threads}."
+            )
+        candidate_families = (family,)
+    else:
+        if requested_num_threads == 128:
+            candidate_families = supported_families
+        else:
+            candidate_families = tuple(
+                family
+                for family in supported_families
+                if int(family[1]) == requested_num_threads
+            )
+            if not candidate_families:
+                supported_threads = ", ".join(
+                    str(num_threads) for _, num_threads in supported_families
+                )
+                raise ValueError(
+                    f"Unsupported chunk_scan num_threads={requested_num_threads} for "
+                    f"chunk_size={L}. Supported tile families use num_threads in "
+                    f"{{{supported_threads}}}."
+                )
+
+    cutlass_tc_dtype = _torch_to_cutlass_dtype(tc_dtype)
+    cutlass_out_dtype = _torch_to_cutlass_dtype(output_dtype)
+    attempts: list[str] = []
+    for m_block_size, num_threads in candidate_families:
+        for n_block_size in _iter_chunk_scan_n_block_candidates(
+            L, requested_n_block_size
+        ):
+            kernel = ChunkScanFwdAmpere(
+                D=D,
+                P=P,
+                L=L,
+                m_block_size=m_block_size,
+                n_block_size=n_block_size,
+                num_threads=num_threads,
+            )
+            info = kernel.support_info(
+                cutlass_tc_dtype,
+                cutlass_out_dtype,
+                device_index=device_index,
+            )
+            if info.supported:
+                return int(m_block_size), int(n_block_size), int(num_threads)
+            attempts.append(
+                f"(m={m_block_size}, n={n_block_size}, threads={num_threads}) "
+                f"needs {info.required_smem_bytes}B > {info.smem_capacity_bytes}B"
+            )
+
+    device_label = _chunk_scan_device_label(device_index)
+    attempt_summary = "; ".join(attempts[:4])
+    if len(attempts) > 4:
+        attempt_summary += f"; ... {len(attempts) - 4} more"
+    raise ValueError(
+        f"No supported chunk_scan tile family fits {device_label} for "
+        f"(chunk_size={L}, D={D}, P={P}). Tried: {attempt_summary}"
+    )
+
+
 def _make_row_major_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
     if not shape:
         return ()
@@ -614,22 +737,37 @@ def _compile_chunk_scan_kernel_impl(
     L = int(chunk_size)
     if L <= 0:
         raise ValueError("chunk_size must be positive.")
-    if m_block_size is None:
-        m_block_size = L
-    n_block_size = _resolve_chunk_scan_n_block_size(L, int(n_block_size))
     n_chunks = (T + L - 1) // L
     T_pad = n_chunks * L
     BH = Bsz * H
     BHC = BH * n_chunks
+    device_index = (
+        int(U.device.index)
+        if U.device.index is not None
+        else torch.cuda.current_device()
+    )
+    tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
+    resolved_m_block_size, resolved_n_block_size, resolved_num_threads = (
+        _resolve_chunk_scan_launch_cfg(
+            D=D,
+            P=P,
+            L=L,
+            tc_dtype=tc_dtype,
+            output_dtype=output_dtype,
+            device_index=device_index,
+            requested_m_block_size=m_block_size,
+            requested_n_block_size=int(n_block_size),
+            requested_num_threads=int(num_threads),
+        )
+    )
 
     if tuple(chunk_starts.shape) != (Bsz, H, n_chunks, P, D):
         raise ValueError(
             f"chunk_starts must be (B,H,C,P,D) ={(Bsz, H, n_chunks, P, D)}."
         )
 
-    tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
     cache_key = _chunk_scan_key(
-        device_index=(U.device.index if U.device.index is not None else -1),
+        device_index=device_index,
         tc_dtype=tc_dtype,
         out_dtype=output_dtype,
         U_shape=tuple(U.shape),
@@ -639,9 +777,9 @@ def _compile_chunk_scan_kernel_impl(
         C_shape=tuple(C.shape),
         chunk_starts_shape=tuple(chunk_starts.shape),
         chunk_size=L,
-        m_block_size=int(m_block_size),
-        n_block_size=int(n_block_size),
-        num_threads=int(num_threads),
+        m_block_size=resolved_m_block_size,
+        n_block_size=resolved_n_block_size,
+        num_threads=resolved_num_threads,
         has_prev=B_prev is not None,
     )
 
@@ -697,14 +835,16 @@ def _compile_chunk_scan_kernel_impl(
             D=D,
             P=P,
             L=L,
-            m_block_size=int(m_block_size),
-            n_block_size=int(n_block_size),
-            num_threads=int(num_threads),
+            m_block_size=resolved_m_block_size,
+            n_block_size=resolved_n_block_size,
+            num_threads=resolved_num_threads,
         )
-        if not kernel.can_implement(in_cutlass_dtype, out_cutlass_dtype):
-            raise ValueError(
-                "Configuration exceeds SM80 shared-memory capacity or violates alignment."
-            )
+        if not kernel.can_implement(
+            in_cutlass_dtype,
+            out_cutlass_dtype,
+            device_index=device_index,
+        ):
+            raise ValueError("Resolved chunk_scan configuration is not supported.")
         compiled = cute.compile(
             kernel, mU, mB, mC, mM, mK, mZ0, mU_prev0, mB_prev0, mOut
         )
@@ -891,9 +1031,25 @@ def _build_forward_args(
     n_chunks = (T + L - 1) // L
     T_pad = n_chunks * L
 
-    resolved_m_block = L if m_block_size is None else int(m_block_size)
-    resolved_n_block = _resolve_chunk_scan_n_block_size(L, int(n_block_size))
     tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
+    device_index = (
+        int(U.device.index)
+        if U.device.index is not None
+        else torch.cuda.current_device()
+    )
+    resolved_m_block, resolved_n_block, resolved_scan_num_threads = (
+        _resolve_chunk_scan_launch_cfg(
+            D=D,
+            P=P,
+            L=L,
+            tc_dtype=tc_dtype,
+            output_dtype=output_dtype,
+            device_index=device_index,
+            requested_m_block_size=m_block_size,
+            requested_n_block_size=int(n_block_size),
+            requested_num_threads=int(scan_num_threads),
+        )
+    )
 
     if prepared_inputs is None:
         U_tc = _prepare_time_operand(U, T_pad=T_pad, dtype=tc_dtype)
@@ -1031,7 +1187,7 @@ def _build_forward_args(
     cfg = (
         resolved_m_block,
         resolved_n_block,
-        int(scan_num_threads),
+        resolved_scan_num_threads,
         int(state_num_threads),
         int(state_vecs_per_thread),
         int(state_copy_bits_in),
@@ -1203,7 +1359,6 @@ def _make_v2x2ssd_fwd_host_wrapper(
         )
 
         tc_dtype = U_ptr.value_type
-        out_dtype = out_ptr.value_type
 
         chunk_increment = ChunkIncrementFwdAmpere(tc_dtype, chunk_size=L)
         chunk_increment(
@@ -1241,10 +1396,8 @@ def _make_v2x2ssd_fwd_host_wrapper(
             n_block_size=n_block_size,
             num_threads=scan_num_threads,
         )
-        if cutlass.const_expr(not chunk_scan.can_implement(tc_dtype, out_dtype)):
-            raise ValueError(
-                "Configuration exceeds SM80 shared-memory capacity or violates alignment."
-            )
+        if cutlass.const_expr(not chunk_scan._tile_family_supported()):
+            raise ValueError("chunk_scan tile family is inconsistent.")
         chunk_scan(
             mU_scan,
             mB_scan,
@@ -1301,11 +1454,9 @@ def compile_v2x2ssd_fwd_cute(
         B_shape=tuple(B.shape),
         C_shape=tuple(C.shape),
         chunk_size=int(chunk_size),
-        m_block_size=int(chunk_size if m_block_size is None else m_block_size),
-        n_block_size=_resolve_chunk_scan_n_block_size(
-            int(chunk_size), int(n_block_size)
-        ),
-        scan_num_threads=int(scan_num_threads),
+        m_block_size=int(cfg[0]),
+        n_block_size=int(cfg[1]),
+        scan_num_threads=int(cfg[2]),
         state_num_threads=int(state_num_threads),
         state_vecs_per_thread=int(state_vecs_per_thread),
         state_copy_bits_in=int(cfg[5]),
@@ -1372,11 +1523,9 @@ def v2x2ssd_fwd_cute(
         B_shape=tuple(B.shape),
         C_shape=tuple(C.shape),
         chunk_size=int(chunk_size),
-        m_block_size=int(chunk_size if m_block_size is None else m_block_size),
-        n_block_size=_resolve_chunk_scan_n_block_size(
-            int(chunk_size), int(n_block_size)
-        ),
-        scan_num_threads=int(scan_num_threads),
+        m_block_size=int(cfg[0]),
+        n_block_size=int(cfg[1]),
+        scan_num_threads=int(cfg[2]),
         state_num_threads=int(state_num_threads),
         state_vecs_per_thread=int(state_vecs_per_thread),
         state_copy_bits_in=int(cfg[5]),
