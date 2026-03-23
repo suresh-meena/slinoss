@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import importlib
-from typing import Any, Final
+from typing import Any, Callable, Final, cast
 
 import torch
 from torch.nn import functional as F
@@ -250,6 +250,9 @@ def cconv1d_cuda(
         return y, final_states
     assert isinstance(out, torch.Tensor)
     return out
+
+
+cconv1d_cuda = cast(Callable[..., Any], torch.compiler.disable(cconv1d_cuda))
 
 
 def cconv1d_reference(

@@ -3,7 +3,13 @@ from __future__ import annotations
 import pytest
 import torch
 
-from slinoss.layers import AutoScanBackend, SLinOSSMixer, ScanInputs, ScanState
+from slinoss.layers import (
+    AutoScanBackend,
+    SLinOSSMixer,
+    ScanInputs,
+    ScanPrepInputs,
+    ScanState,
+)
 
 
 class SpyBackend:
@@ -39,6 +45,30 @@ class SpyBackend:
         if not return_state:
             return torch.zeros_like(inputs.U)
         return torch.zeros_like(inputs.U), next_state
+
+
+class CaptureScanPrepBackend:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.last_inputs: ScanPrepInputs | None = None
+
+    def __call__(self, owner: object, inputs: ScanPrepInputs) -> ScanInputs:
+        self.calls += 1
+        self.last_inputs = inputs
+        return owner._prepare_inputs_reference(inputs)  # type: ignore[attr-defined]
+
+
+class ZeroConvBackend:
+    def __call__(
+        self,
+        owner: SLinOSSMixer,
+        x: torch.Tensor,
+        conv_state: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del conv_state
+        state_len = max(owner.d_conv - 1, 0)
+        next_state = x.new_zeros((x.shape[0], owner.d_inner, state_len))
+        return torch.zeros_like(x), next_state
 
 
 def _make_mixer(*, backend: object | None = None) -> SLinOSSMixer:
@@ -94,6 +124,57 @@ def test_mixer_emits_bc_from_in_proj() -> None:
     assert mixer.in_proj.out_features == (
         2 * mixer.d_inner + mixer.param_proj_dim + mixer.bc_proj_dim
     )
+
+
+def test_mixer_issue_1_bc_emission_is_decoupled_from_value_path() -> None:
+    torch.manual_seed(0)
+    ref_scanprep = CaptureScanPrepBackend()
+    zero_scanprep = CaptureScanPrepBackend()
+    ref_backend = SpyBackend()
+    zero_backend = SpyBackend()
+    mixer = SLinOSSMixer(
+        128,
+        d_state=64,
+        expand=2,
+        d_head=64,
+        d_conv=4,
+        chunk_size=64,
+        normalize_bc=True,
+        scanprep_backend=ref_scanprep,  # type: ignore[arg-type]
+        backend=ref_backend,  # type: ignore[arg-type]
+    )
+    zero_mixer = SLinOSSMixer(
+        128,
+        d_state=64,
+        expand=2,
+        d_head=64,
+        d_conv=4,
+        chunk_size=64,
+        normalize_bc=True,
+        scanprep_backend=zero_scanprep,  # type: ignore[arg-type]
+        cconv_backend=ZeroConvBackend(),  # type: ignore[arg-type]
+        backend=zero_backend,  # type: ignore[arg-type]
+    )
+    zero_mixer.load_state_dict(mixer.state_dict())
+
+    x = torch.randn((2, 65, 128), dtype=torch.float32)
+    expected_bc = mixer.in_proj(x)[..., -mixer.bc_proj_dim :].view(
+        2, 65, mixer.n_heads, 4, mixer.d_state
+    )
+
+    mixer(x)
+    zero_mixer(x)
+
+    assert ref_scanprep.last_inputs is not None
+    assert zero_scanprep.last_inputs is not None
+    assert torch.count_nonzero(ref_scanprep.last_inputs.value).item() > 0
+    assert torch.count_nonzero(zero_scanprep.last_inputs.value).item() == 0
+    assert not torch.allclose(
+        ref_scanprep.last_inputs.value, zero_scanprep.last_inputs.value
+    )
+    assert torch.allclose(ref_scanprep.last_inputs.bc, expected_bc)
+    assert torch.allclose(zero_scanprep.last_inputs.bc, expected_bc)
+    assert torch.allclose(ref_scanprep.last_inputs.bc, zero_scanprep.last_inputs.bc)
 
 
 def test_mixer_rejects_incompatible_d_state_for_cute_scan_backend() -> None:
@@ -179,7 +260,7 @@ def test_mixer_forward_supports_issue_3_shape() -> None:
     assert torch.isfinite(y).all()
 
 
-def test_mixer_torch_compile_contains_only_intentional_cute_boundary_break() -> None:
+def test_mixer_torch_compile_contains_only_intentional_compiler_boundaries() -> None:
     if not torch.cuda.is_available():
         return
 
@@ -201,10 +282,12 @@ def test_mixer_torch_compile_contains_only_intentional_cute_boundary_break() -> 
     explain = torch._dynamo.explain(mixer)
     result = explain(x)
 
-    assert result.graph_count == 2
-    assert result.graph_break_count == 1
-    assert len(result.break_reasons) == 1
-    assert "torch.compiler.disable" in result.break_reasons[0].reason
+    assert result.graph_break_count >= len(result.break_reasons)
+    assert len(result.break_reasons) >= 1
+    assert all(
+        "torch.compiler.disable" in break_reason.reason
+        for break_reason in result.break_reasons
+    )
 
 
 def test_mixer_torch_compile_runs_training_with_cute_boundaries() -> None:
