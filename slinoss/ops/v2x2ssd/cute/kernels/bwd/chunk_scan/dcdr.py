@@ -80,6 +80,20 @@ class ChunkScanBwdDCDRAmpere:
     def P_padded(self) -> int:
         return ((self.P + 31) // 32) * 32
 
+    @staticmethod
+    def _align_up(offset: int, align: int) -> int:
+        return ((offset + align - 1) // align) * align
+
+    @classmethod
+    def _struct_size_bytes(cls, fields: list[tuple[int, int]]) -> int:
+        offset = 0
+        max_align = 1
+        for size, align in fields:
+            offset = cls._align_up(offset, align)
+            offset += size
+            max_align = max(max_align, align)
+        return cls._align_up(offset, max_align)
+
     def _make_acc_tensor_mn_view(self, acc: cute.Tensor) -> cute.Tensor:
         acc_layout_col_major = cute.make_layout(acc.layout.shape)
         acc_layout_mn = cute.make_layout(
@@ -94,6 +108,180 @@ class ChunkScanBwdDCDRAmpere:
         )
         acc_layout_mn = cute.composition(acc.layout, acc_layout_mn)
         return cute.make_tensor(acc.iterator, acc_layout_mn)
+
+    def _tail_pad_layout(self):
+        return cute.make_layout((128,), stride=(1,))
+
+    def _shared_storage_fields(
+        self,
+        in_dtype: type[cutlass.Numeric],
+        s_u_prev_layout: cute.Layout,
+        s_b_prev_layout: cute.Layout,
+        s_dlp_layout: cute.Layout,
+        sDY_layout: cute.ComposedLayout,
+        sV_layout: cute.ComposedLayout,
+        sK_layout: cute.ComposedLayout,
+        sDS_layout: cute.Layout,
+        sZ0_layout: cute.Layout,
+        s_scale_full_layout: cute.Layout,
+        s_inv_scale_full_layout: cute.Layout,
+        s_phase_full_layout: cute.Layout,
+        tile_prefix_log_layout: cute.Layout,
+        tile_prefix_phase_layout: cute.Layout,
+        s_row_layout: cute.Layout,
+        s_inv_row_layout: cute.Layout,
+        s_phase_row_layout: cute.Layout,
+        s_phase_col_layout: cute.Layout,
+        s_tap_layout: cute.Layout,
+    ) -> list[tuple[int, int]]:
+        return [
+            (cute.size_in_bytes(in_dtype, sDY_layout), 16),
+            (cute.size_in_bytes(in_dtype, sV_layout), 16),
+            (cute.size_in_bytes(in_dtype, sK_layout), 16),
+            (cute.size_in_bytes(in_dtype, sDS_layout), 16),
+            (cute.size_in_bytes(in_dtype, sK_layout), 16),
+            (cute.size_in_bytes(in_dtype, sZ0_layout), 16),
+            (cute.size_in_bytes(in_dtype, s_u_prev_layout), 16),
+            (cute.size_in_bytes(in_dtype, s_b_prev_layout), 16),
+            (cute.size_in_bytes(cutlass.Float32, s_dlp_layout), 4),
+            (cute.size_in_bytes(cutlass.Float32, s_scale_full_layout), 4),
+            (cute.size_in_bytes(cutlass.Float32, s_inv_scale_full_layout), 4),
+            (cute.size_in_bytes(cutlass.Float32, s_phase_full_layout), 16),
+            (cute.size_in_bytes(cutlass.Float32, tile_prefix_log_layout), 4),
+            (cute.size_in_bytes(cutlass.Float32, tile_prefix_phase_layout), 16),
+            (cute.size_in_bytes(cutlass.Float32, tile_prefix_log_layout), 4),
+            (cute.size_in_bytes(cutlass.Float32, tile_prefix_phase_layout), 16),
+            (cute.size_in_bytes(cutlass.Float32, s_row_layout), 4),
+            (cute.size_in_bytes(cutlass.Float32, s_inv_row_layout), 4),
+            (cute.size_in_bytes(cutlass.Float32, s_phase_row_layout), 16),
+            (cute.size_in_bytes(cutlass.Float32, s_phase_col_layout), 16),
+            (cute.size_in_bytes(cutlass.Float32, s_tap_layout), 16),
+            (cute.size_in_bytes(cutlass.Float32, s_tap_layout), 16),
+            (cute.size_in_bytes(cutlass.Float32, self._tail_pad_layout()), 16),
+        ]
+
+    def _make_shared_storage(
+        self,
+        in_dtype: type[cutlass.Numeric],
+        s_u_prev_layout: cute.Layout,
+        s_b_prev_layout: cute.Layout,
+        s_dlp_layout: cute.Layout,
+        sDY_layout: cute.ComposedLayout,
+        sV_layout: cute.ComposedLayout,
+        sK_layout: cute.ComposedLayout,
+        sDS_layout: cute.Layout,
+        sZ0_layout: cute.Layout,
+        s_scale_full_layout: cute.Layout,
+        s_inv_scale_full_layout: cute.Layout,
+        s_phase_full_layout: cute.Layout,
+        tile_prefix_log_layout: cute.Layout,
+        tile_prefix_phase_layout: cute.Layout,
+        s_row_layout: cute.Layout,
+        s_inv_row_layout: cute.Layout,
+        s_phase_row_layout: cute.Layout,
+        s_phase_col_layout: cute.Layout,
+        s_tap_layout: cute.Layout,
+    ):
+        tail_pad_layout = self._tail_pad_layout()
+
+        class SharedStorage:
+            pass
+
+        SharedStorage.__annotations__ = {
+            "sDY": cute.struct.Align[
+                cute.struct.MemRange[in_dtype, cute.cosize(sDY_layout)], 16
+            ],
+            "sV_tile": cute.struct.Align[
+                cute.struct.MemRange[in_dtype, cute.cosize(sV_layout)], 16
+            ],
+            "sK_tile": cute.struct.Align[
+                cute.struct.MemRange[in_dtype, cute.cosize(sK_layout)], 16
+            ],
+            "sDS_blk": cute.struct.Align[
+                cute.struct.MemRange[in_dtype, cute.cosize(sDS_layout)], 16
+            ],
+            "sQZ_tile": cute.struct.Align[
+                cute.struct.MemRange[in_dtype, cute.cosize(sK_layout)], 16
+            ],
+            "sZ0": cute.struct.Align[
+                cute.struct.MemRange[in_dtype, cute.cosize(sZ0_layout)], 16
+            ],
+            "s_u_prev": cute.struct.Align[
+                cute.struct.MemRange[in_dtype, cute.cosize(s_u_prev_layout)], 16
+            ],
+            "s_b_prev": cute.struct.Align[
+                cute.struct.MemRange[in_dtype, cute.cosize(s_b_prev_layout)], 16
+            ],
+            "s_dlp": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(s_dlp_layout)], 4
+            ],
+            "s_scale_full": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(s_scale_full_layout)],
+                4,
+            ],
+            "s_inv_scale_full": cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(s_inv_scale_full_layout)
+                ],
+                4,
+            ],
+            "s_phase_full": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(s_phase_full_layout)],
+                16,
+            ],
+            "s_tile_end_log": cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(tile_prefix_log_layout)
+                ],
+                4,
+            ],
+            "s_tile_end_phase": cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(tile_prefix_phase_layout)
+                ],
+                16,
+            ],
+            "s_tile_off_log": cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(tile_prefix_log_layout)
+                ],
+                4,
+            ],
+            "s_tile_off_phase": cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float32, cute.cosize(tile_prefix_phase_layout)
+                ],
+                16,
+            ],
+            "s_row_scale": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(s_row_layout)], 4
+            ],
+            "s_inv_row_scale": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(s_inv_row_layout)],
+                4,
+            ],
+            "s_phase_row": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(s_phase_row_layout)],
+                16,
+            ],
+            "s_phase_col": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(s_phase_col_layout)],
+                16,
+            ],
+            "s_tap_prev": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(s_tap_layout)],
+                16,
+            ],
+            "s_tap_curr": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(s_tap_layout)],
+                16,
+            ],
+            "tail_pad": cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(tail_pad_layout)],
+                16,
+            ],
+        }
+        return cute.struct(SharedStorage)
 
     @cute.jit
     def __call__(
@@ -287,25 +475,29 @@ class ChunkScanBwdDCDRAmpere:
         tC = cute.make_layout(self.atom_layout_mnk)
         tiled_mma = cute.make_tiled_mma(op, tC, permutation_mnk=permutation_mnk)
 
-        smem_needed = 0
-        smem_needed += cute.size_in_bytes(in_dtype, sDY_layout)
-        smem_needed += cute.size_in_bytes(in_dtype, sV_layout)
-        smem_needed += 2 * cute.size_in_bytes(in_dtype, sK_layout)
-        smem_needed += cute.size_in_bytes(in_dtype, sDS_layout)
-        smem_needed += cute.size_in_bytes(in_dtype, sZ0_layout)
-        smem_needed += cute.size_in_bytes(in_dtype, s_u_prev_layout)
-        smem_needed += cute.size_in_bytes(in_dtype, s_b_prev_layout)
-        smem_needed += cute.size_in_bytes(cutlass.Float32, s_dlp_layout)
-        smem_needed += cute.size_in_bytes(cutlass.Float32, s_scale_full_layout)
-        smem_needed += cute.size_in_bytes(cutlass.Float32, s_inv_scale_full_layout)
-        smem_needed += cute.size_in_bytes(cutlass.Float32, s_phase_full_layout)
-        smem_needed += 2 * cute.size_in_bytes(cutlass.Float32, tile_prefix_log_layout)
-        smem_needed += 2 * cute.size_in_bytes(cutlass.Float32, tile_prefix_phase_layout)
-        smem_needed += cute.size_in_bytes(cutlass.Float32, s_row_layout)
-        smem_needed += cute.size_in_bytes(cutlass.Float32, s_inv_row_layout)
-        smem_needed += 2 * cute.size_in_bytes(cutlass.Float32, s_phase_row_layout)
-        smem_needed += 2 * cute.size_in_bytes(cutlass.Float32, s_tap_layout)
-        smem_needed += 512
+        smem_needed = self._struct_size_bytes(
+            self._shared_storage_fields(
+                in_dtype,
+                s_u_prev_layout,
+                s_b_prev_layout,
+                s_dlp_layout,
+                sDY_layout,
+                sV_layout,
+                sK_layout,
+                sDS_layout,
+                sZ0_layout,
+                s_scale_full_layout,
+                s_inv_scale_full_layout,
+                s_phase_full_layout,
+                tile_prefix_log_layout,
+                tile_prefix_phase_layout,
+                s_row_layout,
+                s_inv_row_layout,
+                s_phase_row_layout,
+                s_phase_col_layout,
+                s_tap_layout,
+            )
+        )
 
         grid_z = cute.size(mU.shape[0])
         self.kernel(
@@ -409,43 +601,55 @@ class ChunkScanBwdDCDRAmpere:
         n_tiles = self.L // kv_tile
 
         smem = cutlass.utils.SmemAllocator()
-        sDY = smem.allocate_tensor(mU.element_type, sDY_layout, 16)
-        sV_tile = smem.allocate_tensor(mU.element_type, sV_layout, 16)
-        sK_tile = smem.allocate_tensor(mU.element_type, sK_layout, 16)
-        sDS_blk = smem.allocate_tensor(mU.element_type, sDS_layout, 16)
+        SharedStorage = self._make_shared_storage(
+            mU.element_type,
+            s_u_prev_layout,
+            s_b_prev_layout,
+            s_dlp_layout,
+            sDY_layout,
+            sV_layout,
+            sK_layout,
+            sDS_layout,
+            sZ0_layout,
+            s_scale_full_layout,
+            s_inv_scale_full_layout,
+            s_phase_full_layout,
+            tile_prefix_log_layout,
+            tile_prefix_phase_layout,
+            s_row_layout,
+            s_inv_row_layout,
+            s_phase_row_layout,
+            s_phase_col_layout,
+            s_tap_layout,
+        )
+        storage = smem.allocate(SharedStorage)
+        sDY = storage.sDY.get_tensor(sDY_layout)
+        sV_tile = storage.sV_tile.get_tensor(sV_layout)
+        sK_tile = storage.sK_tile.get_tensor(sK_layout)
+        sDS_blk = storage.sDS_blk.get_tensor(sDS_layout)
         sStage_layout = cute.make_layout((kv_tile, kv_tile), stride=(kv_tile, 1))
         sSc_scratch = cute.make_tensor(sV_tile.iterator, sStage_layout)
         sDS_scratch = cute.make_tensor(sDY.iterator, sStage_layout)
-        sQZ_tile = smem.allocate_tensor(mU.element_type, sK_layout, 16)
-        sZ0 = smem.allocate_tensor(mU.element_type, sZ0_layout, 16)
-        s_u_prev = smem.allocate_tensor(mU.element_type, s_u_prev_layout, 16)
-        s_b_prev = smem.allocate_tensor(mU.element_type, s_b_prev_layout, 16)
-        s_dlp = smem.allocate_tensor(cutlass.Float32, s_dlp_layout, 4)
+        sQZ_tile = storage.sQZ_tile.get_tensor(sK_layout)
+        sZ0 = storage.sZ0.get_tensor(sZ0_layout)
+        s_u_prev = storage.s_u_prev.get_tensor(s_u_prev_layout)
+        s_b_prev = storage.s_b_prev.get_tensor(s_b_prev_layout)
+        s_dlp = storage.s_dlp.get_tensor(s_dlp_layout)
 
-        s_scale_full = smem.allocate_tensor(cutlass.Float32, s_scale_full_layout, 4)
-        s_inv_scale_full = smem.allocate_tensor(
-            cutlass.Float32, s_inv_scale_full_layout, 4
-        )
-        s_phase_full = smem.allocate_tensor(cutlass.Float32, s_phase_full_layout, 16)
-        s_tile_end_log = smem.allocate_tensor(
-            cutlass.Float32, tile_prefix_log_layout, 4
-        )
-        s_tile_end_phase = smem.allocate_tensor(
-            cutlass.Float32, tile_prefix_phase_layout, 16
-        )
-        s_tile_off_log = smem.allocate_tensor(
-            cutlass.Float32, tile_prefix_log_layout, 4
-        )
-        s_tile_off_phase = smem.allocate_tensor(
-            cutlass.Float32, tile_prefix_phase_layout, 16
-        )
+        s_scale_full = storage.s_scale_full.get_tensor(s_scale_full_layout)
+        s_inv_scale_full = storage.s_inv_scale_full.get_tensor(s_inv_scale_full_layout)
+        s_phase_full = storage.s_phase_full.get_tensor(s_phase_full_layout)
+        s_tile_end_log = storage.s_tile_end_log.get_tensor(tile_prefix_log_layout)
+        s_tile_end_phase = storage.s_tile_end_phase.get_tensor(tile_prefix_phase_layout)
+        s_tile_off_log = storage.s_tile_off_log.get_tensor(tile_prefix_log_layout)
+        s_tile_off_phase = storage.s_tile_off_phase.get_tensor(tile_prefix_phase_layout)
 
-        s_row_scale = smem.allocate_tensor(cutlass.Float32, s_row_layout, 4)
-        s_inv_row_scale = smem.allocate_tensor(cutlass.Float32, s_inv_row_layout, 4)
-        s_phase_row = smem.allocate_tensor(cutlass.Float32, s_phase_row_layout, 16)
-        s_phase_col = smem.allocate_tensor(cutlass.Float32, s_phase_col_layout, 16)
-        s_tap_prev = smem.allocate_tensor(cutlass.Float32, s_tap_layout, 16)
-        s_tap_curr = smem.allocate_tensor(cutlass.Float32, s_tap_layout, 16)
+        s_row_scale = storage.s_row_scale.get_tensor(s_row_layout)
+        s_inv_row_scale = storage.s_inv_row_scale.get_tensor(s_inv_row_layout)
+        s_phase_row = storage.s_phase_row.get_tensor(s_phase_row_layout)
+        s_phase_col = storage.s_phase_col.get_tensor(s_phase_col_layout)
+        s_tap_prev = storage.s_tap_prev.get_tensor(s_tap_layout)
+        s_tap_curr = storage.s_tap_curr.get_tensor(s_tap_layout)
 
         if tidx < cutlass.Int32(self.L):
             s_dlp[tidx] = cutlass.Float32(0.0)
