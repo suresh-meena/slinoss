@@ -78,7 +78,23 @@ def _default_async_copy_bits(
     raise ValueError("Failed to find a legal async-copy width for the given tile.")
 
 
+def _assumed_align(
+    t: torch.Tensor,
+    candidates_bytes: tuple[int, ...] = (16, 8, 4),
+) -> int:
+    """Return the widest safe assumed alignment for a tensor view."""
+    elem_align = max(1, t.element_size())
+    ptr = int(t.data_ptr())
+    for align in candidates_bytes:
+        if align < elem_align:
+            continue
+        if (ptr % align) == 0:
+            return align
+    return elem_align
+
+
 __all__ = [
+    "_assumed_align",
     "_default_async_copy_bits",
     "_default_tc_k_tile",
     "_next_pow2",

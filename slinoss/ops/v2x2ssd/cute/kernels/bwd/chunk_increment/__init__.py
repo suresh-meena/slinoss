@@ -4,29 +4,19 @@ from __future__ import annotations
 
 import torch
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.runtime import make_ptr
 
 from .boundary import ChunkIncrementBwdBoundaryAmpere
-from .common import _torch_to_cutlass_dtype
+from .common import _assumed_align, _torch_to_cutlass_dtype
 from .db import ChunkIncrementBwdDBAmpere
 from .du import ChunkIncrementBwdDUAmpere
 from .param_scan import ChunkIncrementBwdParamScanAmpere
 
 
-_COMPILED_CACHE: dict[tuple, tuple[object, object, object, object]] = {}
-_OVERLAP_RESOURCES: dict[
-    int,
-    tuple[
-        torch.cuda.Stream,
-        torch.cuda.Stream,
-        torch.cuda.Stream,
-        torch.cuda.Event,
-        torch.cuda.Event,
-        torch.cuda.Event,
-        torch.cuda.Event,
-    ],
-] = {}
+_COMPILED_CACHE: dict[tuple, tuple[object, object, object, object, object]] = {}
 _ZERO_PREV_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+_PTR_ARG_CACHE: dict[tuple[object, ...], tuple[object, int]] = {}
+_PTR_ARG_CACHE_LIMIT = 32768
 
 
 def _get_zero_prev_tensors(
@@ -168,6 +158,7 @@ def _compiled_key(
     d_m_chunk_shape: tuple[int, ...],
     chunk_size: int,
     has_prev: bool,
+    alignments: tuple[int, ...],
 ) -> tuple:
     return (
         "chunk_increment_bwd",
@@ -181,34 +172,370 @@ def _compiled_key(
         d_m_chunk_shape,
         int(chunk_size),
         has_prev,
+        alignments,
     )
 
 
-def _get_overlap_resources(
-    device: torch.device,
-) -> tuple[
-    torch.cuda.Stream,
-    torch.cuda.Stream,
-    torch.cuda.Stream,
-    torch.cuda.Event,
-    torch.cuda.Event,
-    torch.cuda.Event,
-    torch.cuda.Event,
-]:
-    device_index = device.index if device.index is not None else -1
-    cached = _OVERLAP_RESOURCES.get(device_index)
-    if cached is None:
-        cached = (
-            torch.cuda.Stream(device=device),
-            torch.cuda.Stream(device=device),
-            torch.cuda.Stream(device=device),
-            torch.cuda.Event(blocking=False, enable_timing=False),
-            torch.cuda.Event(blocking=False, enable_timing=False),
-            torch.cuda.Event(blocking=False, enable_timing=False),
-            torch.cuda.Event(blocking=False, enable_timing=False),
-        )
-        _OVERLAP_RESOURCES[device_index] = cached
+def _make_ptr_arg(t: torch.Tensor) -> tuple[object, int]:
+    device_index = (
+        int(t.device.index)
+        if t.device.type == "cuda" and t.device.index is not None
+        else -1
+    )
+    key = (t.device.type, device_index, int(t.data_ptr()), t.dtype)
+    cached = _PTR_ARG_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    align = _assumed_align(t)
+    cached = (
+        make_ptr(
+            _torch_to_cutlass_dtype(t.dtype),
+            t.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=align,
+        ),
+        align,
+    )
+    if len(_PTR_ARG_CACHE) >= _PTR_ARG_CACHE_LIMIT:
+        _PTR_ARG_CACHE.clear()
+    _PTR_ARG_CACHE[key] = cached
     return cached
+
+
+def _make_ptr_args(
+    *tensors: torch.Tensor,
+) -> tuple[tuple[object, ...], tuple[int, ...]]:
+    ptrs: list[object] = []
+    alignments: list[int] = []
+    for tensor in tensors:
+        ptr, align = _make_ptr_arg(tensor)
+        ptrs.append(ptr)
+        alignments.append(align)
+    return tuple(ptrs), tuple(alignments)
+
+
+def _make_row_major_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
+    if not shape:
+        return ()
+    stride = [1] * len(shape)
+    running = 1
+    for i in range(len(shape) - 1, -1, -1):
+        stride[i] = running
+        running *= int(shape[i])
+    return tuple(stride)
+
+
+def _make_tensor_spec(
+    shape: tuple[int, ...],
+    *,
+    stride: tuple[int, ...] | None = None,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    shape = tuple(int(dim) for dim in shape)
+    if stride is None:
+        stride = _make_row_major_stride(shape)
+    else:
+        stride = tuple(int(step) for step in stride)
+    return shape, stride
+
+
+def _make_tensor_from_spec(
+    ptr: cute.Pointer,
+    spec: tuple[tuple[int, ...], tuple[int, ...]],
+):
+    shape, stride = spec
+    return cute.make_tensor(ptr, cute.make_layout(shape, stride=stride))
+
+
+def _make_db_host_wrapper(
+    *,
+    spec: tuple[int, ...],
+    cfg: tuple[int, ...],
+):
+    L, P, D, BHC = spec
+    chunk_size, n_d_tiles = cfg
+
+    u_spec = _make_tensor_spec((L, P, BHC), stride=(P, 1, L * P))
+    b_spec = _make_tensor_spec((L, D, BHC), stride=(D, 1, L * D))
+    m_spec = _make_tensor_spec((2, L, BHC), stride=(1, 2, L * 2))
+    d_inc_dp_spec = _make_tensor_spec((D, P, BHC), stride=(1, D, P * D))
+    d_b_spec = _make_tensor_spec((L, D, BHC), stride=(D, 1, L * D))
+    d_msum_part_spec = _make_tensor_spec(
+        (2, L, n_d_tiles, BHC),
+        stride=(L * n_d_tiles * BHC, n_d_tiles * BHC, BHC, 1),
+    )
+
+    @cute.jit
+    def _db_host_wrapper(
+        U_ptr: cute.Pointer,
+        B_ptr: cute.Pointer,
+        M_ptr: cute.Pointer,
+        Kprev_ptr: cute.Pointer,
+        Kcurr_ptr: cute.Pointer,
+        DIncDP_ptr: cute.Pointer,
+        DB_ptr: cute.Pointer,
+        DMsumPart_ptr: cute.Pointer,
+    ):
+        mU = _make_tensor_from_spec(U_ptr, u_spec)
+        mB = _make_tensor_from_spec(B_ptr, b_spec)
+        mM = _make_tensor_from_spec(M_ptr, m_spec)
+        mKprev = _make_tensor_from_spec(Kprev_ptr, m_spec)
+        mKcurr = _make_tensor_from_spec(Kcurr_ptr, m_spec)
+        mDIncDP = _make_tensor_from_spec(DIncDP_ptr, d_inc_dp_spec)
+        mDB = _make_tensor_from_spec(DB_ptr, d_b_spec)
+        mDMsumPart = _make_tensor_from_spec(DMsumPart_ptr, d_msum_part_spec)
+
+        kernel = ChunkIncrementBwdDBAmpere(
+            U_ptr.value_type,
+            chunk_size=chunk_size,
+            D=D,
+            P=P,
+        )
+        kernel(mU, mB, mM, mKprev, mKcurr, mDIncDP, mDB, mDMsumPart)
+
+    return _db_host_wrapper
+
+
+def _make_du_host_wrapper(
+    *,
+    spec: tuple[int, ...],
+    cfg: tuple[int, ...],
+):
+    L, P, D, BHC = spec
+    (chunk_size,) = cfg
+
+    d_inc_spec = _make_tensor_spec((P, D, BHC), stride=(D, 1, P * D))
+    b_spec = _make_tensor_spec((L, D, BHC), stride=(D, 1, L * D))
+    m_spec = _make_tensor_spec((2, L, BHC), stride=(1, 2, L * 2))
+    d_u_spec = _make_tensor_spec((P, L, BHC), stride=(1, P, L * P))
+
+    @cute.jit
+    def _du_host_wrapper(
+        DInc_ptr: cute.Pointer,
+        B_ptr: cute.Pointer,
+        M_ptr: cute.Pointer,
+        Kprev_ptr: cute.Pointer,
+        Kcurr_ptr: cute.Pointer,
+        DU_ptr: cute.Pointer,
+    ):
+        mDInc = _make_tensor_from_spec(DInc_ptr, d_inc_spec)
+        mB = _make_tensor_from_spec(B_ptr, b_spec)
+        mM = _make_tensor_from_spec(M_ptr, m_spec)
+        mKprev = _make_tensor_from_spec(Kprev_ptr, m_spec)
+        mKcurr = _make_tensor_from_spec(Kcurr_ptr, m_spec)
+        mDU = _make_tensor_from_spec(DU_ptr, d_u_spec)
+
+        kernel = ChunkIncrementBwdDUAmpere(
+            DInc_ptr.value_type,
+            chunk_size=chunk_size,
+            D=D,
+            P=P,
+        )
+        kernel(mDInc, mB, mM, mKprev, mKcurr, mDU)
+
+    return _du_host_wrapper
+
+
+def _make_boundary_host_wrapper(
+    *,
+    spec: tuple[int, ...],
+    cfg: tuple[int, ...],
+):
+    L, P, D, BHC = spec
+    (chunk_size,) = cfg
+
+    d_inc_boundary_spec = _make_tensor_spec((BHC, P, D), stride=(P * D, D, 1))
+    prev_b_spec = _make_tensor_spec((D, BHC), stride=(1, D))
+    prev_u_spec = _make_tensor_spec((P, BHC), stride=(1, P))
+    m_spec = _make_tensor_spec((2, L, BHC), stride=(1, 2, L * 2))
+    d_mp0_spec = _make_tensor_spec((2, BHC), stride=(BHC, 1))
+
+    @cute.jit
+    def _boundary_host_wrapper(
+        DInc_ptr: cute.Pointer,
+        BPrev_ptr: cute.Pointer,
+        UPrev_ptr: cute.Pointer,
+        M_ptr: cute.Pointer,
+        Kprev_ptr: cute.Pointer,
+        DUPrev_ptr: cute.Pointer,
+        DBPrev_ptr: cute.Pointer,
+        DMp0_ptr: cute.Pointer,
+    ):
+        mDInc = _make_tensor_from_spec(DInc_ptr, d_inc_boundary_spec)
+        mBPrev = _make_tensor_from_spec(BPrev_ptr, prev_b_spec)
+        mUPrev = _make_tensor_from_spec(UPrev_ptr, prev_u_spec)
+        mM = _make_tensor_from_spec(M_ptr, m_spec)
+        mKprev = _make_tensor_from_spec(Kprev_ptr, m_spec)
+        mDUPrev = _make_tensor_from_spec(DUPrev_ptr, prev_u_spec)
+        mDBPrev = _make_tensor_from_spec(DBPrev_ptr, prev_b_spec)
+        mDMp0 = _make_tensor_from_spec(DMp0_ptr, d_mp0_spec)
+
+        kernel = ChunkIncrementBwdBoundaryAmpere(
+            DInc_ptr.value_type,
+            chunk_size=chunk_size,
+            D=D,
+            P=P,
+        )
+        kernel(mDInc, mBPrev, mUPrev, mM, mKprev, mDUPrev, mDBPrev, mDMp0)
+
+    return _boundary_host_wrapper
+
+
+def _make_param_host_wrapper(
+    *,
+    spec: tuple[int, ...],
+    cfg: tuple[int, ...],
+):
+    L, BHC = spec
+    (chunk_size, n_d_tiles) = cfg
+
+    m_spec = _make_tensor_spec((2, L, BHC), stride=(1, 2, L * 2))
+    d_msum_part_spec = _make_tensor_spec(
+        (2, L, n_d_tiles, BHC),
+        stride=(L * n_d_tiles * BHC, n_d_tiles * BHC, BHC, 1),
+    )
+    d_mp0_spec = _make_tensor_spec((2, BHC), stride=(BHC, 1))
+    d_mchunk_spec = _make_tensor_spec((2, BHC), stride=(1, 2))
+    d_param_spec = _make_tensor_spec((2, L, BHC), stride=(L * BHC, BHC, 1))
+
+    @cute.jit
+    def _param_host_wrapper(
+        M_ptr: cute.Pointer,
+        Kprev_ptr: cute.Pointer,
+        Kcurr_ptr: cute.Pointer,
+        DMsumPart_ptr: cute.Pointer,
+        DMp0_ptr: cute.Pointer,
+        DMchunk_ptr: cute.Pointer,
+        DM_ptr: cute.Pointer,
+        DKprev_ptr: cute.Pointer,
+        DKcurr_ptr: cute.Pointer,
+    ):
+        mM = _make_tensor_from_spec(M_ptr, m_spec)
+        mKprev = _make_tensor_from_spec(Kprev_ptr, m_spec)
+        mKcurr = _make_tensor_from_spec(Kcurr_ptr, m_spec)
+        mDMsumPart = _make_tensor_from_spec(DMsumPart_ptr, d_msum_part_spec)
+        mDMp0 = _make_tensor_from_spec(DMp0_ptr, d_mp0_spec)
+        mDMchunk = _make_tensor_from_spec(DMchunk_ptr, d_mchunk_spec)
+        mDM = _make_tensor_from_spec(DM_ptr, d_param_spec)
+        mDKprev = _make_tensor_from_spec(DKprev_ptr, d_param_spec)
+        mDKcurr = _make_tensor_from_spec(DKcurr_ptr, d_param_spec)
+
+        kernel = ChunkIncrementBwdParamScanAmpere(
+            chunk_size=chunk_size,
+            nDtiles=n_d_tiles,
+        )
+        kernel(
+            mM,
+            mKprev,
+            mKcurr,
+            mDMsumPart,
+            mDMp0,
+            mDMchunk,
+            mDM,
+            mDKprev,
+            mDKcurr,
+        )
+
+    return _param_host_wrapper
+
+
+def _make_stage_host_wrapper(
+    *,
+    spec: tuple[int, ...],
+    cfg: tuple[int, ...],
+):
+    L, P, D, BHC = spec
+    chunk_size, n_d_tiles = cfg
+
+    u_spec = _make_tensor_spec((L, P, BHC), stride=(P, 1, L * P))
+    b_spec = _make_tensor_spec((L, D, BHC), stride=(D, 1, L * D))
+    m_spec = _make_tensor_spec((2, L, BHC), stride=(1, 2, L * 2))
+    d_inc_spec = _make_tensor_spec((P, D, BHC), stride=(D, 1, P * D))
+    d_inc_dp_spec = _make_tensor_spec((D, P, BHC), stride=(1, D, P * D))
+    d_inc_boundary_spec = _make_tensor_spec((BHC, P, D), stride=(P * D, D, 1))
+    prev_b_spec = _make_tensor_spec((D, BHC), stride=(1, D))
+    prev_u_spec = _make_tensor_spec((P, BHC), stride=(1, P))
+    d_b_spec = _make_tensor_spec((L, D, BHC), stride=(D, 1, L * D))
+    d_u_spec = _make_tensor_spec((P, L, BHC), stride=(1, P, L * P))
+    d_msum_part_spec = _make_tensor_spec(
+        (2, L, n_d_tiles, BHC),
+        stride=(L * n_d_tiles * BHC, n_d_tiles * BHC, BHC, 1),
+    )
+    d_mp0_spec = _make_tensor_spec((2, BHC), stride=(BHC, 1))
+    d_mchunk_spec = _make_tensor_spec((2, BHC), stride=(1, 2))
+    d_param_spec = _make_tensor_spec((2, L, BHC), stride=(L * BHC, BHC, 1))
+
+    @cute.jit
+    def _stage_host_wrapper(
+        U_ptr: cute.Pointer,
+        B_ptr: cute.Pointer,
+        M_ptr: cute.Pointer,
+        Kprev_ptr: cute.Pointer,
+        Kcurr_ptr: cute.Pointer,
+        DInc_ptr: cute.Pointer,
+        BPrev_ptr: cute.Pointer,
+        UPrev_ptr: cute.Pointer,
+        DB_ptr: cute.Pointer,
+        DU_ptr: cute.Pointer,
+        DBPrev_ptr: cute.Pointer,
+        DUPrev_ptr: cute.Pointer,
+        DMsumPart_ptr: cute.Pointer,
+        DMp0_ptr: cute.Pointer,
+        DMchunk_ptr: cute.Pointer,
+        DM_ptr: cute.Pointer,
+        DKprev_ptr: cute.Pointer,
+        DKcurr_ptr: cute.Pointer,
+    ):
+        mU = _make_tensor_from_spec(U_ptr, u_spec)
+        mB = _make_tensor_from_spec(B_ptr, b_spec)
+        mM = _make_tensor_from_spec(M_ptr, m_spec)
+        mKprev = _make_tensor_from_spec(Kprev_ptr, m_spec)
+        mKcurr = _make_tensor_from_spec(Kcurr_ptr, m_spec)
+        mDInc = _make_tensor_from_spec(DInc_ptr, d_inc_spec)
+        mDIncDP = _make_tensor_from_spec(DInc_ptr, d_inc_dp_spec)
+        mDIncBoundary = _make_tensor_from_spec(DInc_ptr, d_inc_boundary_spec)
+        mBPrev = _make_tensor_from_spec(BPrev_ptr, prev_b_spec)
+        mUPrev = _make_tensor_from_spec(UPrev_ptr, prev_u_spec)
+        mDB = _make_tensor_from_spec(DB_ptr, d_b_spec)
+        mDU = _make_tensor_from_spec(DU_ptr, d_u_spec)
+        mDBPrev = _make_tensor_from_spec(DBPrev_ptr, prev_b_spec)
+        mDUPrev = _make_tensor_from_spec(DUPrev_ptr, prev_u_spec)
+        mDMsumPart = _make_tensor_from_spec(DMsumPart_ptr, d_msum_part_spec)
+        mDMp0 = _make_tensor_from_spec(DMp0_ptr, d_mp0_spec)
+        mDMchunk = _make_tensor_from_spec(DMchunk_ptr, d_mchunk_spec)
+        mDM = _make_tensor_from_spec(DM_ptr, d_param_spec)
+        mDKprev = _make_tensor_from_spec(DKprev_ptr, d_param_spec)
+        mDKcurr = _make_tensor_from_spec(DKcurr_ptr, d_param_spec)
+
+        k_db = ChunkIncrementBwdDBAmpere(
+            U_ptr.value_type,
+            chunk_size=chunk_size,
+            D=D,
+            P=P,
+        )
+        k_du = ChunkIncrementBwdDUAmpere(
+            DInc_ptr.value_type,
+            chunk_size=chunk_size,
+            D=D,
+            P=P,
+        )
+        k_boundary = ChunkIncrementBwdBoundaryAmpere(
+            DInc_ptr.value_type,
+            chunk_size=chunk_size,
+            D=D,
+            P=P,
+        )
+        k_param = ChunkIncrementBwdParamScanAmpere(
+            chunk_size=chunk_size,
+            nDtiles=n_d_tiles,
+        )
+
+        k_db(mU, mB, mM, mKprev, mKcurr, mDIncDP, mDB, mDMsumPart)
+        k_du(mDInc, mB, mM, mKprev, mKcurr, mDU)
+        k_boundary(mDIncBoundary, mBPrev, mUPrev, mM, mKprev, mDUPrev, mDBPrev, mDMp0)
+        k_param(mM, mKprev, mKcurr, mDMsumPart, mDMp0, mDMchunk, mDM, mDKprev, mDKcurr)
+
+    return _stage_host_wrapper
 
 
 def compile_chunk_increment_bwd_kernels(
@@ -262,19 +589,6 @@ def compile_chunk_increment_bwd_kernels(
 
     tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
     cutlass_dtype = _torch_to_cutlass_dtype(tc_dtype)
-    cache_key = _compiled_key(
-        device_index=(U.device.index if U.device.index is not None else -1),
-        tc_dtype=tc_dtype,
-        U_shape=tuple(U.shape),
-        B_shape=tuple(B.shape),
-        M_shape=tuple(M.shape),
-        K_shape=tuple(K.shape),
-        d_inc_shape=tuple(d_inc.shape),
-        d_m_chunk_shape=tuple(d_m_chunk.shape),
-        chunk_size=L,
-        has_prev=B_prev is not None,
-    )
-
     U_tc = _pad_zero_time(U, T_pad=T_pad, dtype=tc_dtype)
     B_tc = _pad_zero_time(B, T_pad=T_pad, dtype=tc_dtype)
     M_f = _pad_m_identity(M, T_pad=T_pad)
@@ -302,12 +616,7 @@ def compile_chunk_increment_bwd_kernels(
 
     U_chunks = U_tc.reshape(BH, n_chunks, L, P)
     B_chunks = B_tc.reshape(BH, n_chunks, L, D)
-    M_chunks = M_f.reshape(BH, n_chunks, L, 2)
     K_chunks = K_f.reshape(BH, n_chunks, L, 2, 2)
-
-    U_blk = U_chunks.reshape(BHC, L, P).contiguous()
-    B_blk = B_chunks.reshape(BHC, L, D).contiguous()
-    M_blk = M_chunks.reshape(BHC, L, 2).contiguous()
     Kprev_blk = K_chunks[..., 0, :].reshape(BHC, L, 2).contiguous()
     Kcurr_blk = K_chunks[..., 1, :].reshape(BHC, L, 2).contiguous()
 
@@ -319,21 +628,8 @@ def compile_chunk_increment_bwd_kernels(
         U_prev_chunks[:, 1:, :] = U_chunks[:, :-1, -1, :]
         B_prev_chunks[:, 1:, :] = B_chunks[:, :-1, -1, :]
 
-    U_prev_flat = U_prev_chunks.reshape(BHC, P).contiguous()
-    B_prev_flat = B_prev_chunks.reshape(BHC, D).contiguous()
-    d_inc_flat = d_inc_tc.reshape(BHC, P, D).contiguous()
-
-    mU = from_dlpack(U_blk.permute(1, 2, 0), assumed_align=16)
-    mB = from_dlpack(B_blk.permute(1, 2, 0), assumed_align=16)
-    mM = from_dlpack(M_blk.permute(2, 1, 0), assumed_align=16)
-    mKprev = from_dlpack(Kprev_blk.permute(2, 1, 0), assumed_align=16)
-    mKcurr = from_dlpack(Kcurr_blk.permute(2, 1, 0), assumed_align=16)
-
     k_db = ChunkIncrementBwdDBAmpere(cutlass_dtype, chunk_size=L, D=D, P=P)
-    k_du = ChunkIncrementBwdDUAmpere(cutlass_dtype, chunk_size=L, D=D, P=P)
-    k_boundary = ChunkIncrementBwdBoundaryAmpere(cutlass_dtype, chunk_size=L, D=D, P=P)
     nDtiles = (D + k_db.bN - 1) // k_db.bN
-    k_param = ChunkIncrementBwdParamScanAmpere(chunk_size=L, nDtiles=nDtiles)
 
     dB = torch.empty((BHC, L, D), device=U.device, dtype=tc_dtype)
     dU = torch.empty((BHC, L, P), device=U.device, dtype=tc_dtype)
@@ -345,57 +641,118 @@ def compile_chunk_increment_bwd_kernels(
     dKprev_out = torch.empty((2, L, BHC), device=U.device, dtype=torch.float32)
     dKcurr_out = torch.empty((2, L, BHC), device=U.device, dtype=torch.float32)
 
-    mDInc = from_dlpack(d_inc_flat.permute(1, 2, 0), assumed_align=16)
-    mDInc_DP = from_dlpack(d_inc_flat.permute(2, 1, 0), assumed_align=16)
-    mDInc_boundary = from_dlpack(d_inc_flat, assumed_align=16)
-    mBPrev = from_dlpack(B_prev_flat.transpose(0, 1), assumed_align=16)
-    mUPrev = from_dlpack(U_prev_flat.transpose(0, 1), assumed_align=16)
-    mDB = from_dlpack(dB.permute(1, 2, 0), assumed_align=16)
-    mDU = from_dlpack(dU.permute(2, 1, 0), assumed_align=16)
-    mDBPrev = from_dlpack(dB_prev.transpose(0, 1), assumed_align=16)
-    mDUPrev = from_dlpack(dU_prev.transpose(0, 1), assumed_align=16)
-    mDMsum_part = from_dlpack(dMsum_part, assumed_align=16)
-    mDMp0 = from_dlpack(dMp0, assumed_align=16)
-    mDMchunk = from_dlpack(
-        d_m_chunk_f.reshape(BHC, 2).transpose(0, 1), assumed_align=16
+    db_args, db_alignments = _make_ptr_args(
+        U_tc,
+        B_tc,
+        M_f,
+        Kprev_blk,
+        Kcurr_blk,
+        d_inc_tc,
+        dB,
+        dMsum_part,
     )
-    mDM = from_dlpack(dM_out, assumed_align=16)
-    mDKprev = from_dlpack(dKprev_out, assumed_align=16)
-    mDKcurr = from_dlpack(dKcurr_out, assumed_align=16)
+    du_args, du_alignments = _make_ptr_args(
+        d_inc_tc,
+        B_tc,
+        M_f,
+        Kprev_blk,
+        Kcurr_blk,
+        dU,
+    )
+    boundary_args, boundary_alignments = _make_ptr_args(
+        d_inc_tc,
+        B_prev_chunks,
+        U_prev_chunks,
+        M_f,
+        Kprev_blk,
+        dU_prev,
+        dB_prev,
+        dMp0,
+    )
+    param_args, param_alignments = _make_ptr_args(
+        M_f,
+        Kprev_blk,
+        Kcurr_blk,
+        dMsum_part,
+        dMp0,
+        d_m_chunk_f,
+        dM_out,
+        dKprev_out,
+        dKcurr_out,
+    )
+    stage_args, stage_alignments = _make_ptr_args(
+        U_tc,
+        B_tc,
+        M_f,
+        Kprev_blk,
+        Kcurr_blk,
+        d_inc_tc,
+        B_prev_chunks,
+        U_prev_chunks,
+        dB,
+        dU,
+        dB_prev,
+        dU_prev,
+        dMsum_part,
+        dMp0,
+        d_m_chunk_f,
+        dM_out,
+        dKprev_out,
+        dKcurr_out,
+    )
+    cache_key = _compiled_key(
+        device_index=(U.device.index if U.device.index is not None else -1),
+        tc_dtype=tc_dtype,
+        U_shape=tuple(U.shape),
+        B_shape=tuple(B.shape),
+        M_shape=tuple(M.shape),
+        K_shape=tuple(K.shape),
+        d_inc_shape=tuple(d_inc.shape),
+        d_m_chunk_shape=tuple(d_m_chunk.shape),
+        chunk_size=L,
+        has_prev=B_prev is not None,
+        alignments=stage_alignments,
+    )
 
     cached = _COMPILED_CACHE.get(cache_key)
     if cached is None:
-        compiled_db = cute.compile(
-            k_db, mU, mB, mM, mKprev, mKcurr, mDInc_DP, mDB, mDMsum_part
+        db_wrapper = _make_db_host_wrapper(
+            spec=(L, P, D, BHC),
+            cfg=(L, nDtiles),
         )
-        compiled_du = cute.compile(k_du, mDInc, mB, mM, mKprev, mKcurr, mDU)
-        compiled_boundary = cute.compile(
-            k_boundary,
-            mDInc_boundary,
-            mBPrev,
-            mUPrev,
-            mM,
-            mKprev,
-            mDUPrev,
-            mDBPrev,
-            mDMp0,
+        du_wrapper = _make_du_host_wrapper(
+            spec=(L, P, D, BHC),
+            cfg=(L,),
         )
-        compiled_param = cute.compile(
-            k_param,
-            mM,
-            mKprev,
-            mKcurr,
-            mDMsum_part,
-            mDMp0,
-            mDMchunk,
-            mDM,
-            mDKprev,
-            mDKcurr,
+        boundary_wrapper = _make_boundary_host_wrapper(
+            spec=(L, P, D, BHC),
+            cfg=(L,),
         )
-        cached = (compiled_db, compiled_du, compiled_boundary, compiled_param)
+        param_wrapper = _make_param_host_wrapper(
+            spec=(L, BHC),
+            cfg=(L, nDtiles),
+        )
+        stage_wrapper = _make_stage_host_wrapper(
+            spec=(L, P, D, BHC),
+            cfg=(L, nDtiles),
+        )
+        compiled_db = cute.compile(db_wrapper, *db_args)
+        compiled_du = cute.compile(du_wrapper, *du_args)
+        compiled_boundary = cute.compile(boundary_wrapper, *boundary_args)
+        compiled_param = cute.compile(param_wrapper, *param_args)
+        compiled_stage = cute.compile(stage_wrapper, *stage_args)
+        cached = (
+            compiled_db,
+            compiled_du,
+            compiled_boundary,
+            compiled_param,
+            compiled_stage,
+        )
         _COMPILED_CACHE[cache_key] = cached
     else:
-        compiled_db, compiled_du, compiled_boundary, compiled_param = cached
+        compiled_db, compiled_du, compiled_boundary, compiled_param, compiled_stage = (
+            cached
+        )
 
     dB_view = dB.reshape(Bsz, H, n_chunks, L, D)
     dU_view = dU.reshape(Bsz, H, n_chunks, L, P)
@@ -409,90 +766,11 @@ def compile_chunk_increment_bwd_kernels(
     dKprev_view = dKprev_out.permute(2, 1, 0).reshape(Bsz, H, n_chunks, L, 2)
     dKcurr_view = dKcurr_out.permute(2, 1, 0).reshape(Bsz, H, n_chunks, L, 2)
 
-    def _launch_db() -> None:
-        compiled_db(mU, mB, mM, mKprev, mKcurr, mDInc_DP, mDB, mDMsum_part)
-
-    def _launch_du() -> None:
-        compiled_du(mDInc, mB, mM, mKprev, mKcurr, mDU)
-
-    def _launch_boundary() -> None:
-        compiled_boundary(
-            mDInc_boundary,
-            mBPrev,
-            mUPrev,
-            mM,
-            mKprev,
-            mDUPrev,
-            mDBPrev,
-            mDMp0,
-        )
-
-    def _launch_param() -> None:
-        compiled_param(
-            mM,
-            mKprev,
-            mKcurr,
-            mDMsum_part,
-            mDMp0,
-            mDMchunk,
-            mDM,
-            mDKprev,
-            mDKcurr,
-        )
-
     def launch_sequential() -> None:
-        _launch_db()
-        _launch_du()
-        _launch_boundary()
-        _launch_param()
-
-    stream_db = None
-    stream_du = None
-    stream_boundary = None
-    ev_start = None
-    ev_db_done = None
-    ev_du_done = None
-    ev_boundary_done = None
-
-    if return_launchers and enable_overlapped_launcher:
-        (
-            stream_db,
-            stream_du,
-            stream_boundary,
-            ev_start,
-            ev_db_done,
-            ev_du_done,
-            ev_boundary_done,
-        ) = _get_overlap_resources(U.device)
+        compiled_stage(*stage_args)
 
     def launch_overlapped() -> None:
-        if stream_db is None or stream_du is None or stream_boundary is None:
-            launch_sequential()
-            return
-
-        current = torch.cuda.current_stream(device=U.device)
-        current.record_event(ev_start)
-
-        stream_db.wait_event(ev_start)
-        stream_du.wait_event(ev_start)
-        stream_boundary.wait_event(ev_start)
-
-        with torch.cuda.stream(stream_db):
-            _launch_db()
-            stream_db.record_event(ev_db_done)
-
-        with torch.cuda.stream(stream_du):
-            _launch_du()
-            stream_du.record_event(ev_du_done)
-
-        with torch.cuda.stream(stream_boundary):
-            _launch_boundary()
-            stream_boundary.record_event(ev_boundary_done)
-
-        current.wait_event(ev_db_done)
-        current.wait_event(ev_boundary_done)
-        _launch_param()
-        current.wait_event(ev_du_done)
+        launch_sequential()
 
     base = (
         compiled_db,
