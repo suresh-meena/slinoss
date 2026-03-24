@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import cutlass
 import cutlass.cute as cute
 
-from .common import _TileConfig
+from .common import _TileConfig, _make_layout_bundle, _thread_tile_view
+
+
+@dataclass(frozen=True)
+class StatePassingReductionCopyBundle:
+    copy_vec: object
+    copy_scalar: object
 
 
 class StatePassingBwdMAmpere:
@@ -18,6 +26,22 @@ class StatePassingBwdMAmpere:
         self.cfg = cfg
         self.copy_bits_in = int(copy_bits_in)
 
+    @staticmethod
+    def _make_copy_atom(dtype: type[cutlass.Numeric], num_bits: int):
+        return cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            dtype,
+            num_bits_per_copy=int(num_bits),
+        )
+
+    def _make_copy_bundle(
+        self, *, in_dtype: type[cutlass.Numeric]
+    ) -> StatePassingReductionCopyBundle:
+        return StatePassingReductionCopyBundle(
+            copy_vec=self._make_copy_atom(in_dtype, self.copy_bits_in),
+            copy_scalar=self._make_copy_atom(in_dtype, in_dtype.width),
+        )
+
     @cute.jit
     def __call__(
         self,
@@ -29,19 +53,15 @@ class StatePassingBwdMAmpere:
         BH = B * H
         S = P * D
 
-        layout_bcs = cute.make_layout((BH, C, S), stride=(C * S, S, 1))
+        layouts = _make_layout_bundle(BH=BH, C=C, S=S, cfg=self.cfg)
+        copies = self._make_copy_bundle(in_dtype=chunk_starts.element_type)
 
-        starts_flat = cute.make_tensor(chunk_starts.iterator, layout_bcs)
-        dinc_flat = cute.make_tensor(d_inc.iterator, layout_bcs)
-        layout_bcm = cute.make_layout((BH, C, 2), stride=(C * 2, 2, 1))
-        dm_flat = cute.make_tensor(d_m_chunk.iterator, layout_bcm)
+        starts_flat = cute.make_tensor(chunk_starts.iterator, layouts.layout_bcs)
+        dinc_flat = cute.make_tensor(d_inc.iterator, layouts.layout_bcs)
+        dm_flat = cute.make_tensor(d_m_chunk.iterator, layouts.layout_bcm)
 
-        tv_layout = cute.make_layout(
-            (self.cfg.num_threads, self.cfg.elems_per_thread),
-            stride=(self.cfg.elems_per_thread, 1),
-        )
         idS = cute.make_identity_tensor(S)
-        cS = cute.zipped_divide(idS, tiler=cute.make_layout(self.cfg.tile))
+        cS = cute.zipped_divide(idS, tiler=layouts.tile_layout)
 
         grid_x = C
         grid_y = BH
@@ -50,7 +70,10 @@ class StatePassingBwdMAmpere:
             dinc_flat,
             dm_flat,
             cS,
-            tv_layout,
+            layouts.tile_layout,
+            layouts.tv_layout,
+            copies.copy_vec,
+            copies.copy_scalar,
         ).launch(
             grid=[grid_x, grid_y, 1],
             block=[self.cfg.num_threads, 1, 1],
@@ -63,7 +86,10 @@ class StatePassingBwdMAmpere:
         dinc_flat: cute.Tensor,  # (BH, C, S)
         dm_flat: cute.Tensor,  # (BH, C, 2)
         cS: cute.Tensor,
+        tile_layout: cute.Layout,
         tv_layout: cute.Layout,
+        copy_vec,
+        copy_scalar,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         c, bh, _ = cute.arch.block_idx()
@@ -71,19 +97,6 @@ class StatePassingBwdMAmpere:
         warp = cute.arch.warp_idx()
 
         S = starts_flat.shape[2]
-
-        copy_vec = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            starts_flat.element_type,
-            num_bits_per_copy=self.copy_bits_in,
-        )
-        copy_scalar = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            starts_flat.element_type,
-            num_bits_per_copy=starts_flat.element_type.width,
-        )
-
-        tile_layout = cute.make_layout(cS.shape[0])
         pairs_per_thread = self.cfg.elems_per_thread // 2
 
         dmr = cutlass.Float32(0.0)
@@ -109,14 +122,8 @@ class StatePassingBwdMAmpere:
             gZ = starts_flat[bh, c, None]
             gG = dinc_flat[bh, c, None]
 
-            tZ = cute.zipped_divide(gZ, tiler=tile_layout)
-            tG = cute.zipped_divide(gG, tiler=tile_layout)
-            ctaZ = tZ[cta_coord]
-            ctaG = tG[cta_coord]
-            tidZ = cute.composition(ctaZ, tv_layout)
-            tidG = cute.composition(ctaG, tv_layout)
-            thrZ = tidZ[tidx, None]
-            thrG = tidG[tidx, None]
+            thrZ = _thread_tile_view(gZ, tile_layout, cta_coord, tv_layout, tidx)
+            thrG = _thread_tile_view(gG, tile_layout, cta_coord, tv_layout, tidx)
 
             frgZ = cute.make_rmem_tensor_like(thrZ)
             frgG = cute.make_rmem_tensor_like(thrG)

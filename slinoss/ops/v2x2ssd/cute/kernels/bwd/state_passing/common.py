@@ -25,6 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import cutlass
+import cutlass.cute as cute
 import torch
 
 
@@ -101,3 +102,45 @@ class _TileConfig:
     @property
     def tile(self) -> int:
         return int(self.num_threads) * self.elems_per_thread
+
+
+@dataclass(frozen=True)
+class StatePassingLayoutBundle:
+    layout_bcs: object
+    layout_bcm: object
+    layout_bs: object
+    tile_layout: object
+    tv_layout: object
+
+
+def _make_layout_bundle(
+    *,
+    BH: int,
+    C: int,
+    S: int,
+    cfg: _TileConfig,
+) -> StatePassingLayoutBundle:
+    return StatePassingLayoutBundle(
+        layout_bcs=cute.make_layout((BH, C, S), stride=(C * S, S, 1)),
+        layout_bcm=cute.make_layout((BH, C, 2), stride=(C * 2, 2, 1)),
+        layout_bs=cute.make_layout((BH, S), stride=(S, 1)),
+        tile_layout=cute.make_layout(cfg.tile),
+        tv_layout=cute.make_layout(
+            (cfg.num_threads, cfg.elems_per_thread),
+            stride=(cfg.elems_per_thread, 1),
+        ),
+    )
+
+
+@cute.jit
+def _thread_tile_view(
+    g_tensor: cute.Tensor,
+    tile_layout: cute.Layout,
+    cta_coord,
+    tv_layout: cute.Layout,
+    tidx: cutlass.Int32,
+):
+    t_tensor = cute.zipped_divide(g_tensor, tiler=tile_layout)
+    cta_tensor = t_tensor[cta_coord]
+    tid_tensor = cute.composition(cta_tensor, tv_layout)
+    return tid_tensor[tidx, None]

@@ -1,9 +1,22 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import cutlass
 import cutlass.cute as cute
 
-from .common import _TileConfig
+from .common import _TileConfig, _make_layout_bundle, _thread_tile_view
+
+
+@dataclass(frozen=True)
+class StatePassingCopyBundle:
+    copy_in_vec: object
+    copy_in_scalar: object
+    copy_out_vec: object
+    copy_out_scalar: object
+    copy_final_vec: object
+    copy_final_scalar: object
+    copy_m: object
 
 
 class StatePassingBwdStateAmpere:
@@ -20,6 +33,32 @@ class StatePassingBwdStateAmpere:
         self.copy_bits_in = int(copy_bits_in)
         self.copy_bits_out = int(copy_bits_out)
 
+    @staticmethod
+    def _make_copy_atom(dtype: type[cutlass.Numeric], num_bits: int):
+        return cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            dtype,
+            num_bits_per_copy=int(num_bits),
+        )
+
+    def _make_copy_bundle(
+        self,
+        *,
+        in_dtype: type[cutlass.Numeric],
+        out_dtype: type[cutlass.Numeric],
+        final_dtype: type[cutlass.Numeric],
+        m_dtype: type[cutlass.Numeric],
+    ) -> StatePassingCopyBundle:
+        return StatePassingCopyBundle(
+            copy_in_vec=self._make_copy_atom(in_dtype, self.copy_bits_in),
+            copy_in_scalar=self._make_copy_atom(in_dtype, in_dtype.width),
+            copy_out_vec=self._make_copy_atom(out_dtype, self.copy_bits_out),
+            copy_out_scalar=self._make_copy_atom(out_dtype, out_dtype.width),
+            copy_final_vec=self._make_copy_atom(final_dtype, self.copy_bits_in),
+            copy_final_scalar=self._make_copy_atom(final_dtype, final_dtype.width),
+            copy_m=self._make_copy_atom(m_dtype, m_dtype.width * 2),
+        )
+
     @cute.jit
     def __call__(
         self,
@@ -33,22 +72,22 @@ class StatePassingBwdStateAmpere:
         BH = B * H
         S = P * D
 
-        layout_bcs = cute.make_layout((BH, C, S), stride=(C * S, S, 1))
-        layout_bs = cute.make_layout((BH, S), stride=(S, 1))
-        layout_bcm = cute.make_layout((BH, C, 2), stride=(C * 2, 2, 1))
-
-        dstarts_flat = cute.make_tensor(d_chunk_starts.iterator, layout_bcs)
-        dfinal_flat = cute.make_tensor(d_final.iterator, layout_bs)
-        m_flat = cute.make_tensor(m_chunk.iterator, layout_bcm)
-        dinc_flat = cute.make_tensor(d_inc.iterator, layout_bcs)
-        dinitial_flat = cute.make_tensor(d_initial.iterator, layout_bs)
-
-        tv_layout = cute.make_layout(
-            (self.cfg.num_threads, self.cfg.elems_per_thread),
-            stride=(self.cfg.elems_per_thread, 1),
+        layouts = _make_layout_bundle(BH=BH, C=C, S=S, cfg=self.cfg)
+        copies = self._make_copy_bundle(
+            in_dtype=d_chunk_starts.element_type,
+            out_dtype=d_inc.element_type,
+            final_dtype=d_final.element_type,
+            m_dtype=m_chunk.element_type,
         )
+
+        dstarts_flat = cute.make_tensor(d_chunk_starts.iterator, layouts.layout_bcs)
+        dfinal_flat = cute.make_tensor(d_final.iterator, layouts.layout_bs)
+        m_flat = cute.make_tensor(m_chunk.iterator, layouts.layout_bcm)
+        dinc_flat = cute.make_tensor(d_inc.iterator, layouts.layout_bcs)
+        dinitial_flat = cute.make_tensor(d_initial.iterator, layouts.layout_bs)
+
         idS = cute.make_identity_tensor(S)
-        cS = cute.zipped_divide(idS, tiler=cute.make_layout(self.cfg.tile))
+        cS = cute.zipped_divide(idS, tiler=layouts.tile_layout)
 
         grid_x = cute.ceil_div(S, self.cfg.tile)
         grid_y = BH
@@ -60,7 +99,15 @@ class StatePassingBwdStateAmpere:
             dinc_flat,
             dinitial_flat,
             cS,
-            tv_layout,
+            layouts.tile_layout,
+            layouts.tv_layout,
+            copies.copy_in_vec,
+            copies.copy_in_scalar,
+            copies.copy_out_vec,
+            copies.copy_out_scalar,
+            copies.copy_final_vec,
+            copies.copy_final_scalar,
+            copies.copy_m,
         ).launch(
             grid=[grid_x, grid_y, 1],
             block=[self.cfg.num_threads, 1, 1],
@@ -75,7 +122,15 @@ class StatePassingBwdStateAmpere:
         dinc_flat: cute.Tensor,  # (BH, C, S)
         dinitial_flat: cute.Tensor,  # (BH, S)
         cS: cute.Tensor,
+        tile_layout: cute.Layout,
         tv_layout: cute.Layout,
+        copy_in_vec,
+        copy_in_scalar,
+        copy_out_vec,
+        copy_out_scalar,
+        copy_final_vec,
+        copy_final_scalar,
+        copy_m,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         tile_idx, bh, _ = cute.arch.block_idx()
@@ -99,59 +154,17 @@ class StatePassingBwdStateAmpere:
             for i in cutlass.range_constexpr(cute.size(frgPred)):
                 frgPred[i] = cute.elem_less(thrCrd[i], S)
 
-        copy_in_vec = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            dstarts_flat.element_type,
-            num_bits_per_copy=self.copy_bits_in,
-        )
-        copy_in_scalar = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            dstarts_flat.element_type,
-            num_bits_per_copy=dstarts_flat.element_type.width,
-        )
-        copy_out_vec = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            dinc_flat.element_type,
-            num_bits_per_copy=self.copy_bits_out,
-        )
-        copy_out_scalar = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            dinc_flat.element_type,
-            num_bits_per_copy=dinc_flat.element_type.width,
-        )
-        copy_df_vec = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            dfinal_flat.element_type,
-            num_bits_per_copy=self.copy_bits_in,
-        )
-        copy_df_scalar = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            dfinal_flat.element_type,
-            num_bits_per_copy=dfinal_flat.element_type.width,
-        )
-
-        copy_m = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            m_flat.element_type,
-            num_bits_per_copy=m_flat.element_type.width * 2,
-        )
-
-        tile_layout = cute.make_layout(cS.shape[0])
-
         gF = dfinal_flat[bh, None]
-        tF = cute.zipped_divide(gF, tiler=tile_layout)
-        ctaF = tF[cta_coord]
-        tidF = cute.composition(ctaF, tv_layout)
-        thrF = tidF[tidx, None]
+        thrF = _thread_tile_view(gF, tile_layout, cta_coord, tv_layout, tidx)
 
         accG = cute.make_rmem_tensor(thrF.shape, cutlass.Float32)
         accG.fill(0.0)
         frgF = cute.make_rmem_tensor_like(thrF)
         frgF.fill(0)
         if is_partial_tile:
-            cute.copy(copy_df_scalar, thrF, frgF, pred=frgPred)
+            cute.copy(copy_final_scalar, thrF, frgF, pred=frgPred)
         else:
-            cute.copy(copy_df_vec, thrF, frgF)
+            cute.copy(copy_final_vec, thrF, frgF)
         accG.store(frgF.load().to(cutlass.Float32))
 
         frgIn = cute.make_rmem_tensor_like(thrF)
@@ -161,10 +174,7 @@ class StatePassingBwdStateAmpere:
             c = C - 1 - c_it
 
             gOut = dinc_flat[bh, c, None]
-            tOut = cute.zipped_divide(gOut, tiler=tile_layout)
-            ctaOut = tOut[cta_coord]
-            tidOut = cute.composition(ctaOut, tv_layout)
-            thrOut = tidOut[tidx, None]
+            thrOut = _thread_tile_view(gOut, tile_layout, cta_coord, tv_layout, tidx)
 
             frgTmp = cute.make_rmem_tensor_like(thrOut)
             frgTmp.store(accG.load().to(dinc_flat.element_type))
@@ -174,10 +184,7 @@ class StatePassingBwdStateAmpere:
                 cute.copy(copy_out_vec, frgTmp, thrOut)
 
             gIn = dstarts_flat[bh, c, None]
-            tIn = cute.zipped_divide(gIn, tiler=tile_layout)
-            ctaIn = tIn[cta_coord]
-            tidIn = cute.composition(ctaIn, tv_layout)
-            thrIn = tidIn[tidx, None]
+            thrIn = _thread_tile_view(gIn, tile_layout, cta_coord, tv_layout, tidx)
 
             frgIn.fill(0)
             if is_partial_tile:
@@ -215,10 +222,7 @@ class StatePassingBwdStateAmpere:
                 accG[base + 1] = ri + dstart_f32[base + 1]
 
         gI = dinitial_flat[bh, None]
-        tI = cute.zipped_divide(gI, tiler=tile_layout)
-        ctaI = tI[cta_coord]
-        tidI = cute.composition(ctaI, tv_layout)
-        thrI = tidI[tidx, None]
+        thrI = _thread_tile_view(gI, tile_layout, cta_coord, tv_layout, tidx)
 
         frgTmp = cute.make_rmem_tensor_like(thrI)
         frgTmp.store(accG.load().to(dinitial_flat.element_type))
