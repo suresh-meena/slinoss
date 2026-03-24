@@ -103,6 +103,7 @@ def _compiled_key(
     pairs_per_thread: int,
     copy_bits_state: int,
     copy_bits_out: int,
+    copy_bits_final: int,
     alignments: tuple[int, ...],
 ) -> tuple:
     return (
@@ -116,6 +117,7 @@ def _compiled_key(
         int(pairs_per_thread),
         int(copy_bits_state),
         int(copy_bits_out),
+        int(copy_bits_final),
         alignments,
     )
 
@@ -126,7 +128,7 @@ def _make_state_passing_state_host_wrapper(
     cfg: tuple[int, ...],
 ):
     B, H, C, P, D = spec
-    num_threads, pairs_per_thread, copy_bits_state, copy_bits_out = cfg
+    num_threads, pairs_per_thread, copy_bits_state, copy_bits_out, copy_bits_final = cfg
 
     d_starts_spec = _make_tensor_spec((B, H, C, P, D))
     d_final_spec = _make_tensor_spec((B, H, P, D))
@@ -155,6 +157,7 @@ def _make_state_passing_state_host_wrapper(
             ),
             copy_bits_in=copy_bits_state,
             copy_bits_out=copy_bits_out,
+            copy_bits_final=copy_bits_final,
         )
         kernel(mDStarts, mDFinal, mM, mDInc, mDInit)
 
@@ -257,6 +260,11 @@ def compile_state_passing_bwd_kernels(
         tile_stride_elems=S,
         elems_per_thread=cfg.elems_per_thread,
     )
+    copy_bits_final = _choose_copy_bits_for_linear_tiles(
+        d_final,
+        tile_stride_elems=S,
+        elems_per_thread=cfg.elems_per_thread,
+    )
     copy_bits_out = _choose_copy_bits_for_linear_tiles(
         d_inc,
         tile_stride_elems=S,
@@ -290,6 +298,7 @@ def compile_state_passing_bwd_kernels(
         pairs_per_thread=cfg.pairs_per_thread,
         copy_bits_state=copy_bits_state,
         copy_bits_out=copy_bits_out,
+        copy_bits_final=copy_bits_final,
         alignments=alignments,
     )
 
@@ -302,6 +311,7 @@ def compile_state_passing_bwd_kernels(
                 cfg.pairs_per_thread,
                 copy_bits_state,
                 copy_bits_out,
+                copy_bits_final,
             ),
         )
         m_wrapper = _make_state_passing_m_host_wrapper(
@@ -323,8 +333,10 @@ def compile_state_passing_bwd_kernels(
         compiled_state(*state_args)
         compiled_m(*m_args)
 
-    def launch_overlapped() -> None:
-        launch_sequential()
+    # ``d_m_chunk`` depends on the freshly produced ``d_inc`` values, so this stage
+    # has no real overlapped schedule. Keep the second launcher only for interface
+    # compatibility with the larger backward stages.
+    launch_overlapped = launch_sequential
 
     base = (compiled_state, compiled_m, d_inc, d_m_chunk, d_initial)
     if return_launchers:

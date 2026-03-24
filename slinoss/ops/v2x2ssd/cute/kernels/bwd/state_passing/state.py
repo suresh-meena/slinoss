@@ -28,10 +28,12 @@ class StatePassingBwdStateAmpere:
         *,
         copy_bits_in: int,
         copy_bits_out: int,
+        copy_bits_final: int,
     ):
         self.cfg = cfg
         self.copy_bits_in = int(copy_bits_in)
         self.copy_bits_out = int(copy_bits_out)
+        self.copy_bits_final = int(copy_bits_final)
 
     @staticmethod
     def _make_copy_atom(dtype: type[cutlass.Numeric], num_bits: int):
@@ -54,7 +56,7 @@ class StatePassingBwdStateAmpere:
             copy_in_scalar=self._make_copy_atom(in_dtype, in_dtype.width),
             copy_out_vec=self._make_copy_atom(out_dtype, self.copy_bits_out),
             copy_out_scalar=self._make_copy_atom(out_dtype, out_dtype.width),
-            copy_final_vec=self._make_copy_atom(final_dtype, self.copy_bits_in),
+            copy_final_vec=self._make_copy_atom(final_dtype, self.copy_bits_final),
             copy_final_scalar=self._make_copy_atom(final_dtype, final_dtype.width),
             copy_m=self._make_copy_atom(m_dtype, m_dtype.width * 2),
         )

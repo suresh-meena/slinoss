@@ -241,6 +241,7 @@ def _bwd_host_cache_key(
     state_pairs_per_thread: int,
     state_copy_bits_state: int,
     state_copy_bits_out: int,
+    state_copy_bits_final: int,
     n_d_tiles: int,
     alignments: tuple[int, ...],
 ) -> tuple:
@@ -265,6 +266,7 @@ def _bwd_host_cache_key(
         int(state_pairs_per_thread),
         int(state_copy_bits_state),
         int(state_copy_bits_out),
+        int(state_copy_bits_final),
         int(n_d_tiles),
         alignments,
     )
@@ -485,6 +487,11 @@ def _build_backward_args(
         tile_stride_elems=P * D,
         elems_per_thread=state_cfg.elems_per_thread,
     )
+    state_copy_bits_final = _choose_copy_bits_for_linear_tiles(
+        d_final,
+        tile_stride_elems=P * D,
+        elems_per_thread=state_cfg.elems_per_thread,
+    )
     state_copy_bits_out = _choose_copy_bits_for_linear_tiles(
         d_inc,
         tile_stride_elems=P * D,
@@ -567,6 +574,7 @@ def _build_backward_args(
         int(state_pairs_per_thread),
         int(state_copy_bits_state),
         int(state_copy_bits_out),
+        int(state_copy_bits_final),
     )
 
     dU_scan_view = dU_scan.reshape(Bsz, H, n_chunks, L, P)
@@ -643,6 +651,7 @@ def _make_v2x2ssd_bwd_host_wrapper(
         state_pairs_per_thread,
         state_copy_bits_state,
         state_copy_bits_out,
+        state_copy_bits_final,
     ) = cfg
     BH = Bsz * H
     BHC = BH * n_chunks
@@ -918,6 +927,7 @@ def _make_v2x2ssd_bwd_host_wrapper(
             state_cfg,
             copy_bits_in=state_copy_bits_state,
             copy_bits_out=state_copy_bits_out,
+            copy_bits_final=state_copy_bits_final,
         )
         state_m_bwd = StatePassingBwdMAmpere(
             state_cfg, copy_bits_in=state_copy_bits_state
@@ -1102,6 +1112,7 @@ def compile_v2x2ssd_bwd_cute(
         state_pairs_per_thread=int(state_pairs_per_thread),
         state_copy_bits_state=int(cfg[6]),
         state_copy_bits_out=int(cfg[7]),
+        state_copy_bits_final=int(cfg[8]),
         n_d_tiles=int(spec[7]),
         alignments=alignments,
     )
@@ -1181,6 +1192,7 @@ def v2x2ssd_bwd_cute(
         state_pairs_per_thread=int(state_pairs_per_thread),
         state_copy_bits_state=int(cfg[6]),
         state_copy_bits_out=int(cfg[7]),
+        state_copy_bits_final=int(cfg[8]),
         n_d_tiles=int(spec[7]),
         alignments=alignments,
     )
