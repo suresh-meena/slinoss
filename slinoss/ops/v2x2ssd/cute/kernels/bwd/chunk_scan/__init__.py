@@ -321,6 +321,16 @@ def _public_dk_from_parts(
     )
 
 
+def _resolve_dz0_cta_tiler(*, D: int) -> tuple[int, int, int]:
+    # The 96-wide D tile is fine when it covers the state width cleanly, but
+    # mixed full+tail tiling perturbs the current dz0 epilogue on realistic
+    # D=2N mixer shapes. Use the same tail-safe family selection as the forward
+    # chunk-increment path.
+    if D <= 96 or D % 96 == 0:
+        return (64, 96, 32)
+    return (64, 128, 32)
+
+
 def _compiled_key(
     *,
     device_index: int,
@@ -334,6 +344,7 @@ def _compiled_key(
     d_out_shape: tuple[int, ...],
     chunk_size: int,
     has_prev: bool,
+    dz0_cta_tiler: tuple[int, int, int],
     alignments: tuple[int, ...],
     num_threads_du: int,
     num_threads_db: int,
@@ -353,6 +364,7 @@ def _compiled_key(
         d_out_shape,
         int(chunk_size),
         has_prev,
+        dz0_cta_tiler,
         alignments,
         int(num_threads_du),
         int(num_threads_db),
@@ -364,9 +376,9 @@ def _compiled_key(
 def _make_dz0_host_wrapper(
     *,
     spec: tuple[tuple[int, ...], ...],
-    cfg: tuple[int, ...],
+    cfg: tuple[int, tuple[int, int, int]],
 ):
-    (chunk_size,) = cfg
+    chunk_size, dz0_cta_tiler = cfg
     d_out_spec, c_spec, m_spec, dz0_spec = spec
 
     @cute.jit
@@ -381,7 +393,11 @@ def _make_dz0_host_wrapper(
         mM = _make_tensor_from_spec(M_ptr, m_spec)
         mDZ0 = _make_tensor_from_spec(DZ0_ptr, dz0_spec)
 
-        kernel = ChunkScanBwdDZ0Ampere(DOut_ptr.value_type, chunk_size=chunk_size)
+        kernel = ChunkScanBwdDZ0Ampere(
+            DOut_ptr.value_type,
+            chunk_size=chunk_size,
+            cta_tiler=dz0_cta_tiler,
+        )
         kernel(mDOut, mC, mM, mDZ0)
 
     return _dz0_host_wrapper
@@ -742,6 +758,7 @@ def compile_chunk_scan_bwd_kernels(
     device_index = (
         U.device.index if U.device.index is not None else torch.cuda.current_device()
     )
+    dz0_cta_tiler = _resolve_dz0_cta_tiler(D=D)
     _validate_dcdr_support(
         tc_dtype=tc_dtype,
         chunk_size=L,
@@ -961,6 +978,7 @@ def compile_chunk_scan_bwd_kernels(
         d_out_shape=tuple(d_out.shape),
         chunk_size=L,
         has_prev=B_prev is not None,
+        dz0_cta_tiler=dz0_cta_tiler,
         alignments=alignments,
         num_threads_du=num_threads_du,
         num_threads_db=num_threads_db,
@@ -978,7 +996,7 @@ def compile_chunk_scan_bwd_kernels(
                 _make_tensor_spec_from_tensor(M2),
                 _make_tensor_spec_from_tensor(dZ0_perm),
             ),
-            cfg=(L,),
+            cfg=(L, dz0_cta_tiler),
         )
         du_wrapper = _make_du_host_wrapper(
             spec=tuple(

@@ -113,6 +113,45 @@ def test_chunk_increment_cute_matches_reference_stage() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_chunk_increment_cute_matches_reference_stage_mixer_regime() -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+    inputs = _make_inputs(
+        b=2,
+        h=4,
+        T=49,
+        N=64,
+        P=64,
+        dtype=torch.float32,
+        device=torch.device("cuda"),
+        streaming=False,
+    )
+
+    inc_ref, m_ref = reference_chunk_increment(
+        inputs.U,
+        inputs.M,
+        inputs.K,
+        inputs.B,
+        B_prev=None,
+        U_prev=None,
+        T=inputs.U.shape[2],
+        chunk_size=32,
+        compute_dtype=torch.float32,
+    )
+    inc_cute, m_cute = chunk_increment_cute(
+        inputs.U,
+        inputs.M,
+        inputs.K,
+        inputs.B,
+        chunk_size=32,
+        compute_dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(inc_cute, inc_ref, atol=2e-4, rtol=0.0)
+    torch.testing.assert_close(m_cute, m_ref, atol=2e-5, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_chunk_increment_compile_entrypoint_reuses_cache() -> None:
     pytest.importorskip("cutlass")
     torch.manual_seed(0)

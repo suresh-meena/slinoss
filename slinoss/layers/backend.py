@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
 
@@ -256,7 +256,7 @@ class ReferenceScanBackend:
 
 
 class CuteScanBackend:
-    """Stateless CuTe backend wrapper for the staged ``v2x2ssd`` operator."""
+    """CuTe backend wrapper for the staged ``v2x2ssd`` operator."""
 
     def __init__(self, *, compute_dtype: torch.dtype | None = None) -> None:
         self.compute_dtype = compute_dtype
@@ -268,29 +268,53 @@ class CuteScanBackend:
         chunk_size: int,
         state: ScanState | None = None,
         return_state: bool | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, ScanState]:
         if return_state is None:
             return_state = state is not None
-        if state is not None or return_state:
-            raise NotImplementedError(
-                "CuTe scan backend currently supports only stateless execution."
-            )
+        scan_state = ScanState() if state is None else state
 
         output_dtype = inputs.U.dtype
         compute_dtype = self.compute_dtype
         if compute_dtype is None:
             compute_dtype = _default_compute_dtype(output_dtype)
 
-        return v2x2ssd_cute(
-            inputs.U,
-            inputs.M,
-            inputs.K,
-            inputs.B,
-            inputs.C,
-            chunk_size=chunk_size,
-            compute_dtype=compute_dtype,
-            output_dtype=output_dtype,
+        if not return_state:
+            return cast(
+                torch.Tensor,
+                v2x2ssd_cute(
+                    inputs.U,
+                    inputs.M,
+                    inputs.K,
+                    inputs.B,
+                    inputs.C,
+                    chunk_size=chunk_size,
+                    initial_states=scan_state.state,
+                    B_prev=scan_state.b_prev,
+                    U_prev=scan_state.u_prev,
+                    compute_dtype=compute_dtype,
+                    output_dtype=output_dtype,
+                    return_state=False,
+                ),
+            )
+        y, final_state, b_last, u_last = cast(
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+            v2x2ssd_cute(
+                inputs.U,
+                inputs.M,
+                inputs.K,
+                inputs.B,
+                inputs.C,
+                chunk_size=chunk_size,
+                initial_states=scan_state.state,
+                B_prev=scan_state.b_prev,
+                U_prev=scan_state.u_prev,
+                compute_dtype=compute_dtype,
+                output_dtype=output_dtype,
+                return_state=True,
+            ),
         )
+        next_state = ScanState(state=final_state, b_prev=b_last, u_prev=u_last)
+        return y, next_state
 
 
 class AutoScanBackend:

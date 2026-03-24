@@ -5,6 +5,9 @@ import torch
 
 from slinoss.layers import (
     AutoScanBackend,
+    CuteScanBackend,
+    ReferenceCConv1dBackend,
+    ReferenceScanPrepBackend,
     SLinOSSMixer,
     ScanInputs,
     ScanPrepInputs,
@@ -403,6 +406,138 @@ def test_mixer_torch_compile_runs_training_with_cute_boundaries() -> None:
     for param in mixer.parameters():
         if param.grad is not None:
             assert torch.isfinite(param.grad).all()
+
+
+def test_mixer_cute_segmented_forward_matches_single_pass() -> None:
+    if not torch.cuda.is_available():
+        return
+
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+    mixer = SLinOSSMixer(
+        128,
+        d_state=64,
+        expand=2,
+        d_head=64,
+        d_conv=4,
+        chunk_size=32,
+        normalize_bc=True,
+        backend=CuteScanBackend(),
+        scanprep_backend=ReferenceScanPrepBackend(),
+        cconv_backend=ReferenceCConv1dBackend(),
+        device="cuda",
+        dtype=torch.float32,
+    ).eval()
+    x = torch.randn((2, 49, 128), device="cuda", dtype=torch.float32)
+
+    y_full, state_full = mixer(x, return_state=True)
+    y_a, state = mixer(x[:, :17, :], return_state=True)
+    y_b, state = mixer(x[:, 17:, :], state=state, return_state=True)
+
+    assert state_full.scan.state is not None
+    assert state_full.scan.b_prev is not None
+    assert state_full.scan.u_prev is not None
+    assert state.scan.state is not None
+    assert state.scan.b_prev is not None
+    assert state.scan.u_prev is not None
+    for tensor in (
+        y_full,
+        y_a,
+        y_b,
+        state_full.scan.state,
+        state_full.scan.b_prev,
+        state_full.scan.u_prev,
+        state.scan.state,
+        state.scan.b_prev,
+        state.scan.u_prev,
+    ):
+        assert torch.isfinite(tensor).all()
+
+    y_segmented = torch.cat([y_a, y_b], dim=1)
+    torch.testing.assert_close(y_segmented, y_full, atol=1e-3, rtol=0.0)
+    torch.testing.assert_close(
+        state.scan.state, state_full.scan.state, atol=1e-3, rtol=0.0
+    )
+    torch.testing.assert_close(
+        state.scan.b_prev, state_full.scan.b_prev, atol=1e-3, rtol=0.0
+    )
+    torch.testing.assert_close(
+        state.scan.u_prev, state_full.scan.u_prev, atol=1e-3, rtol=0.0
+    )
+
+
+def test_mixer_cute_segmented_training_matches_single_pass() -> None:
+    if not torch.cuda.is_available():
+        return
+
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+    mixer_full = SLinOSSMixer(
+        128,
+        d_state=64,
+        expand=2,
+        d_head=64,
+        d_conv=4,
+        chunk_size=32,
+        normalize_bc=True,
+        backend=CuteScanBackend(),
+        scanprep_backend=ReferenceScanPrepBackend(),
+        cconv_backend=ReferenceCConv1dBackend(),
+        device="cuda",
+        dtype=torch.float32,
+    ).train()
+    mixer_seg = SLinOSSMixer(
+        128,
+        d_state=64,
+        expand=2,
+        d_head=64,
+        d_conv=4,
+        chunk_size=32,
+        normalize_bc=True,
+        backend=CuteScanBackend(),
+        scanprep_backend=ReferenceScanPrepBackend(),
+        cconv_backend=ReferenceCConv1dBackend(),
+        device="cuda",
+        dtype=torch.float32,
+    ).train()
+    mixer_seg.load_state_dict(mixer_full.state_dict())
+
+    x_full = torch.randn(
+        (2, 33, 128), device="cuda", dtype=torch.float32, requires_grad=True
+    )
+    x_seg = x_full.detach().clone().requires_grad_(True)
+    weight = torch.randn((2, 33, 128), device="cuda", dtype=torch.float32)
+
+    y_full = mixer_full(x_full)
+    loss_full = (y_full * weight).sum()
+    loss_full.backward()
+
+    y_a, state = mixer_seg(x_seg[:, :17, :], return_state=True)
+    y_b, state = mixer_seg(x_seg[:, 17:, :], state=state, return_state=True)
+    y_seg = torch.cat([y_a, y_b], dim=1)
+    loss_seg = (y_seg * weight).sum()
+    loss_seg.backward()
+
+    assert x_full.grad is not None
+    assert x_seg.grad is not None
+    assert torch.isfinite(y_full).all()
+    assert torch.isfinite(y_seg).all()
+    assert torch.isfinite(x_full.grad).all()
+    assert torch.isfinite(x_seg.grad).all()
+
+    torch.testing.assert_close(y_seg, y_full, atol=2e-3, rtol=0.0)
+    torch.testing.assert_close(x_seg.grad, x_full.grad, atol=2e-2, rtol=0.0)
+    for (name_full, param_full), (name_seg, param_seg) in zip(
+        mixer_full.named_parameters(),
+        mixer_seg.named_parameters(),
+        strict=True,
+    ):
+        assert name_full == name_seg
+        assert param_full.grad is not None
+        assert param_seg.grad is not None
+        assert torch.isfinite(param_full.grad).all()
+        assert torch.isfinite(param_seg.grad).all()
+        torch.testing.assert_close(param_seg.grad, param_full.grad, atol=2e-2, rtol=0.0)
 
 
 def test_mixer_step_matches_full_forward() -> None:

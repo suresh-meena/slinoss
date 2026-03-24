@@ -27,6 +27,7 @@ _CHUNK_SCAN_CACHE: dict[tuple, object] = {}
 _FWD_HOST_CACHE: dict[tuple, object] = {}
 _ZERO_PREV_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
 _ZERO_INITIAL_STATE_CACHE: dict[tuple, torch.Tensor] = {}
+_DUMMY_FINAL_STATE_CACHE: dict[tuple, torch.Tensor] = {}
 
 
 def _get_zero_prev_tensors(
@@ -84,6 +85,33 @@ def _get_zero_initial_state(
     return cached
 
 
+def _get_dummy_final_state(
+    *,
+    device: torch.device,
+    batch_size: int,
+    heads: int,
+    P: int,
+    D: int,
+) -> torch.Tensor:
+    key = (
+        device.type,
+        device.index if device.index is not None else -1,
+        int(batch_size),
+        int(heads),
+        int(P),
+        int(D),
+    )
+    cached = _DUMMY_FINAL_STATE_CACHE.get(key)
+    if cached is None:
+        cached = torch.empty(
+            (batch_size, heads, P, D),
+            device=device,
+            dtype=torch.float32,
+        )
+        _DUMMY_FINAL_STATE_CACHE[key] = cached
+    return cached
+
+
 def _get_fwd_workspace(
     *,
     device: torch.device,
@@ -92,14 +120,11 @@ def _get_fwd_workspace(
     n_chunks: int,
     P: int,
     D: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    return (
-        torch.empty(
-            (batch_size, heads, n_chunks, P, D),
-            device=device,
-            dtype=torch.float32,
-        ),
-        torch.empty((batch_size, heads, P, D), device=device, dtype=torch.float32),
+) -> torch.Tensor:
+    return torch.empty(
+        (batch_size, heads, n_chunks, P, D),
+        device=device,
+        dtype=torch.float32,
     )
 
 
@@ -333,6 +358,7 @@ def _chunk_increment_key(
     B_shape: tuple[int, ...],
     chunk_size: int,
     has_prev: bool,
+    cta_tiler: tuple[int, int, int],
     alignments: tuple[int, ...],
 ) -> tuple:
     return (
@@ -345,6 +371,7 @@ def _chunk_increment_key(
         B_shape,
         int(chunk_size),
         has_prev,
+        tuple(int(dim) for dim in cta_tiler),
         alignments,
     )
 
@@ -415,6 +442,17 @@ def _chunk_scan_key(
     )
 
 
+def _resolve_chunk_increment_cta_tiler(*, D: int) -> tuple[int, int, int]:
+    # The 96-wide N tile is efficient when it covers the full state width, but
+    # mixed full+tail tiling can perturb the current epilogue path on realistic
+    # D=2N mixer shapes. Pick a tail-safe family instead of changing semantics.
+    if D <= 96 or D % 96 == 0:
+        return (64, 96, 32)
+    if D % 128 == 0:
+        return (64, 128, 32)
+    return (64, 64, 32)
+
+
 def _make_chunk_scan_host_wrapper(
     *,
     spec: tuple[int, ...],
@@ -469,7 +507,11 @@ def _make_chunk_scan_host_wrapper(
     return _chunk_scan_host_wrapper
 
 
-def _make_chunk_increment_host_wrapper(*, spec: tuple[int, ...]):
+def _make_chunk_increment_host_wrapper(
+    *,
+    spec: tuple[int, ...],
+    cta_tiler: tuple[int, int, int],
+):
     Bsz, H, T_pad, P, D, n_chunks, L = spec
     BH = Bsz * H
     BHC = BH * n_chunks
@@ -505,7 +547,11 @@ def _make_chunk_increment_host_wrapper(*, spec: tuple[int, ...]):
         mInc = _make_tensor_from_spec(Inc_ptr, inc_spec)
         mMchunk = _make_tensor_from_spec(Mchunk_ptr, m_chunk_spec)
 
-        chunk_increment = ChunkIncrementFwdAmpere(U_ptr.value_type, chunk_size=L)
+        chunk_increment = ChunkIncrementFwdAmpere(
+            U_ptr.value_type,
+            chunk_size=L,
+            cta_tiler=cta_tiler,
+        )
         chunk_increment(mU, mB, mM, mKprev, mKcurr, mU_prev0, mB_prev0, mInc, mMchunk)
 
     return _chunk_increment_host_wrapper
@@ -619,6 +665,7 @@ def _compile_chunk_increment_kernel_impl(
 
     BH = Bsz * H
     BHC = BH * n_chunks
+    cta_tiler = _resolve_chunk_increment_cta_tiler(D=D)
 
     inc_chunk = torch.zeros((BHC, P, D), device=U.device, dtype=torch.float32)
     m_chunk_chunk = torch.zeros((BHC, 2), device=U.device, dtype=torch.float32)
@@ -646,13 +693,15 @@ def _compile_chunk_increment_kernel_impl(
         B_shape=tuple(B.shape),
         chunk_size=L,
         has_prev=U_prev0 is not None,
+        cta_tiler=cta_tiler,
         alignments=alignments,
     )
 
     compiled = _CHUNK_INCREMENT_CACHE.get(cache_key)
     if compiled is None:
         host_wrapper = _make_chunk_increment_host_wrapper(
-            spec=(Bsz, H, T_pad, P, D, n_chunks, L)
+            spec=(Bsz, H, T_pad, P, D, n_chunks, L),
+            cta_tiler=cta_tiler,
         )
         compiled = cute.compile(host_wrapper, *dynamic_args)
         _CHUNK_INCREMENT_CACHE[cache_key] = compiled
@@ -1130,6 +1179,7 @@ def _fwd_host_cache_key(
     state_copy_bits_in: int,
     state_copy_bits_out: int,
     state_copy_bits_state: int,
+    has_init: bool,
     alignments: tuple[int, ...],
 ) -> tuple:
     return (
@@ -1151,6 +1201,7 @@ def _fwd_host_cache_key(
         int(state_copy_bits_in),
         int(state_copy_bits_out),
         int(state_copy_bits_state),
+        bool(has_init),
         alignments,
     )
 
@@ -1170,6 +1221,10 @@ def _build_forward_args(
     scan_num_threads: int,
     state_num_threads: int,
     state_vecs_per_thread: int,
+    initial_states: torch.Tensor | None = None,
+    B_prev: torch.Tensor | None = None,
+    U_prev: torch.Tensor | None = None,
+    return_final_state: bool = False,
     prepared_inputs: tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1183,10 +1238,12 @@ def _build_forward_args(
     tuple[int, ...],
     tuple[int, ...],
     tuple[int, ...],
-    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor],
 ]:
     if U.device.type != "cuda":
         raise ValueError("CUDA tensor required.")
+    if (B_prev is None) ^ (U_prev is None):
+        raise ValueError("B_prev and U_prev must be passed together (or both omitted).")
     if U.dtype != B.dtype or U.dtype != C.dtype:
         raise ValueError("U/B/C must share dtype.")
     if U.dtype not in (torch.float16, torch.bfloat16, torch.float32):
@@ -1206,6 +1263,20 @@ def _build_forward_args(
         raise ValueError(f"K must be (B,H,T,2,2)={(Bsz, H, T, 2, 2)}.")
     if D % 2 != 0:
         raise ValueError("B/C last dim must be divisible by 2.")
+    if initial_states is not None:
+        if not torch.is_floating_point(initial_states):
+            raise TypeError("initial_states must be floating-point.")
+        if tuple(initial_states.shape) != (Bsz, H, P, D):
+            raise ValueError("initial_states must be (B,H,P,D) matching scan inputs.")
+        if initial_states.device != U.device:
+            raise ValueError("initial_states must be on the same device as U.")
+    if B_prev is not None:
+        if not torch.is_floating_point(B_prev) or not torch.is_floating_point(U_prev):
+            raise TypeError("B_prev and U_prev must be floating-point.")
+        if tuple(B_prev.shape) != (Bsz, H, D) or tuple(U_prev.shape) != (Bsz, H, P):
+            raise ValueError("B_prev/U_prev must be (B,H,D)/(B,H,P).")
+        if B_prev.device != U.device or U_prev.device != U.device:
+            raise ValueError("B_prev and U_prev must be on the same device as U.")
 
     L = int(chunk_size)
     if L <= 0:
@@ -1276,16 +1347,20 @@ def _build_forward_args(
         ):
             raise ValueError("prepared K_f must match padded scan parameter layout.")
 
-    U_prev0, B_prev0 = _get_zero_prev_tensors(
-        device=U.device,
-        dtype=tc_dtype,
-        batch_size=Bsz,
-        heads=H,
-        P=P,
-        D=D,
-    )
+    if B_prev is None:
+        U_prev0, B_prev0 = _get_zero_prev_tensors(
+            device=U.device,
+            dtype=tc_dtype,
+            batch_size=Bsz,
+            heads=H,
+            P=P,
+            D=D,
+        )
+    else:
+        U_prev0 = U_prev.to(dtype=tc_dtype).contiguous()
+        B_prev0 = B_prev.to(dtype=tc_dtype).contiguous()
 
-    inc, final_state = _get_fwd_workspace(
+    inc = _get_fwd_workspace(
         device=U.device,
         batch_size=Bsz,
         heads=H,
@@ -1293,13 +1368,32 @@ def _build_forward_args(
         P=P,
         D=D,
     )
-    initial_state0 = _get_zero_initial_state(
-        device=U.device,
-        batch_size=Bsz,
-        heads=H,
-        P=P,
-        D=D,
-    )
+    if initial_states is None:
+        initial_state0 = _get_zero_initial_state(
+            device=U.device,
+            batch_size=Bsz,
+            heads=H,
+            P=P,
+            D=D,
+        )
+        has_init = False
+    else:
+        initial_state0 = initial_states.to(dtype=torch.float32).contiguous()
+        has_init = True
+    final_state_workspace = None
+    if return_final_state:
+        final_state_workspace = torch.empty(
+            (Bsz, H, P, D), device=U.device, dtype=torch.float32
+        )
+        final_state = final_state_workspace
+    else:
+        final_state = _get_dummy_final_state(
+            device=U.device,
+            batch_size=Bsz,
+            heads=H,
+            P=P,
+            D=D,
+        )
     m_chunk = torch.empty((Bsz, H, n_chunks, 2), device=U.device, dtype=torch.float32)
     chunk_starts = torch.empty(
         (Bsz, H, n_chunks, P, D), device=U.device, dtype=torch.float32
@@ -1357,6 +1451,7 @@ def _build_forward_args(
         int(state_copy_bits_in),
         int(state_copy_bits_out),
         int(state_copy_bits_state),
+        has_init,
     )
     return (
         dynamic_args,
@@ -1365,6 +1460,7 @@ def _build_forward_args(
         cfg,
         (
             out_pad[:, :, :T, :],
+            final_state_workspace,
             m_chunk,
             chunk_starts,
         ),
@@ -1377,6 +1473,7 @@ def _make_v2x2ssd_fwd_host_wrapper(
     cfg: tuple[int, ...],
 ):
     Bsz, H, T_pad, P, D, n_chunks, L = spec
+    chunk_increment_cta_tiler = _resolve_chunk_increment_cta_tiler(D=D)
     (
         m_block_size,
         n_block_size,
@@ -1386,6 +1483,7 @@ def _make_v2x2ssd_fwd_host_wrapper(
         state_copy_bits_in,
         state_copy_bits_out,
         state_copy_bits_state,
+        has_init,
     ) = cfg
     BH = Bsz * H
     BHC = BH * n_chunks
@@ -1462,7 +1560,11 @@ def _make_v2x2ssd_fwd_host_wrapper(
 
         tc_dtype = U_ptr.value_type
 
-        chunk_increment = ChunkIncrementFwdAmpere(tc_dtype, chunk_size=L)
+        chunk_increment = ChunkIncrementFwdAmpere(
+            tc_dtype,
+            chunk_size=L,
+            cta_tiler=chunk_increment_cta_tiler,
+        )
         chunk_increment(
             mU_inc,
             mB_inc,
@@ -1481,7 +1583,7 @@ def _make_v2x2ssd_fwd_host_wrapper(
             copy_bits_in=state_copy_bits_in,
             copy_bits_out=state_copy_bits_out,
             copy_bits_state=state_copy_bits_state,
-            has_init=False,
+            has_init=has_init,
         )
         # Keep the stateless dummy init separate from the final-state output.
         # Aliasing these makes the fused path effectively stateful across calls.
@@ -1533,6 +1635,9 @@ def compile_v2x2ssd_fwd_cute(
     scan_num_threads: int = 128,
     state_num_threads: int = 128,
     state_vecs_per_thread: int = 8,
+    initial_states: torch.Tensor | None = None,
+    B_prev: torch.Tensor | None = None,
+    U_prev: torch.Tensor | None = None,
 ) -> object:
     dynamic_args, alignments, spec, cfg, _outputs = _build_forward_args(
         U,
@@ -1548,6 +1653,9 @@ def compile_v2x2ssd_fwd_cute(
         scan_num_threads=scan_num_threads,
         state_num_threads=state_num_threads,
         state_vecs_per_thread=state_vecs_per_thread,
+        initial_states=initial_states,
+        B_prev=B_prev,
+        U_prev=U_prev,
     )
     cache_key = _fwd_host_cache_key(
         device_index=(U.device.index if U.device.index is not None else -1),
@@ -1567,6 +1675,7 @@ def compile_v2x2ssd_fwd_cute(
         state_copy_bits_in=int(cfg[5]),
         state_copy_bits_out=int(cfg[6]),
         state_copy_bits_state=int(cfg[7]),
+        has_init=bool(cfg[8]),
         alignments=alignments,
     )
     cached = _FWD_HOST_CACHE.get(cache_key)
@@ -1594,6 +1703,10 @@ def v2x2ssd_fwd_cute(
     scan_num_threads: int = 128,
     state_num_threads: int = 128,
     state_vecs_per_thread: int = 8,
+    initial_states: torch.Tensor | None = None,
+    B_prev: torch.Tensor | None = None,
+    U_prev: torch.Tensor | None = None,
+    return_final_state: bool = False,
     prepared_inputs: tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1602,7 +1715,10 @@ def v2x2ssd_fwd_cute(
         torch.Tensor,
     ]
     | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> (
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+):
     dynamic_args, alignments, spec, cfg, outputs = _build_forward_args(
         U,
         M,
@@ -1617,6 +1733,10 @@ def v2x2ssd_fwd_cute(
         scan_num_threads=scan_num_threads,
         state_num_threads=state_num_threads,
         state_vecs_per_thread=state_vecs_per_thread,
+        initial_states=initial_states,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        return_final_state=return_final_state,
         prepared_inputs=prepared_inputs,
     )
     cache_key = _fwd_host_cache_key(
@@ -1637,6 +1757,7 @@ def v2x2ssd_fwd_cute(
         state_copy_bits_in=int(cfg[5]),
         state_copy_bits_out=int(cfg[6]),
         state_copy_bits_state=int(cfg[7]),
+        has_init=bool(cfg[8]),
         alignments=alignments,
     )
     compiled = _FWD_HOST_CACHE.get(cache_key)
@@ -1645,7 +1766,11 @@ def v2x2ssd_fwd_cute(
         compiled = cute.compile(host_wrapper, *dynamic_args)
         _FWD_HOST_CACHE[cache_key] = compiled
     compiled(*dynamic_args)
-    return outputs
+    Y, final_state, m_chunk, chunk_starts = outputs
+    if not return_final_state:
+        return Y, m_chunk, chunk_starts
+    assert final_state is not None
+    return Y, final_state, m_chunk, chunk_starts
 
 
 __all__ = [

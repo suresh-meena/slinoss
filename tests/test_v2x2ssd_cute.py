@@ -338,6 +338,97 @@ def test_v2x2ssd_cute_stateless_forward_is_mode_invariant() -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_v2x2ssd_cute_stateful_forward_is_mode_invariant() -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
+        batch=2,
+        heads=4,
+        T=65,
+        N=32,
+        P=64,
+        device=torch.device("cuda"),
+        value_dtype=torch.float32,
+    )
+    for tensor in (U, M, K, B, C, initial_states, B_prev, U_prev):
+        tensor.requires_grad_()
+
+    with torch.enable_grad():
+        out_grad = v2x2ssd_cute(
+            U,
+            M,
+            K,
+            B,
+            C,
+            chunk_size=64,
+            initial_states=initial_states,
+            B_prev=B_prev,
+            U_prev=U_prev,
+            compute_dtype=torch.float32,
+            output_dtype=torch.float32,
+            return_state=True,
+        )
+    with torch.no_grad():
+        out_no_grad = v2x2ssd_cute(
+            U,
+            M,
+            K,
+            B,
+            C,
+            chunk_size=64,
+            initial_states=initial_states,
+            B_prev=B_prev,
+            U_prev=U_prev,
+            compute_dtype=torch.float32,
+            output_dtype=torch.float32,
+            return_state=True,
+        )
+    with torch.inference_mode():
+        out_infer = v2x2ssd_cute(
+            U,
+            M,
+            K,
+            B,
+            C,
+            chunk_size=64,
+            initial_states=initial_states,
+            B_prev=B_prev,
+            U_prev=U_prev,
+            compute_dtype=torch.float32,
+            output_dtype=torch.float32,
+            return_state=True,
+        )
+
+    for output_tuple in (out_grad, out_no_grad, out_infer):
+        for tensor in output_tuple:
+            assert torch.isfinite(tensor).all()
+
+    for got, want in zip(out_no_grad, out_grad, strict=True):
+        torch.testing.assert_close(got, want, atol=0.0, rtol=0.0)
+    for got, want in zip(out_infer, out_grad, strict=True):
+        torch.testing.assert_close(got, want, atol=0.0, rtol=0.0)
+
+    with torch.no_grad():
+        out_repeat = v2x2ssd_cute(
+            U,
+            M,
+            K,
+            B,
+            C,
+            chunk_size=64,
+            initial_states=initial_states,
+            B_prev=B_prev,
+            U_prev=U_prev,
+            compute_dtype=torch.float32,
+            output_dtype=torch.float32,
+            return_state=True,
+        )
+    for got, want in zip(out_repeat, out_no_grad, strict=True):
+        torch.testing.assert_close(got, want, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_v2x2ssd_cute_training_backward_is_repeatable() -> None:
     pytest.importorskip("cutlass")
 
@@ -625,3 +716,214 @@ def test_v2x2ssd_cute_matches_reference_autograd_training_only() -> None:
         # scatter/reduction back to public layout. The remaining slices stay on
         # the tighter exact budget.
         torch.testing.assert_close(got, want, atol=atol_by_grad[name], rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_v2x2ssd_cute_matches_reference_autograd_with_state() -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
+        batch=2,
+        heads=2,
+        T=65,
+        N=8,
+        P=16,
+        device=torch.device("cuda"),
+    )
+    chunk_size = 32
+    y_weight = torch.randn((2, 2, 65, 16), device="cuda", dtype=torch.float32)
+    state_weight = torch.randn((2, 2, 16, 16), device="cuda", dtype=torch.float32)
+    b_last_weight = torch.randn((2, 2, 16), device="cuda", dtype=torch.float32)
+    u_last_weight = torch.randn((2, 2, 16), device="cuda", dtype=torch.float32)
+
+    def run(
+        op, tensors: tuple[torch.Tensor, ...]
+    ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+        U_i, M_i, K_i, B_i, C_i, initial_i, B_prev_i, U_prev_i = tensors
+        if op is v2x2ssd:
+            outputs = op(
+                U_i,
+                M_i,
+                K_i,
+                B_i,
+                C_i,
+                chunk_size=chunk_size,
+                initial_states=initial_i,
+                B_prev=B_prev_i,
+                U_prev=U_prev_i,
+                compute_dtype=torch.float32,
+                output_dtype=torch.float32,
+            )
+        else:
+            outputs = op(
+                U_i,
+                M_i,
+                K_i,
+                B_i,
+                C_i,
+                chunk_size=chunk_size,
+                initial_states=initial_i,
+                B_prev=B_prev_i,
+                U_prev=U_prev_i,
+                compute_dtype=torch.float32,
+                output_dtype=torch.float32,
+                return_state=True,
+            )
+        Y, final_state, B_last, U_last = outputs
+        loss = (
+            (Y * y_weight).sum()
+            + (final_state * state_weight).sum()
+            + (B_last * b_last_weight).sum()
+            + (U_last * u_last_weight).sum()
+        )
+        grads = torch.autograd.grad(
+            loss,
+            (U_i, M_i, K_i, B_i, C_i, initial_i, B_prev_i, U_prev_i),
+            retain_graph=False,
+        )
+        return outputs, grads
+
+    ref_tensors = tuple(
+        tensor.detach().clone().requires_grad_(True)
+        for tensor in (U, M, K, B, C, initial_states, B_prev, U_prev)
+    )
+    cute_tensors = tuple(
+        tensor.detach().clone().requires_grad_(True)
+        for tensor in (U, M, K, B, C, initial_states, B_prev, U_prev)
+    )
+
+    ref_out, ref_grads = run(v2x2ssd, ref_tensors)
+    cute_out, cute_grads = run(v2x2ssd_cute, cute_tensors)
+
+    for got, want in zip(cute_out, ref_out, strict=True):
+        torch.testing.assert_close(got, want, atol=1e-3, rtol=0.0)
+
+    grad_names = ("U", "M", "K", "B", "C", "initial_states", "B_prev", "U_prev")
+    atol_by_grad = {
+        "U": 1e-1,
+        "M": 3e-1,
+        "K": 5e-1,
+        "B": 4e-1,
+        "C": 3e-1,
+        "initial_states": 5e-3,
+        "B_prev": 5e-3,
+        "U_prev": 5e-3,
+    }
+    for name, got, want in zip(grad_names, cute_grads, ref_grads, strict=True):
+        torch.testing.assert_close(got, want, atol=atol_by_grad[name], rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_v2x2ssd_cute_segmented_training_matches_single_pass_for_realistic_shape() -> (
+    None
+):
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    U, M, K, B, C, initial_states, B_prev, U_prev = _make_scan_inputs(
+        batch=1,
+        heads=2,
+        T=33,
+        N=64,
+        P=64,
+        device=torch.device("cuda"),
+    )
+    chunk_size = 32
+    weight = torch.randn((1, 2, 33, 64), device="cuda", dtype=torch.float32)
+
+    full_tensors = tuple(
+        tensor.detach().clone().requires_grad_(True)
+        for tensor in (U, M, K, B, C, initial_states, B_prev, U_prev)
+    )
+
+    seg1_tensors = (
+        U[:, :, :17, :].contiguous().detach().clone().requires_grad_(True),
+        M[:, :, :17, :].contiguous().detach().clone().requires_grad_(True),
+        K[:, :, :17, :, :].contiguous().detach().clone().requires_grad_(True),
+        B[:, :, :17, :].contiguous().detach().clone().requires_grad_(True),
+        C[:, :, :17, :].contiguous().detach().clone().requires_grad_(True),
+    )
+    seg2_tensors = (
+        U[:, :, 17:, :].contiguous().detach().clone().requires_grad_(True),
+        M[:, :, 17:, :].contiguous().detach().clone().requires_grad_(True),
+        K[:, :, 17:, :, :].contiguous().detach().clone().requires_grad_(True),
+        B[:, :, 17:, :].contiguous().detach().clone().requires_grad_(True),
+        C[:, :, 17:, :].contiguous().detach().clone().requires_grad_(True),
+    )
+    initial_seg = initial_states.detach().clone().requires_grad_(True)
+    B_prev_seg = B_prev.detach().clone().requires_grad_(True)
+    U_prev_seg = U_prev.detach().clone().requires_grad_(True)
+
+    Y_full, _final_full, _B_last_full, _U_last_full = v2x2ssd_cute(
+        full_tensors[0],
+        full_tensors[1],
+        full_tensors[2],
+        full_tensors[3],
+        full_tensors[4],
+        chunk_size=chunk_size,
+        initial_states=full_tensors[5],
+        B_prev=full_tensors[6],
+        U_prev=full_tensors[7],
+        compute_dtype=torch.float32,
+        output_dtype=torch.float32,
+        return_state=True,
+    )
+    loss_full = (Y_full * weight).sum()
+    full_grads = torch.autograd.grad(loss_full, full_tensors)
+
+    Y_a, final_state_a, B_last_a, U_last_a = v2x2ssd_cute(
+        seg1_tensors[0],
+        seg1_tensors[1],
+        seg1_tensors[2],
+        seg1_tensors[3],
+        seg1_tensors[4],
+        chunk_size=chunk_size,
+        initial_states=initial_seg,
+        B_prev=B_prev_seg,
+        U_prev=U_prev_seg,
+        compute_dtype=torch.float32,
+        output_dtype=torch.float32,
+        return_state=True,
+    )
+    Y_b, _final_state_b, _B_last_b, _U_last_b = v2x2ssd_cute(
+        seg2_tensors[0],
+        seg2_tensors[1],
+        seg2_tensors[2],
+        seg2_tensors[3],
+        seg2_tensors[4],
+        chunk_size=chunk_size,
+        initial_states=final_state_a,
+        B_prev=B_last_a,
+        U_prev=U_last_a,
+        compute_dtype=torch.float32,
+        output_dtype=torch.float32,
+        return_state=True,
+    )
+    Y_seg = torch.cat((Y_a, Y_b), dim=2)
+    loss_seg = (Y_seg * weight).sum()
+    seg_grads = torch.autograd.grad(
+        loss_seg,
+        (
+            *seg1_tensors,
+            *seg2_tensors,
+            initial_seg,
+            B_prev_seg,
+            U_prev_seg,
+        ),
+    )
+
+    torch.testing.assert_close(Y_seg, Y_full, atol=2e-4, rtol=0.0)
+
+    gradient_pairs = (
+        ("U", torch.cat((seg_grads[0], seg_grads[5]), dim=2), full_grads[0], 5e-4),
+        ("M", torch.cat((seg_grads[1], seg_grads[6]), dim=2), full_grads[1], 5e-3),
+        ("K", torch.cat((seg_grads[2], seg_grads[7]), dim=2), full_grads[2], 5e-3),
+        ("B", torch.cat((seg_grads[3], seg_grads[8]), dim=2), full_grads[3], 5e-3),
+        ("C", torch.cat((seg_grads[4], seg_grads[9]), dim=2), full_grads[4], 2e-3),
+        ("initial", seg_grads[10], full_grads[5], 5e-5),
+        ("B_prev", seg_grads[11], full_grads[6], 2e-3),
+        ("U_prev", seg_grads[12], full_grads[7], 5e-4),
+    )
+    for _name, got, want, atol in gradient_pairs:
+        torch.testing.assert_close(got, want, atol=atol, rtol=0.0)

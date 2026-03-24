@@ -127,6 +127,48 @@ def _reference_du_grads(
     )
 
 
+def _reference_boundary_grads(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    chunk_starts: torch.Tensor,
+    d_out: torch.Tensor,
+    *,
+    B_prev: torch.Tensor,
+    U_prev: torch.Tensor,
+    T: int,
+    chunk_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    chunk_starts_ref = chunk_starts.detach().clone().requires_grad_(True)
+    B_prev_ref = B_prev.detach().clone().requires_grad_(True)
+    U_prev_ref = U_prev.detach().clone().requires_grad_(True)
+    y_ref = ref_chunk_scan(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_starts_ref,
+        B_prev=B_prev_ref,
+        U_prev=U_prev_ref,
+        T=T,
+        chunk_size=chunk_size,
+        output_dtype=torch.float32,
+        compute_dtype=torch.float32,
+    )
+    loss = (y_ref * d_out).sum()
+    dZ0_ref, dB_prev_ref, dU_prev_ref = torch.autograd.grad(
+        loss, (chunk_starts_ref, B_prev_ref, U_prev_ref)
+    )
+    return (
+        dZ0_ref.to(dtype=torch.float32).contiguous(),
+        dB_prev_ref.to(dtype=torch.float32).contiguous(),
+        dU_prev_ref.to(dtype=torch.float32).contiguous(),
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_chunk_scan_bwd_compile_entrypoint_matches_public_stage() -> None:
     pytest.importorskip("cutlass")
@@ -424,6 +466,75 @@ def test_chunk_scan_bwd_matches_reference_when_value_axis_exceeds_state_axis(
 
     torch.testing.assert_close(dU_public, dU_ref, atol=2e-4, rtol=0.0)
     torch.testing.assert_close(dU_prev_public, dU_prev_ref, atol=1e-4, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_chunk_scan_bwd_matches_reference_dz0_for_realistic_stateful_shape() -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    batch, heads, T, N, P = 2, 4, 17, 64, 64
+    chunk_size = 32
+    device = torch.device("cuda")
+
+    U, M, K, B, C, B_prev, U_prev = _make_inputs(
+        batch=batch,
+        heads=heads,
+        T=T,
+        N=N,
+        P=P,
+        device=device,
+    )
+    inc, m_chunk = chunk_increment(
+        U,
+        M,
+        K,
+        B,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        T=T,
+        chunk_size=chunk_size,
+        compute_dtype=torch.float32,
+    )
+    chunk_starts, _ = state_passing(
+        inc,
+        m_chunk,
+        initial_states=None,
+        compute_dtype=torch.float32,
+    )
+    d_out = torch.randn((batch, heads, T, P), device=device, dtype=torch.float32)
+
+    dZ0_ref, dB_prev_ref, dU_prev_ref = _reference_boundary_grads(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_starts,
+        d_out,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        T=T,
+        chunk_size=chunk_size,
+    )
+
+    _dU, _dM, _dK, _dB, _dC, dZ0, dB_prev, dU_prev = chunk_scan_bwd_cute(
+        U,
+        M,
+        K,
+        B,
+        C,
+        chunk_starts,
+        d_out,
+        chunk_size=chunk_size,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        compute_dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(dZ0, dZ0_ref, atol=1e-3, rtol=0.0)
+    torch.testing.assert_close(dB_prev, dB_prev_ref, atol=2e-3, rtol=0.0)
+    torch.testing.assert_close(dU_prev, dU_prev_ref, atol=2e-4, rtol=0.0)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

@@ -22,6 +22,7 @@ from .chunk_scan import (
     _public_dk_from_parts,
     _public_from_chunked,
     _public_from_param_scan,
+    _resolve_dz0_cta_tiler,
 )
 from .chunk_scan.db import ChunkScanBwdDBAmpere
 from .chunk_scan.dlp import ChunkScanBwdDLPAmpere
@@ -276,6 +277,7 @@ def _bwd_host_cache_key(
     state_copy_bits_out: int,
     state_copy_bits_final: int,
     n_d_tiles: int,
+    dz0_cta_tiler: tuple[int, int, int],
     alignments: tuple[int, ...],
 ) -> tuple:
     return (
@@ -301,6 +303,7 @@ def _bwd_host_cache_key(
         int(state_copy_bits_out),
         int(state_copy_bits_final),
         int(n_d_tiles),
+        dz0_cta_tiler,
         alignments,
     )
 
@@ -323,6 +326,9 @@ def _build_backward_args(
     scan_num_threads_param: int,
     state_num_threads: int,
     state_pairs_per_thread: int,
+    B_prev: torch.Tensor | None = None,
+    U_prev: torch.Tensor | None = None,
+    d_final_state: torch.Tensor | None = None,
     prepared_inputs: tuple[
         torch.Tensor,
         torch.Tensor,
@@ -335,13 +341,15 @@ def _build_backward_args(
     tuple[object, ...],
     tuple[int, ...],
     tuple[int, ...],
-    tuple[int, ...],
+    tuple[object, ...],
     tuple[torch.Tensor, ...],
 ]:
     if U.device.type != "cuda":
         raise ValueError("CUDA tensor required.")
     if U.dtype != B.dtype or U.dtype != C.dtype:
         raise ValueError("U/B/C must share dtype.")
+    if (B_prev is None) ^ (U_prev is None):
+        raise ValueError("B_prev and U_prev must be passed together (or both omitted).")
     if U.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise TypeError("U/B/C must be float16/bfloat16/float32.")
     if M.dtype != torch.float32 or K.dtype != torch.float32:
@@ -361,6 +369,16 @@ def _build_backward_args(
         raise ValueError(f"K must be (B,H,T,2,2)={(Bsz, H, T, 2, 2)}.")
     if d_out.shape != (Bsz, H, T, P):
         raise ValueError("d_out must be (B,H,T,P) matching U.")
+    if B_prev is not None:
+        if tuple(B_prev.shape) != (Bsz, H, D) or tuple(U_prev.shape) != (Bsz, H, P):
+            raise ValueError("B_prev/U_prev must be (B,H,D)/(B,H,P).")
+        if B_prev.device != U.device or U_prev.device != U.device:
+            raise ValueError("B_prev/U_prev must be on the same device as U.")
+    if d_final_state is not None:
+        if tuple(d_final_state.shape) != (Bsz, H, P, D):
+            raise ValueError("d_final_state must be (B,H,P,D).")
+        if d_final_state.device != U.device:
+            raise ValueError("d_final_state must be on the same device as U.")
     if D % 2 != 0:
         raise ValueError("D must be divisible by 2.")
 
@@ -381,6 +399,7 @@ def _build_backward_args(
         )
 
     tc_dtype = _tc_input_dtype(U.dtype, compute_dtype)
+    dz0_cta_tiler = _resolve_dz0_cta_tiler(D=D)
 
     if prepared_inputs is None:
         U_tc = _pad_zero_time(U, T_pad=T_pad, dtype=tc_dtype)
@@ -436,21 +455,28 @@ def _build_backward_args(
         else chunk_starts.to(dtype=torch.float32).contiguous()
     )
 
-    U_prev0, B_prev0 = _get_zero_prev_tensors(
-        device=U.device,
-        dtype=tc_dtype,
-        batch_size=Bsz,
-        heads=H,
-        P=P,
-        D=D,
-    )
-    d_final = _get_zero_final_grad(
-        device=U.device,
-        batch_size=Bsz,
-        heads=H,
-        P=P,
-        D=D,
-    )
+    if B_prev is None:
+        U_prev0, B_prev0 = _get_zero_prev_tensors(
+            device=U.device,
+            dtype=tc_dtype,
+            batch_size=Bsz,
+            heads=H,
+            P=P,
+            D=D,
+        )
+    else:
+        U_prev0 = U_prev.to(dtype=tc_dtype).contiguous()
+        B_prev0 = B_prev.to(dtype=tc_dtype).contiguous()
+    if d_final_state is None:
+        d_final = _get_zero_final_grad(
+            device=U.device,
+            batch_size=Bsz,
+            heads=H,
+            P=P,
+            D=D,
+        )
+    else:
+        d_final = d_final_state.to(dtype=torch.float32).contiguous()
 
     BH = Bsz * H
     U_chunks = U_tc.reshape(BH, n_chunks, L, P)
@@ -603,6 +629,7 @@ def _build_backward_args(
         int(state_copy_bits_state),
         int(state_copy_bits_out),
         int(state_copy_bits_final),
+        dz0_cta_tiler,
     )
 
     dU_scan_view = dU_scan.reshape(Bsz, H, n_chunks, L, P)
@@ -644,6 +671,7 @@ def _build_backward_args(
         spec,
         cfg,
         (
+            d_initial,
             dU_scan_view,
             dU_prev_scan_view,
             dB_scan_view,
@@ -667,7 +695,7 @@ def _build_backward_args(
 def _make_v2x2ssd_bwd_host_wrapper(
     *,
     spec: tuple[int, ...],
-    cfg: tuple[int, ...],
+    cfg: tuple[object, ...],
 ):
     Bsz, H, T_pad, P, D, n_chunks, L, n_d_tiles = spec
     (
@@ -680,6 +708,7 @@ def _make_v2x2ssd_bwd_host_wrapper(
         state_copy_bits_state,
         state_copy_bits_out,
         state_copy_bits_final,
+        dz0_cta_tiler,
     ) = cfg
     BH = Bsz * H
     BHC = BH * n_chunks
@@ -872,7 +901,9 @@ def _make_v2x2ssd_bwd_host_wrapper(
             P=P,
             num_threads=scan_num_threads_du,
         )
-        scan_dz0 = ChunkScanBwdDZ0Ampere(tc_dtype, chunk_size=L)
+        scan_dz0 = ChunkScanBwdDZ0Ampere(
+            tc_dtype, chunk_size=L, cta_tiler=dz0_cta_tiler
+        )
         cast_d_inc, cast_grid_x, cast_num_threads = _make_cast_f32_to_tc(
             total_elems=BHC * P * D
         )
@@ -1071,6 +1102,7 @@ def compile_v2x2ssd_bwd_cute(
         state_copy_bits_state=int(cfg[6]),
         state_copy_bits_out=int(cfg[7]),
         state_copy_bits_final=int(cfg[8]),
+        dz0_cta_tiler=cfg[9],
         n_d_tiles=int(spec[7]),
         alignments=alignments,
     )
@@ -1084,7 +1116,7 @@ def compile_v2x2ssd_bwd_cute(
     return compiled
 
 
-def v2x2ssd_bwd_cute(
+def _v2x2ssd_bwd_cute_impl(
     U: torch.Tensor,
     M: torch.Tensor,
     K: torch.Tensor,
@@ -1102,6 +1134,10 @@ def v2x2ssd_bwd_cute(
     scan_num_threads_param: int = 32,
     state_num_threads: int = 128,
     state_pairs_per_thread: int = 8,
+    initial_state_dtype: torch.dtype | None = None,
+    B_prev: torch.Tensor | None = None,
+    U_prev: torch.Tensor | None = None,
+    d_final_state: torch.Tensor | None = None,
     prepared_inputs: tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1110,7 +1146,16 @@ def v2x2ssd_bwd_cute(
         torch.Tensor,
     ]
     | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     dynamic_args, alignments, spec, cfg, outputs = _build_backward_args(
         U,
         M,
@@ -1128,6 +1173,9 @@ def v2x2ssd_bwd_cute(
         scan_num_threads_param=scan_num_threads_param,
         state_num_threads=state_num_threads,
         state_pairs_per_thread=state_pairs_per_thread,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        d_final_state=d_final_state,
         prepared_inputs=prepared_inputs,
     )
     cache_key = _bwd_host_cache_key(
@@ -1151,6 +1199,7 @@ def v2x2ssd_bwd_cute(
         state_copy_bits_state=int(cfg[6]),
         state_copy_bits_out=int(cfg[7]),
         state_copy_bits_final=int(cfg[8]),
+        dz0_cta_tiler=cfg[9],
         n_d_tiles=int(spec[7]),
         alignments=alignments,
     )
@@ -1163,6 +1212,7 @@ def v2x2ssd_bwd_cute(
     compiled(*dynamic_args)
 
     (
+        d_initial,
         dU_scan,
         dU_prev_scan,
         dB_scan,
@@ -1198,10 +1248,132 @@ def v2x2ssd_bwd_cute(
         _public_dk_from_parts(dKprev_scan, dKcurr_scan, T=U.shape[2]),
         _public_from_chunked(dB_public, T=U.shape[2], dtype=B.dtype),
         _public_from_chunked(dC_scan, T=U.shape[2], dtype=C.dtype),
+        d_initial.to(dtype=initial_state_dtype or torch.float32).contiguous(),
+        dB_prev_scan[:, :, 0, :]
+        .to(dtype=B_prev.dtype if B_prev is not None else B.dtype)
+        .contiguous(),
+        dU_prev_scan[:, :, 0, :]
+        .to(dtype=U_prev.dtype if U_prev is not None else U.dtype)
+        .contiguous(),
+    )
+
+
+def v2x2ssd_bwd_cute(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    m_chunk: torch.Tensor,
+    chunk_starts: torch.Tensor,
+    d_out: torch.Tensor,
+    *,
+    chunk_size: int,
+    compute_dtype: torch.dtype | None = None,
+    scan_num_threads_du: int = 128,
+    scan_num_threads_db: int = 128,
+    scan_num_threads_dc: int = 128,
+    scan_num_threads_param: int = 32,
+    state_num_threads: int = 128,
+    state_pairs_per_thread: int = 8,
+    prepared_inputs: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]
+    | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    dU, dM, dK, dB, dC, _d_initial, _dB_prev, _dU_prev = _v2x2ssd_bwd_cute_impl(
+        U,
+        M,
+        K,
+        B,
+        C,
+        m_chunk,
+        chunk_starts,
+        d_out,
+        chunk_size=chunk_size,
+        compute_dtype=compute_dtype,
+        scan_num_threads_du=scan_num_threads_du,
+        scan_num_threads_db=scan_num_threads_db,
+        scan_num_threads_dc=scan_num_threads_dc,
+        scan_num_threads_param=scan_num_threads_param,
+        state_num_threads=state_num_threads,
+        state_pairs_per_thread=state_pairs_per_thread,
+        prepared_inputs=prepared_inputs,
+    )
+    return dU, dM, dK, dB, dC
+
+
+def v2x2ssd_bwd_stateful_cute(
+    U: torch.Tensor,
+    M: torch.Tensor,
+    K: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    m_chunk: torch.Tensor,
+    chunk_starts: torch.Tensor,
+    d_out: torch.Tensor,
+    *,
+    chunk_size: int,
+    initial_state_dtype: torch.dtype | None = None,
+    B_prev: torch.Tensor | None = None,
+    U_prev: torch.Tensor | None = None,
+    d_final_state: torch.Tensor | None = None,
+    compute_dtype: torch.dtype | None = None,
+    scan_num_threads_du: int = 128,
+    scan_num_threads_db: int = 128,
+    scan_num_threads_dc: int = 128,
+    scan_num_threads_param: int = 32,
+    state_num_threads: int = 128,
+    state_pairs_per_thread: int = 8,
+    prepared_inputs: tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]
+    | None = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    return _v2x2ssd_bwd_cute_impl(
+        U,
+        M,
+        K,
+        B,
+        C,
+        m_chunk,
+        chunk_starts,
+        d_out,
+        chunk_size=chunk_size,
+        compute_dtype=compute_dtype,
+        scan_num_threads_du=scan_num_threads_du,
+        scan_num_threads_db=scan_num_threads_db,
+        scan_num_threads_dc=scan_num_threads_dc,
+        scan_num_threads_param=scan_num_threads_param,
+        state_num_threads=state_num_threads,
+        state_pairs_per_thread=state_pairs_per_thread,
+        initial_state_dtype=initial_state_dtype,
+        B_prev=B_prev,
+        U_prev=U_prev,
+        d_final_state=d_final_state,
+        prepared_inputs=prepared_inputs,
     )
 
 
 __all__ = [
     "compile_v2x2ssd_bwd_cute",
     "v2x2ssd_bwd_cute",
+    "v2x2ssd_bwd_stateful_cute",
 ]
