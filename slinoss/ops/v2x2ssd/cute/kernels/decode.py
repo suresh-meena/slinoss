@@ -42,6 +42,8 @@ class MixerDecodeStepFwd:
         self,
         *,
         spec: tuple[int, int, int, int],
+        state_stride: tuple[int, int, int, int] | None = None,
+        final_state_stride: tuple[int, int, int, int] | None = None,
         normalize_bc: bool,
         dt_min: float,
         dt_max: float,
@@ -70,7 +72,17 @@ class MixerDecodeStepFwd:
         self.skip_shape = (self.heads, self.p_size)
         self.skip_stride = make_row_major_stride(self.skip_shape)
         self.state_shape = (self.batch, self.heads, self.p_size, self.d_size)
-        self.state_stride = make_row_major_stride(self.state_shape)
+        default_state_stride = make_row_major_stride(self.state_shape)
+        self.state_stride = (
+            default_state_stride
+            if state_stride is None
+            else tuple(int(v) for v in state_stride)
+        )
+        self.final_state_stride = (
+            self.state_stride
+            if final_state_stride is None
+            else tuple(int(v) for v in final_state_stride)
+        )
         self.prev_b_shape = (self.batch, self.heads, self.d_size)
         self.prev_b_stride = make_row_major_stride(self.prev_b_shape)
         self.prev_u_shape = self.value_shape
@@ -176,7 +188,7 @@ class MixerDecodeStepFwd:
         )
         mFinalState = cute.make_tensor(
             final_state_ptr,
-            cute.make_layout(self.state_shape, stride=self.state_stride),
+            cute.make_layout(self.state_shape, stride=self.final_state_stride),
         )
         mBLast = cute.make_tensor(
             b_last_ptr, cute.make_layout(self.prev_b_shape, stride=self.prev_b_stride)
@@ -304,6 +316,54 @@ class MixerDecodeStepFwd:
             byte_alignment=4,
             swizzle=None,
         )
+        inv0_s = smem.allocate_tensor(
+            element_type=cutlass.Float32,
+            layout=scalar_layout,
+            byte_alignment=4,
+            swizzle=None,
+        )
+        inv1_s = smem.allocate_tensor(
+            element_type=cutlass.Float32,
+            layout=scalar_layout,
+            byte_alignment=4,
+            swizzle=None,
+        )
+        inv2_s = smem.allocate_tensor(
+            element_type=cutlass.Float32,
+            layout=scalar_layout,
+            byte_alignment=4,
+            swizzle=None,
+        )
+        inv3_s = smem.allocate_tensor(
+            element_type=cutlass.Float32,
+            layout=scalar_layout,
+            byte_alignment=4,
+            swizzle=None,
+        )
+        tap_prev_re_s = smem.allocate_tensor(
+            element_type=cutlass.Float32,
+            layout=scalar_layout,
+            byte_alignment=4,
+            swizzle=None,
+        )
+        tap_prev_im_s = smem.allocate_tensor(
+            element_type=cutlass.Float32,
+            layout=scalar_layout,
+            byte_alignment=4,
+            swizzle=None,
+        )
+        tap_curr_re_s = smem.allocate_tensor(
+            element_type=cutlass.Float32,
+            layout=scalar_layout,
+            byte_alignment=4,
+            swizzle=None,
+        )
+        tap_curr_im_s = smem.allocate_tensor(
+            element_type=cutlass.Float32,
+            layout=scalar_layout,
+            byte_alignment=4,
+            swizzle=None,
+        )
 
         if tidx == 0:
             s0 = cutlass.Float32(0.0)
@@ -325,20 +385,10 @@ class MixerDecodeStepFwd:
             inv1 = cute.rsqrt(s1 / denom + eps_bc)
             inv2 = cute.rsqrt(s2 / denom + eps_bc)
             inv3 = cute.rsqrt(s3 / denom + eps_bc)
-            for n in cutlass.range(self.n_size, unroll_full=True):
-                b_re_v = cutlass.Float32(mBC[bidx, hidx, 0, n]) * inv0
-                b_im_v = cutlass.Float32(mBC[bidx, hidx, 1, n]) * inv1
-                c_re_v = cutlass.Float32(mBC[bidx, hidx, 2, n]) * inv2
-                c_im_v = cutlass.Float32(mBC[bidx, hidx, 3, n]) * inv3
-                if self.normalize_bc:
-                    b_re_v = b_re_v * cutlass.Float32(mBScale[hidx, 0, n])
-                    b_im_v = b_im_v * cutlass.Float32(mBScale[hidx, 1, n])
-                    c_re_v = c_re_v * cutlass.Float32(mCScale[hidx, 0, n])
-                    c_im_v = c_im_v * cutlass.Float32(mCScale[hidx, 1, n])
-                b_re[n] = b_re_v
-                b_im[n] = b_im_v
-                c_re[n] = c_re_v
-                c_im[n] = c_im_v
+            inv0_s[0] = inv0
+            inv1_s[0] = inv1
+            inv2_s[0] = inv2
+            inv3_s[0] = inv3
 
             dt_raw = cutlass.Float32(mParams[bidx, hidx, 0]) + cutlass.Float32(
                 mDtBias[hidx]
@@ -466,31 +516,49 @@ class MixerDecodeStepFwd:
             tap_prev_im = lerp(k_prev_learned_im, k_prev_im, mix_k_prev)
             tap_curr_re = lerp(k_curr_learned_re, k_curr_re, mix_k_curr)
             tap_curr_im = lerp(k_curr_learned_im, k_curr_im, mix_k_curr)
+            tap_prev_re_s[0] = tap_prev_re
+            tap_prev_im_s[0] = tap_prev_im
+            tap_curr_re_s[0] = tap_curr_re
+            tap_curr_im_s[0] = tap_curr_im
 
-            for n in cutlass.range(self.n_size, unroll_full=True):
-                prev_re = cutlass.Float32(mBPrev[bidx, hidx, 2 * n])
-                prev_im = cutlass.Float32(mBPrev[bidx, hidx, 2 * n + 1])
-                beta_prev_re_v, beta_prev_im_v = complex_mul(
-                    tap_prev_re,
-                    tap_prev_im,
-                    prev_re,
-                    prev_im,
-                )
-                beta_curr_re_v, beta_curr_im_v = complex_mul(
-                    tap_curr_re,
-                    tap_curr_im,
-                    b_re[n],
-                    b_im[n],
-                )
-                beta_prev_re[n] = beta_prev_re_v
-                beta_prev_im[n] = beta_prev_im_v
-                beta_curr_re[n] = beta_curr_re_v
-                beta_curr_im[n] = beta_curr_im_v
-                mBLast[bidx, hidx, 2 * n] = b_re[n].to(mBLast.element_type)
-                mBLast[bidx, hidx, 2 * n + 1] = b_im[n].to(mBLast.element_type)
+        cute.arch.barrier()
 
-            for p in cutlass.range(self.p_size, unroll_full=True):
-                mULast[bidx, hidx, p] = mValue[bidx, hidx, p]
+        if tidx < self.n_size:
+            n = tidx
+            b_re_v = cutlass.Float32(mBC[bidx, hidx, 0, n]) * inv0_s[0]
+            b_im_v = cutlass.Float32(mBC[bidx, hidx, 1, n]) * inv1_s[0]
+            c_re_v = cutlass.Float32(mBC[bidx, hidx, 2, n]) * inv2_s[0]
+            c_im_v = cutlass.Float32(mBC[bidx, hidx, 3, n]) * inv3_s[0]
+            if self.normalize_bc:
+                b_re_v = b_re_v * cutlass.Float32(mBScale[hidx, 0, n])
+                b_im_v = b_im_v * cutlass.Float32(mBScale[hidx, 1, n])
+                c_re_v = c_re_v * cutlass.Float32(mCScale[hidx, 0, n])
+                c_im_v = c_im_v * cutlass.Float32(mCScale[hidx, 1, n])
+            b_re[n] = b_re_v
+            b_im[n] = b_im_v
+            c_re[n] = c_re_v
+            c_im[n] = c_im_v
+
+            prev_re = cutlass.Float32(mBPrev[bidx, hidx, 2 * n])
+            prev_im = cutlass.Float32(mBPrev[bidx, hidx, 2 * n + 1])
+            beta_prev_re_v, beta_prev_im_v = complex_mul(
+                tap_prev_re_s[0],
+                tap_prev_im_s[0],
+                prev_re,
+                prev_im,
+            )
+            beta_curr_re_v, beta_curr_im_v = complex_mul(
+                tap_curr_re_s[0],
+                tap_curr_im_s[0],
+                b_re_v,
+                b_im_v,
+            )
+            beta_prev_re[n] = beta_prev_re_v
+            beta_prev_im[n] = beta_prev_im_v
+            beta_curr_re[n] = beta_curr_re_v
+            beta_curr_im[n] = beta_curr_im_v
+            mBLast[bidx, hidx, 2 * n] = b_re_v.to(mBLast.element_type)
+            mBLast[bidx, hidx, 2 * n + 1] = b_im_v.to(mBLast.element_type)
 
         cute.arch.barrier()
 
@@ -525,6 +593,7 @@ class MixerDecodeStepFwd:
             silu_gate = gate * sigmoid(gate)
             y = (acc + u_curr * cutlass.Float32(mSkip[hidx, p])) * silu_gate
             mY[bidx, hidx, p] = y.to(mY.element_type)
+            mULast[bidx, hidx, p] = mValue[bidx, hidx, p]
 
 
 __all__ = ["MixerDecodeStepFwd"]

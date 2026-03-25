@@ -91,6 +91,9 @@ def mixer_decode_step_cute(
     b_scale: torch.Tensor | None,
     c_scale: torch.Tensor | None,
     output_dtype: torch.dtype,
+    final_state_out: torch.Tensor | None = None,
+    b_last_out: torch.Tensor | None = None,
+    u_last_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, heads, P, N = _validate_decode_inputs(
         value,
@@ -141,9 +144,31 @@ def mixer_decode_step_cute(
     )
 
     y = torch.empty((batch, heads, P), device=value.device, dtype=output_dtype)
-    final_state = torch.empty_like(state_c)
-    b_last = torch.empty_like(b_prev_c)
-    u_last = torch.empty_like(u_prev_c)
+    final_state = (
+        final_state_out if final_state_out is not None else torch.empty_like(state_c)
+    )
+    b_last = b_last_out if b_last_out is not None else torch.empty_like(b_prev_c)
+    u_last = u_last_out if u_last_out is not None else torch.empty_like(u_prev_c)
+    if tuple(map(int, final_state.shape)) != tuple(map(int, state_c.shape)):
+        raise ValueError(
+            f"final_state_out must be {tuple(state_c.shape)}. Got {tuple(final_state.shape)}."
+        )
+    if tuple(map(int, b_last.shape)) != tuple(map(int, b_prev_c.shape)):
+        raise ValueError(
+            f"b_last_out must be {tuple(b_prev_c.shape)}. Got {tuple(b_last.shape)}."
+        )
+    if tuple(map(int, u_last.shape)) != tuple(map(int, u_prev_c.shape)):
+        raise ValueError(
+            f"u_last_out must be {tuple(u_prev_c.shape)}. Got {tuple(u_last.shape)}."
+        )
+    state_stride = cast(
+        tuple[int, int, int, int],
+        tuple(int(v) for v in state_c.stride()),
+    )
+    final_state_stride = cast(
+        tuple[int, int, int, int],
+        tuple(int(v) for v in final_state.stride()),
+    )
 
     value_ptr, value_align = make_ptr_arg(value_c)
     params_ptr, params_align = make_ptr_arg(params_c)
@@ -204,6 +229,8 @@ def mixer_decode_step_cute(
         final_state_align,
         b_last_align,
         u_last_align,
+        state_stride,
+        final_state_stride,
         float(dt_min),
         float(dt_max),
         float(r_min),
@@ -220,6 +247,8 @@ def mixer_decode_step_cute(
         compiled = cute.compile(
             MixerDecodeStepFwd(
                 spec=spec,
+                state_stride=state_stride,
+                final_state_stride=final_state_stride,
                 normalize_bc=True,
                 dt_min=dt_min,
                 dt_max=dt_max,
@@ -278,7 +307,7 @@ def mixer_decode_step_cute(
         current_stream,
     )
     y_flat = cast(torch.Tensor, y.reshape(batch, heads * P).contiguous())
-    return y_flat, final_state.contiguous(), b_last.contiguous(), u_last.contiguous()
+    return y_flat, final_state, b_last, u_last
 
 
 __all__ = ["mixer_decode_step_cute"]

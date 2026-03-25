@@ -11,6 +11,7 @@ from torch.nn import functional as F
 
 from slinoss.layers import AutoMixerDecodeBackend, CuteMixerDecodeBackend, SLinOSSMixer
 from slinoss.layers.state import SLinOSSMixerState
+from slinoss.ops.decode_linear import decode_linear
 
 
 def configure_optim(
@@ -50,6 +51,10 @@ class FeedForward(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc2(F.gelu(self.fc1(x), approximate="tanh"))
+
+    def decode_one(self, x: torch.Tensor) -> torch.Tensor:
+        hidden = decode_linear(x, self.fc1)
+        return decode_linear(F.gelu(hidden, approximate="tanh"), self.fc2)
 
 
 @dataclass
@@ -135,7 +140,7 @@ class NextCharBlock(nn.Module):
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> SLinOSSMixerState:
-        return self.mixer.init_state(batch_size, device=device, dtype=dtype)
+        return self.mixer.init_decode_state(batch_size, device=device, dtype=dtype)
 
     def decode_one_inplace(
         self,
@@ -145,7 +150,7 @@ class NextCharBlock(nn.Module):
         norm1 = self.norm1(x)
         x = x + self.mixer._step_inplace(norm1, state)
         norm2 = self.norm2(x)
-        x = x + self.ff(norm2)
+        x = x + self.ff.decode_one(norm2)
         return x
 
 
@@ -224,7 +229,7 @@ class _NextCharCudaGraphDecodeEngine:
         ):
             x = block.decode_one_inplace(x, layer_state)
         x = self.model.norm_f(x)
-        return self.model.lm_head(x)
+        return decode_linear(x, self.model.lm_head)
 
     def _capture(self) -> None:
         snapshot = self.state.clone()
@@ -361,7 +366,7 @@ class NextCharLM(nn.Module):
         ):
             x = block.decode_one_inplace(x, layer_state)
         x = self.norm_f(x)
-        logits = self.lm_head(x)
+        logits = decode_linear(x, self.lm_head)
         state.position += 1
         if state.position_buffer is not None:
             state.position_buffer.fill_(int(state.position))

@@ -14,6 +14,7 @@ from slinoss.layers import (
     SLinOSSMixer,
 )
 from slinoss.models import NextCharBlock, NextCharLM
+from slinoss.ops.v2x2ssd.cute.decode import mixer_decode_step_cute
 
 
 def _cuda_decode_dtypes() -> list[torch.dtype]:
@@ -33,8 +34,10 @@ def _force_reference_sequence_backends(model: NextCharLM) -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("dtype", _cuda_decode_dtypes())
+@pytest.mark.parametrize("batch_size", [1, 2])
 def test_mixer_step_supported_cuda_matches_forward_without_calling_forward(
     dtype: torch.dtype,
+    batch_size: int,
 ) -> None:
     pytest.importorskip("cutlass")
     torch.manual_seed(0)
@@ -49,7 +52,7 @@ def test_mixer_step_supported_cuda_matches_forward_without_calling_forward(
         device="cuda",
         dtype=dtype,
     ).eval()
-    x = torch.randn((2, 7, 128), device="cuda", dtype=dtype)
+    x = torch.randn((batch_size, 7, 128), device="cuda", dtype=dtype)
 
     with torch.no_grad():
         y_full, state_full = mixer(x, return_state=True)
@@ -89,8 +92,40 @@ def test_mixer_step_supported_cuda_matches_forward_without_calling_forward(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("dtype", _cuda_decode_dtypes())
+def test_mixer_init_decode_state_uses_decode_layout_only_for_cute_path(
+    dtype: torch.dtype,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    mixer = SLinOSSMixer(
+        128,
+        d_state=64,
+        expand=2,
+        d_head=64,
+        d_conv=4,
+        chunk_size=32,
+        device="cuda",
+        dtype=dtype,
+    ).eval()
+    fast_state = mixer.init_decode_state(1, device="cuda", dtype=dtype)
+    assert fast_state.scan.state is not None
+    assert tuple(fast_state.scan.state.shape) == (1, mixer.n_heads, mixer.d_head, 128)
+    assert not fast_state.scan.state.is_contiguous()
+    assert fast_state.scan.state.stride()[-2:] == (1, mixer.d_head)
+
+    mixer.decode_backend = ReferenceMixerDecodeBackend()
+    ref_state = mixer.init_decode_state(1, device="cuda", dtype=dtype)
+    assert ref_state.scan.state is not None
+    assert ref_state.scan.state.is_contiguous()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", _cuda_decode_dtypes())
+@pytest.mark.parametrize("batch_size", [1, 2])
 def test_nextchar_decode_one_matches_full_forward_on_supported_cuda(
     dtype: torch.dtype,
+    batch_size: int,
 ) -> None:
     pytest.importorskip("cutlass")
     torch.manual_seed(0)
@@ -110,11 +145,11 @@ def test_nextchar_decode_one_matches_full_forward_on_supported_cuda(
         .to(device="cuda", dtype=dtype)
         .eval()
     )
-    idx = torch.randint(0, 64, (2, 6), device="cuda", dtype=torch.long)
+    idx = torch.randint(0, 64, (batch_size, 6), device="cuda", dtype=torch.long)
 
     with torch.no_grad():
         logits_full = model(idx)
-        decode_state = model.init_decode_state(2, device="cuda", dtype=dtype)
+        decode_state = model.init_decode_state(batch_size, device="cuda", dtype=dtype)
         pieces: list[torch.Tensor] = []
         for t in range(idx.shape[1]):
             logits_t, decode_state = model.decode_one(idx[:, t], decode_state)
@@ -251,8 +286,166 @@ def test_mixer_step_supported_cuda_matches_reference_backends(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("dtype", _cuda_decode_dtypes())
+def test_mixer_step_supported_cuda_reuses_scan_state_buffers(
+    dtype: torch.dtype,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    mixer = SLinOSSMixer(
+        128,
+        d_state=64,
+        expand=2,
+        d_head=64,
+        d_conv=4,
+        chunk_size=32,
+        device="cuda",
+        dtype=dtype,
+    ).eval()
+    x = torch.randn((2, 128), device="cuda", dtype=dtype)
+
+    with torch.no_grad():
+        state = mixer.init_state(x.shape[0], device="cuda", dtype=dtype)
+        assert state.scan.state is not None
+        assert state.scan.b_prev is not None
+        assert state.scan.u_prev is not None
+
+        state_ptr = state.scan.state.data_ptr()
+        b_prev_ptr = state.scan.b_prev.data_ptr()
+        u_prev_ptr = state.scan.u_prev.data_ptr()
+
+        y = mixer._step_inplace(x, state)
+
+    assert y.shape == (2, 128)
+    assert state.scan.state is not None
+    assert state.scan.b_prev is not None
+    assert state.scan.u_prev is not None
+    assert state.scan.state.data_ptr() == state_ptr
+    assert state.scan.b_prev.data_ptr() == b_prev_ptr
+    assert state.scan.u_prev.data_ptr() == u_prev_ptr
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", _cuda_decode_dtypes())
+def test_mixer_decode_step_cute_allows_aliasing_state_and_b_prev_outputs(
+    dtype: torch.dtype,
+) -> None:
+    pytest.importorskip("cutlass")
+    torch.manual_seed(0)
+
+    mixer = SLinOSSMixer(
+        128,
+        d_state=64,
+        expand=2,
+        d_head=64,
+        d_conv=4,
+        chunk_size=32,
+        device="cuda",
+        dtype=dtype,
+    ).eval()
+    x = torch.randn((2, 128), device="cuda", dtype=dtype)
+
+    with torch.no_grad():
+        state = mixer.init_state(x.shape[0], device="cuda", dtype=dtype)
+        assert state.scan.state is not None
+        assert state.scan.b_prev is not None
+        assert state.scan.u_prev is not None
+        proj = mixer.in_proj(x)
+        gate, value_raw, params_flat, bc_flat = torch.split(
+            proj,
+            [mixer.d_inner, mixer.d_inner, mixer.param_proj_dim, mixer.bc_proj_dim],
+            dim=-1,
+        )
+        value, _ = mixer._apply_causal_depthwise_conv_step(value_raw, state.conv)
+        value_h = value.view(x.shape[0], mixer.n_heads, mixer.d_head).contiguous()
+        params_h = params_flat.view(
+            x.shape[0], mixer.n_heads, mixer.scanprep.param_dim
+        ).contiguous()
+        bc_h = bc_flat.view(x.shape[0], mixer.n_heads, 4, mixer.d_state).contiguous()
+        gate_h = gate.view(x.shape[0], mixer.n_heads, mixer.d_head).contiguous()
+        skip = mixer.skip.view(mixer.n_heads, mixer.d_head)
+
+        state_ref = state.scan.state.clone()
+        b_prev_ref = state.scan.b_prev.clone()
+        u_prev_ref = state.scan.u_prev.clone()
+        y_ref, final_ref, b_last_ref, u_last_ref = mixer_decode_step_cute(
+            value_h,
+            params_h,
+            bc_h,
+            gate_h,
+            skip,
+            initial_states=state_ref,
+            B_prev=b_prev_ref,
+            U_prev=u_prev_ref,
+            dt_min=mixer.scanprep.dt_min,
+            dt_max=mixer.scanprep.dt_max,
+            r_min=mixer.scanprep.r_min,
+            r_max=mixer.scanprep.r_max,
+            theta_bound=mixer.scanprep.theta_bound,
+            k_max=mixer.scanprep.k_max,
+            eps=mixer.scanprep.eps,
+            dt_bias=mixer.scanprep.dt_bias,
+            gamma_bias=mixer.scanprep.gamma_bias,
+            omega_bias=mixer.scanprep.omega_bias,
+            mix_r_bias=mixer.scanprep.mix_r_bias,
+            mix_theta_bias=mixer.scanprep.mix_theta_bias,
+            mix_k_prev_bias=mixer.scanprep.mix_k_prev_bias,
+            mix_k_curr_bias=mixer.scanprep.mix_k_curr_bias,
+            b_scale=mixer.scanprep.b_scale,
+            c_scale=mixer.scanprep.c_scale,
+            output_dtype=dtype,
+        )
+
+        state_alias = state.scan.state.clone()
+        b_prev_alias = state.scan.b_prev.clone()
+        u_prev_alias = state.scan.u_prev.clone()
+        y_alias, final_alias, b_last_alias, u_last_alias = mixer_decode_step_cute(
+            value_h,
+            params_h,
+            bc_h,
+            gate_h,
+            skip,
+            initial_states=state_alias,
+            B_prev=b_prev_alias,
+            U_prev=u_prev_alias,
+            dt_min=mixer.scanprep.dt_min,
+            dt_max=mixer.scanprep.dt_max,
+            r_min=mixer.scanprep.r_min,
+            r_max=mixer.scanprep.r_max,
+            theta_bound=mixer.scanprep.theta_bound,
+            k_max=mixer.scanprep.k_max,
+            eps=mixer.scanprep.eps,
+            dt_bias=mixer.scanprep.dt_bias,
+            gamma_bias=mixer.scanprep.gamma_bias,
+            omega_bias=mixer.scanprep.omega_bias,
+            mix_r_bias=mixer.scanprep.mix_r_bias,
+            mix_theta_bias=mixer.scanprep.mix_theta_bias,
+            mix_k_prev_bias=mixer.scanprep.mix_k_prev_bias,
+            mix_k_curr_bias=mixer.scanprep.mix_k_curr_bias,
+            b_scale=mixer.scanprep.b_scale,
+            c_scale=mixer.scanprep.c_scale,
+            output_dtype=dtype,
+            final_state_out=state_alias,
+            b_last_out=b_prev_alias,
+            u_last_out=u_prev_alias,
+        )
+
+    atol = 6e-2 if dtype in (torch.float16, torch.bfloat16) else 1e-6
+    assert final_alias.data_ptr() == state_alias.data_ptr()
+    assert b_last_alias.data_ptr() == b_prev_alias.data_ptr()
+    assert u_last_alias.data_ptr() == u_prev_alias.data_ptr()
+    torch.testing.assert_close(y_alias, y_ref, atol=atol, rtol=0.0)
+    torch.testing.assert_close(final_alias, final_ref, atol=atol, rtol=0.0)
+    torch.testing.assert_close(b_last_alias, b_last_ref, atol=atol, rtol=0.0)
+    torch.testing.assert_close(u_last_alias, u_last_ref, atol=atol, rtol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", _cuda_decode_dtypes())
+@pytest.mark.parametrize("batch_size", [1, 2])
 def test_nextchar_decode_one_supported_cuda_matches_reference_path_and_state(
     dtype: torch.dtype,
+    batch_size: int,
 ) -> None:
     pytest.importorskip("cutlass")
     torch.manual_seed(0)
@@ -274,17 +467,17 @@ def test_nextchar_decode_one_supported_cuda_matches_reference_path_and_state(
     )
     model_ref = deepcopy(model).eval()
     _force_reference_sequence_backends(model_ref)
-    idx = torch.randint(0, 64, (2, 6), device="cuda", dtype=torch.long)
+    idx = torch.randint(0, 64, (batch_size, 6), device="cuda", dtype=torch.long)
 
     with torch.no_grad():
-        state_fast = model.init_decode_state(2, device="cuda", dtype=dtype)
+        state_fast = model.init_decode_state(batch_size, device="cuda", dtype=dtype)
         fast_pieces: list[torch.Tensor] = []
         for t in range(idx.shape[1]):
             logits_t, state_fast = model.decode_one(idx[:, t], state_fast)
             fast_pieces.append(logits_t.unsqueeze(1))
         logits_fast = torch.cat(fast_pieces, dim=1)
 
-        state_ref = model_ref.init_decode_state(2, device="cuda", dtype=dtype)
+        state_ref = model_ref.init_decode_state(batch_size, device="cuda", dtype=dtype)
         ref_pieces: list[torch.Tensor] = []
         for t in range(idx.shape[1]):
             logits_t, state_ref = model_ref._decode_one_eager_inplace(

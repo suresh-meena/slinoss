@@ -10,6 +10,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from slinoss.ops.cconv1d import cconv1d_cuda, cconv1d_cuda_supported
+from slinoss.ops.decode_linear import decode_linear
 from slinoss.ops.v2x2ssd.reference import v2x2ssm
 
 from .backend import (
@@ -192,6 +193,46 @@ class SLinOSSMixer(nn.Module):
                 ),
             ),
         )
+
+    def _make_decode_state_tensor(
+        self,
+        batch_size: int,
+        *,
+        device: torch.device | str,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        return torch.zeros(
+            (batch_size, self.n_heads, 2 * self.d_state, self.d_head),
+            device=device,
+            dtype=dtype,
+        ).transpose(-1, -2)
+
+    def init_decode_state(
+        self,
+        batch_size: int,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> SLinOSSMixerState:
+        state = self.init_state(batch_size, device=device, dtype=dtype)
+        if device is None:
+            device = self.in_proj.weight.device
+        device_obj = torch.device(device)
+        if dtype is None:
+            dtype = self.in_proj.weight.dtype
+        if self._supports_cute_decode(
+            batch_size=batch_size,
+            device=device_obj,
+            dtype=dtype,
+        ) and isinstance(
+            self.decode_backend, (AutoMixerDecodeBackend, CuteMixerDecodeBackend)
+        ):
+            state.scan.state = self._make_decode_state_tensor(
+                batch_size,
+                device=device_obj,
+                dtype=dtype,
+            )
+        return state
 
     def _apply_causal_depthwise_conv(
         self,
@@ -598,6 +639,9 @@ class SLinOSSMixer(nn.Module):
             b_scale=self.scanprep.b_scale,
             c_scale=self.scanprep.c_scale,
             output_dtype=inputs.value.dtype,
+            final_state_out=state.state,
+            b_last_out=state.b_prev,
+            u_last_out=state.u_prev,
         )
         next_state = ScanState(
             state=final_state,
@@ -639,7 +683,7 @@ class SLinOSSMixer(nn.Module):
             or tuple(state.scan.state.shape) != tuple(scan_next.state.shape)
         ):
             state.scan.state = scan_next.state
-        else:
+        elif state.scan.state is not scan_next.state:
             state.scan.state.copy_(scan_next.state)
         if (
             state.scan.b_prev is None
@@ -647,7 +691,7 @@ class SLinOSSMixer(nn.Module):
             or tuple(state.scan.b_prev.shape) != tuple(scan_next.b_prev.shape)
         ):
             state.scan.b_prev = scan_next.b_prev
-        else:
+        elif state.scan.b_prev is not scan_next.b_prev:
             state.scan.b_prev.copy_(scan_next.b_prev)
         if (
             state.scan.u_prev is None
@@ -655,9 +699,9 @@ class SLinOSSMixer(nn.Module):
             or tuple(state.scan.u_prev.shape) != tuple(scan_next.u_prev.shape)
         ):
             state.scan.u_prev = scan_next.u_prev
-        else:
+        elif state.scan.u_prev is not scan_next.u_prev:
             state.scan.u_prev.copy_(scan_next.u_prev)
-        return self.out_proj(gated)
+        return decode_linear(gated, self.out_proj)
 
     def step_cuda_fast(
         self,
@@ -680,7 +724,7 @@ class SLinOSSMixer(nn.Module):
         ):
             raise ValueError("Current inputs are unsupported for step_cuda_fast.")
         next_state = (
-            self.init_state(batch, device=x.device, dtype=x.dtype)
+            self.init_decode_state(batch, device=x.device, dtype=x.dtype)
             if state is None
             else state.clone()
         )
@@ -708,7 +752,7 @@ class SLinOSSMixer(nn.Module):
         else:
             batch = int(x_t.shape[0])
             next_state = (
-                self.init_state(batch, device=x_t.device, dtype=x_t.dtype)
+                self.init_decode_state(batch, device=x_t.device, dtype=x_t.dtype)
                 if state is None
                 else state.clone()
             )

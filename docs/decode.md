@@ -72,8 +72,9 @@ CuTe decode backend. Explicit reference decode backends stay on the eager path.
 - The decode kernel is launched on the active CUDA stream so it participates in
   CUDA graph capture.
 - The graph capture path does not reset recurrent state on replay.
-- State tensors are copied back into stable buffers in-place, which keeps the
-  persistent graph state valid across replays.
+- The recurrent decode kernel writes `state / b_prev / u_prev` directly back
+  into the stable decode buffers, which keeps the persistent graph state valid
+  across replays without extra host-side state copies.
 
 ## Perf Tooling
 
@@ -119,14 +120,18 @@ with
 
 `t_lower = max(bytes_hbm / peak_bw, flops_tc / peak_tc_flops, flops_simt / peak_simt_flops, launches * launch_floor)`
 
-The current implementation uses a conservative analytic model built from the real
-nextchar shape and the actual mandatory decode traffic:
+The current implementation uses an analytic proxy built from the real nextchar
+shape and the dominant decode traffic terms:
 
-- recurrent state read/write
 - token/position row reads
 - logits writes
 - tensor-core and SIMT work estimates from the actual model dimensions
 - one host-visible graph replay per token on the persistent path
+
+For cache-friendly steady-state decode, especially on the local RTX 3060, this
+proxy can overestimate compulsory off-chip traffic and therefore report an
+efficiency slightly above `1.0`. Treat it as a stable comparative metric rather
+than a hard physical bound unless it is recalibrated on the target platform.
 
 Checked-in measurements are from the local RTX 3060 development machine. The
 harness also accepts an H100 preset for future runs on the target platform.

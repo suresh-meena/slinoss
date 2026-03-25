@@ -30,21 +30,29 @@ Results:
 
 | B | persistent us/token | eager us/token | speedup | t_lower us/token | efficiency |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 430.089 | 3406.004 | 7.919x | 4.599 | 0.011 |
-| 2 | 288.397 | 1872.520 | 6.493x | 9.198 | 0.032 |
-| 4 | 164.809 | 928.797 | 5.636x | 18.394 | 0.112 |
-| 8 | 98.186 | 462.517 | 4.711x | 36.786 | 0.375 |
-| 16 | 85.160 | 233.142 | 2.738x | 73.570 | 0.864 |
+| 1 | 384.043 | 3190.416 | 8.307x | 4.599 | 0.012 |
+| 2 | 258.950 | 1843.955 | 7.121x | 9.198 | 0.036 |
+| 4 | 127.536 | 879.899 | 6.899x | 18.394 | 0.144 |
+| 8 | 64.503 | 427.166 | 6.622x | 36.786 | 0.570 |
+| 16 | 37.810 | 219.635 | 5.809x | 73.570 | 1.946 |
 
 Interpretation:
 
 - The persistent path is materially faster than the eager token loop across the
   entire supported batch grid.
-- The local lower-bound efficiency improves with batch size and gets close to
-  the bound at `B=16`.
-- Small batches are far from the bound on this GPU. The eager decode profile
-  shows that the remaining time is dominated by CUDA GEMM (`aten::mm`,
-  `aten::addmm`) and depthwise conv (`aten::cudnn_convolution`) kernels rather
-  than by the decode graph plumbing itself.
+- Relative to the first issue-8 landing, persistent decode improved by about
+  `1.12x` at `B=1`, `1.11x` at `B=2`, `1.29x` at `B=4`, `1.52x` at `B=8`, and
+  `2.25x` at `B=16`.
+- Nsight Compute on the direct `B=16` recurrent kernel dropped from about
+  `151.6 us` to `37.4 us` after switching decode to the transposed physical
+  state layout and compiling the kernel against the real state strides.
+- Nsight Systems on the current `B=1` whole-model persistent path still shows
+  the CuTe recurrent decode kernel as the largest GPU bucket at about `34.3%`,
+  followed by small projection GEMMs and decode-step conv.
+- Small batches are still far from the proxy bound on this GPU.
+- The `B=16` efficiency proxy exceeds `1.0`, which means the simple HBM traffic
+  model is now overcounting off-chip traffic on this steady-state path. Treat
+  the reported efficiency here as a comparative proxy, not a strict physical
+  bound, on this card.
 - No H100 was available in the local environment, so this table is not an H100
   claim. The decode harness accepts an H100 preset for target-platform runs.
