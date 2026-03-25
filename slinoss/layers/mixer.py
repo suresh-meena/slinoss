@@ -44,6 +44,107 @@ def _cute_scan_requires_d_state_multiple_of_8(d_state: int) -> None:
         )
 
 
+def _copy_scan_state_(dst: ScanState, src: ScanState) -> None:
+    if dst.state is not None and src.state is not None:
+        dst.state.copy_(src.state)
+    if dst.b_prev is not None and src.b_prev is not None:
+        dst.b_prev.copy_(src.b_prev)
+    if dst.u_prev is not None and src.u_prev is not None:
+        dst.u_prev.copy_(src.u_prev)
+
+
+def _copy_mixer_state_(dst: SLinOSSMixerState, src: SLinOSSMixerState) -> None:
+    if dst.conv is not None and src.conv is not None:
+        dst.conv.copy_(src.conv)
+    _copy_scan_state_(dst.scan, src.scan)
+
+
+class _MixerCudaGraphStepEngine:
+    """Fixed-shape CUDA graph replay for one-token mixer decode."""
+
+    _disabled_configs: set[tuple[int, torch.dtype, int]] = set()
+
+    def __init__(
+        self,
+        mixer: "SLinOSSMixer",
+        state: SLinOSSMixerState,
+        *,
+        batch_size: int,
+    ) -> None:
+        self.mixer = mixer
+        self.batch_size = int(batch_size)
+        self.device = mixer.in_proj.weight.device
+        self.dtype = mixer.in_proj.weight.dtype
+        self.x_buffer = torch.zeros(
+            (self.batch_size, mixer.d_model),
+            device=self.device,
+            dtype=self.dtype,
+        )
+        self.graph = torch.cuda.CUDAGraph()
+        self.static_y: torch.Tensor | None = None
+        self._capture(state)
+
+    @staticmethod
+    def supported(
+        mixer: "SLinOSSMixer",
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> bool:
+        if (
+            int(device.index or 0),
+            dtype,
+            int(batch_size),
+        ) in _MixerCudaGraphStepEngine._disabled_configs:
+            return False
+        if not isinstance(
+            mixer.decode_backend,
+            (AutoMixerDecodeBackend, CuteMixerDecodeBackend),
+        ):
+            return False
+        return mixer._supports_cute_decode(
+            batch_size=batch_size,
+            device=device,
+            dtype=dtype,
+        )
+
+    @classmethod
+    def disable(
+        cls,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        cls._disabled_configs.add((int(device.index or 0), dtype, int(batch_size)))
+
+    def _capture(self, state: SLinOSSMixerState) -> None:
+        snapshot = state.clone()
+        stream = torch.cuda.Stream(device=self.device)
+        stream.wait_stream(torch.cuda.current_stream(device=self.device))
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                _copy_mixer_state_(state, snapshot)
+                self.static_y = self.mixer._step_inplace(self.x_buffer, state)
+        _copy_mixer_state_(state, snapshot)
+        torch.cuda.current_stream(device=self.device).wait_stream(stream)
+        with torch.cuda.graph(self.graph):
+            self.static_y = self.mixer._step_inplace(self.x_buffer, state)
+        _copy_mixer_state_(state, snapshot)
+
+    def step(
+        self,
+        x: torch.Tensor,
+        state: SLinOSSMixerState,
+    ) -> tuple[torch.Tensor, SLinOSSMixerState]:
+        self.x_buffer.copy_(x)
+        self.graph.replay()
+        if self.static_y is None:
+            raise RuntimeError("Mixer decode graph did not materialize an output.")
+        return self.static_y.clone(), state
+
+
 class SLinOSSMixer(nn.Module):
     """Selective linear oscillatory mixer with a backend-agnostic scan surface."""
 
@@ -206,6 +307,44 @@ class SLinOSSMixer(nn.Module):
             device=device,
             dtype=dtype,
         ).transpose(-1, -2)
+
+    def _ensure_fast_decode_state_layout(
+        self,
+        state: SLinOSSMixerState,
+        *,
+        batch_size: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        if state.scan.state is None:
+            state.scan.state = self._make_decode_state_tensor(
+                batch_size,
+                device=device,
+                dtype=dtype,
+            )
+            return
+        if state.scan.state.shape != (
+            batch_size,
+            self.n_heads,
+            self.d_head,
+            2 * self.d_state,
+        ):
+            raise ValueError(
+                "scan.state must match "
+                f"{(batch_size, self.n_heads, self.d_head, 2 * self.d_state)}. "
+                f"Got {tuple(state.scan.state.shape)}."
+            )
+        if state.scan.state.device != device or state.scan.state.dtype != dtype:
+            state.scan.state = state.scan.state.to(device=device, dtype=dtype)
+        if state.scan.state.stride()[-2:] == (1, self.d_head):
+            return
+        fast_state = self._make_decode_state_tensor(
+            batch_size,
+            device=device,
+            dtype=dtype,
+        )
+        fast_state.copy_(state.scan.state)
+        state.scan.state = fast_state
 
     def init_decode_state(
         self,
@@ -751,7 +890,48 @@ class SLinOSSMixer(nn.Module):
             if state is None
             else state
         )
-        y_step = self._step_inplace(x_t, next_state)
+        if _MixerCudaGraphStepEngine.supported(
+            self,
+            batch_size=batch,
+            device=x_t.device,
+            dtype=x_t.dtype,
+        ):
+            self._ensure_fast_decode_state_layout(
+                next_state,
+                batch_size=batch,
+                device=x_t.device,
+                dtype=x_t.dtype,
+            )
+            engine = next_state._engine
+            if (
+                not isinstance(engine, _MixerCudaGraphStepEngine)
+                or engine.mixer is not self
+                or engine.batch_size != batch
+                or engine.device != x_t.device
+                or engine.dtype != x_t.dtype
+            ):
+                try:
+                    engine = _MixerCudaGraphStepEngine(
+                        self,
+                        next_state,
+                        batch_size=batch,
+                    )
+                except Exception:
+                    _MixerCudaGraphStepEngine.disable(
+                        batch_size=batch,
+                        device=x_t.device,
+                        dtype=x_t.dtype,
+                    )
+                    torch.cuda.synchronize(device=x_t.device)
+                    next_state._engine = None
+                    y_step = self._step_inplace(x_t, next_state)
+                else:
+                    next_state._engine = engine
+                    y_step, next_state = engine.step(x_t, next_state)
+            else:
+                y_step, next_state = engine.step(x_t, next_state)
+        else:
+            y_step = self._step_inplace(x_t, next_state)
         if squeeze:
             return y_step, next_state
         return y_step.unsqueeze(1), next_state
@@ -784,13 +964,16 @@ class SLinOSSMixer(nn.Module):
             y, next_state = self.forward(x, state=state, return_state=True)
             assert isinstance(next_state, SLinOSSMixerState)
         else:
-            batch = int(x_t.shape[0])
-            next_state = (
-                self.init_decode_state(batch, device=x_t.device, dtype=x_t.dtype)
-                if state is None
-                else (state if inplace else state.clone())
-            )
-            y_step = self._step_inplace(x_t, next_state)
+            if inplace:
+                y_step, next_state = self.step_inplace(x_t, state)
+            else:
+                batch = int(x_t.shape[0])
+                next_state = (
+                    self.init_decode_state(batch, device=x_t.device, dtype=x_t.dtype)
+                    if state is None
+                    else state.clone()
+                )
+                y_step = self._step_inplace(x_t, next_state)
             y = y_step.unsqueeze(1)
         if squeeze:
             return y[:, 0, :], next_state

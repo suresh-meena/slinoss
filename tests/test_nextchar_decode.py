@@ -78,6 +78,8 @@ def test_mixer_step_supported_cuda_matches_forward_without_calling_forward(
     assert state_full.scan.state is not None and state_step.scan.state is not None
     assert state_full.scan.b_prev is not None and state_step.scan.b_prev is not None
     assert state_full.scan.u_prev is not None and state_step.scan.u_prev is not None
+    assert state_step._engine is not None
+    assert state_step.scan.state.stride()[-2:] == (1, mixer.d_head)
     torch.testing.assert_close(state_step.conv, state_full.conv, atol=atol, rtol=0.0)
     torch.testing.assert_close(
         state_step.scan.state, state_full.scan.state, atol=atol, rtol=0.0
@@ -315,15 +317,26 @@ def test_mixer_step_supported_cuda_reuses_scan_state_buffers(
         u_prev_ptr = state.scan.u_prev.data_ptr()
 
         y, returned_state = mixer.step(x, state)
+        assert state.scan.state is not None
+        promoted_state_ptr = state.scan.state.data_ptr()
+        promoted_b_prev_ptr = state.scan.b_prev.data_ptr()
+        promoted_u_prev_ptr = state.scan.u_prev.data_ptr()
+        y2, returned_state2 = mixer.step(x, state)
 
     assert y.shape == (2, 128)
+    assert y2.shape == (2, 128)
     assert returned_state is state
+    assert returned_state2 is state
     assert state.scan.state is not None
     assert state.scan.b_prev is not None
     assert state.scan.u_prev is not None
-    assert state.scan.state.data_ptr() == state_ptr
-    assert state.scan.b_prev.data_ptr() == b_prev_ptr
-    assert state.scan.u_prev.data_ptr() == u_prev_ptr
+    assert state_ptr != promoted_state_ptr
+    assert state.scan.state.stride()[-2:] == (1, mixer.d_head)
+    assert promoted_b_prev_ptr == b_prev_ptr
+    assert promoted_u_prev_ptr == u_prev_ptr
+    assert state.scan.state.data_ptr() == promoted_state_ptr
+    assert state.scan.b_prev.data_ptr() == promoted_b_prev_ptr
+    assert state.scan.u_prev.data_ptr() == promoted_u_prev_ptr
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

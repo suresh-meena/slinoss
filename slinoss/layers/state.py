@@ -80,6 +80,7 @@ class SLinOSSMixerState:
 
     conv: torch.Tensor | None = None
     scan: ScanState = field(default_factory=ScanState)
+    _engine: object | None = field(default=None, repr=False, compare=False)
 
     def detach(self) -> "SLinOSSMixerState":
         return SLinOSSMixerState(

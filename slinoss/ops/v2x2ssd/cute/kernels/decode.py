@@ -66,6 +66,11 @@ class MixerDecodeStepFwd:
                 "workers_per_p must be positive and divide the decode N dimension."
             )
         self.block_threads = int(self.p_size * self.workers_per_p)
+        self.state_tile_elems = int(self.d_size * self.p_size)
+        self.state_load_iters = int(
+            (self.state_tile_elems + self.block_threads - 1) // self.block_threads
+        )
+        self.bc_reduce_warps = int((self.n_size + cute.arch.WARP_SIZE - 1) // 32)
         self.normalize_bc = bool(normalize_bc)
 
         self.value_shape = (self.batch, self.heads, self.p_size)
@@ -222,6 +227,85 @@ class MixerDecodeStepFwd:
             u_last_ptr, cute.make_layout(self.prev_u_shape, stride=self.prev_u_stride)
         )
 
+        state_tile_layout = cute.make_layout(
+            (self.d_size, self.p_size),
+            stride=(self.p_size, 1),
+        )
+        vec_layout = cute.make_layout((self.n_size,))
+        p_layout = cute.make_layout((self.p_size,))
+        acc_layout = cute.make_layout((self.workers_per_p, self.p_size))
+        bc_reduce_layout = cute.make_layout((4, self.bc_reduce_warps))
+        state_dtype = mState.element_type
+
+        @cute.struct
+        class SharedStorage:
+            sState: cute.struct.Align[
+                cute.struct.MemRange[state_dtype, cute.cosize(state_tile_layout)],
+                1024,
+            ]
+            sValue: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(p_layout)],
+                128,
+            ]
+            sUPrev: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(p_layout)],
+                128,
+            ]
+            sGate: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(p_layout)],
+                128,
+            ]
+            sSkip: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(p_layout)],
+                128,
+            ]
+            b_re: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(vec_layout)],
+                128,
+            ]
+            b_im: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(vec_layout)],
+                128,
+            ]
+            c_re: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(vec_layout)],
+                128,
+            ]
+            c_im: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(vec_layout)],
+                128,
+            ]
+            beta_prev_re: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(vec_layout)],
+                128,
+            ]
+            beta_prev_im: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(vec_layout)],
+                128,
+            ]
+            beta_curr_re: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(vec_layout)],
+                128,
+            ]
+            beta_curr_im: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(vec_layout)],
+                128,
+            ]
+            inv: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 4], 16]
+            rho: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 2], 8]
+            tap_prev: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 2], 8]
+            tap_curr: cute.struct.Align[cute.struct.MemRange[cutlass.Float32, 2], 8]
+            acc_partial: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(acc_layout)],
+                128,
+            ]
+            bc_reduce: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Float32, cute.cosize(bc_reduce_layout)],
+                32,
+            ]
+
+        self.shared_storage = SharedStorage
+
         self.kernel(
             mValue,
             mParams,
@@ -280,131 +364,48 @@ class MixerDecodeStepFwd:
         warp_idx = cute.arch.warp_idx()
         bidx, hidx, _ = cute.arch.block_idx()
 
-        smem = cutlass.utils.SmemAllocator()
+        state_tile_layout = cute.make_layout(
+            (self.d_size, self.p_size),
+            stride=(self.p_size, 1),
+        )
         vec_layout = cute.make_layout((self.n_size,))
-        scalar_layout = cute.make_layout((1,))
+        p_layout = cute.make_layout((self.p_size,))
         acc_layout = cute.make_layout((self.workers_per_p, self.p_size))
-        bc_reduce_layout = cute.make_layout((4, 2))
-        b_re = smem.allocate_tensor(
-            element_type=cutlass.Float32,
-            layout=vec_layout,
-            byte_alignment=16,
-            swizzle=None,
-        )
-        b_im = smem.allocate_tensor(
-            element_type=cutlass.Float32,
-            layout=vec_layout,
-            byte_alignment=16,
-            swizzle=None,
-        )
-        c_re = smem.allocate_tensor(
-            element_type=cutlass.Float32,
-            layout=vec_layout,
-            byte_alignment=16,
-            swizzle=None,
-        )
-        c_im = smem.allocate_tensor(
-            element_type=cutlass.Float32,
-            layout=vec_layout,
-            byte_alignment=16,
-            swizzle=None,
-        )
-        beta_prev_re = smem.allocate_tensor(
-            element_type=cutlass.Float32,
-            layout=vec_layout,
-            byte_alignment=16,
-            swizzle=None,
-        )
-        beta_prev_im = smem.allocate_tensor(
-            element_type=cutlass.Float32,
-            layout=vec_layout,
-            byte_alignment=16,
-            swizzle=None,
-        )
-        beta_curr_re = smem.allocate_tensor(
-            element_type=cutlass.Float32,
-            layout=vec_layout,
-            byte_alignment=16,
-            swizzle=None,
-        )
-        beta_curr_im = smem.allocate_tensor(
-            element_type=cutlass.Float32,
-            layout=vec_layout,
-            byte_alignment=16,
-            swizzle=None,
-        )
-        rho_re_s = smem.allocate_tensor(
-            element_type=cutlass.Float32,
-            layout=scalar_layout,
-            byte_alignment=4,
-            swizzle=None,
-        )
-        rho_im_s = smem.allocate_tensor(
-            element_type=cutlass.Float32,
-            layout=scalar_layout,
-            byte_alignment=4,
-            swizzle=None,
-        )
-        inv0_s = smem.allocate_tensor(
-            element_type=cutlass.Float32,
-            layout=scalar_layout,
-            byte_alignment=4,
-            swizzle=None,
-        )
-        inv1_s = smem.allocate_tensor(
-            element_type=cutlass.Float32,
-            layout=scalar_layout,
-            byte_alignment=4,
-            swizzle=None,
-        )
-        inv2_s = smem.allocate_tensor(
-            element_type=cutlass.Float32,
-            layout=scalar_layout,
-            byte_alignment=4,
-            swizzle=None,
-        )
-        inv3_s = smem.allocate_tensor(
-            element_type=cutlass.Float32,
-            layout=scalar_layout,
-            byte_alignment=4,
-            swizzle=None,
-        )
-        tap_prev_re_s = smem.allocate_tensor(
-            element_type=cutlass.Float32,
-            layout=scalar_layout,
-            byte_alignment=4,
-            swizzle=None,
-        )
-        tap_prev_im_s = smem.allocate_tensor(
-            element_type=cutlass.Float32,
-            layout=scalar_layout,
-            byte_alignment=4,
-            swizzle=None,
-        )
-        tap_curr_re_s = smem.allocate_tensor(
-            element_type=cutlass.Float32,
-            layout=scalar_layout,
-            byte_alignment=4,
-            swizzle=None,
-        )
-        tap_curr_im_s = smem.allocate_tensor(
-            element_type=cutlass.Float32,
-            layout=scalar_layout,
-            byte_alignment=4,
-            swizzle=None,
-        )
-        acc_partial = smem.allocate_tensor(
-            element_type=cutlass.Float32,
-            layout=acc_layout,
-            byte_alignment=16,
-            swizzle=None,
-        )
-        bc_reduce = smem.allocate_tensor(
-            element_type=cutlass.Float32,
-            layout=bc_reduce_layout,
-            byte_alignment=16,
-            swizzle=None,
-        )
+        bc_reduce_layout = cute.make_layout((4, self.bc_reduce_warps))
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(self.shared_storage)
+        sState = storage.sState.get_tensor(state_tile_layout)
+        sValue = storage.sValue.get_tensor(p_layout)
+        sUPrev = storage.sUPrev.get_tensor(p_layout)
+        sGate = storage.sGate.get_tensor(p_layout)
+        sSkip = storage.sSkip.get_tensor(p_layout)
+        b_re = storage.b_re.get_tensor(vec_layout)
+        b_im = storage.b_im.get_tensor(vec_layout)
+        c_re = storage.c_re.get_tensor(vec_layout)
+        c_im = storage.c_im.get_tensor(vec_layout)
+        beta_prev_re = storage.beta_prev_re.get_tensor(vec_layout)
+        beta_prev_im = storage.beta_prev_im.get_tensor(vec_layout)
+        beta_curr_re = storage.beta_curr_re.get_tensor(vec_layout)
+        beta_curr_im = storage.beta_curr_im.get_tensor(vec_layout)
+        inv_s = storage.inv.get_tensor(cute.make_layout((4,)))
+        rho_s = storage.rho.get_tensor(cute.make_layout((2,)))
+        tap_prev_s = storage.tap_prev.get_tensor(cute.make_layout((2,)))
+        tap_curr_s = storage.tap_curr.get_tensor(cute.make_layout((2,)))
+        acc_partial = storage.acc_partial.get_tensor(acc_layout)
+        bc_reduce = storage.bc_reduce.get_tensor(bc_reduce_layout)
+
+        if tidx < self.p_size:
+            sValue[tidx] = cutlass.Float32(mValue[bidx, hidx, tidx])
+            sUPrev[tidx] = cutlass.Float32(mUPrev[bidx, hidx, tidx])
+            sGate[tidx] = cutlass.Float32(mGate[bidx, hidx, tidx])
+            sSkip[tidx] = cutlass.Float32(mSkip[hidx, tidx])
+
+        for state_iter in cutlass.range_constexpr(self.state_load_iters):
+            linear_idx = tidx + state_iter * self.block_threads
+            if linear_idx < self.state_tile_elems:
+                row = linear_idx // self.p_size
+                p = linear_idx - row * self.p_size
+                sState[row, p] = mState[bidx, hidx, p, row]
 
         if tidx < self.n_size:
             s0 = cutlass.Float32(mBC[bidx, hidx, 0, tidx])
@@ -428,14 +429,7 @@ class MixerDecodeStepFwd:
             eps_bc = cutlass.Float32(1.0e-5)
             total = bc_reduce[tidx, 0] + bc_reduce[tidx, 1]
             inv = cute.rsqrt(total / denom + eps_bc)
-            if tidx == 0:
-                inv0_s[0] = inv
-            elif tidx == 1:
-                inv1_s[0] = inv
-            elif tidx == 2:
-                inv2_s[0] = inv
-            else:
-                inv3_s[0] = inv
+            inv_s[tidx] = inv
 
         if tidx == 0:
             dt_raw = cutlass.Float32(mParams[bidx, hidx, 0]) + cutlass.Float32(
@@ -501,8 +495,8 @@ class MixerDecodeStepFwd:
             theta = principal_angle(lerp(theta_direct, theta_struct, mix_theta))
             rho_re = r * cute_math.cos(theta)
             rho_im = r * cute_math.sin(theta)
-            rho_re_s[0] = rho_re
-            rho_im_s[0] = rho_im
+            rho_s[0] = rho_re
+            rho_s[1] = rho_im
 
             log_r = cute_math.log(r)
             z_re = log_r
@@ -564,19 +558,19 @@ class MixerDecodeStepFwd:
             tap_prev_im = lerp(k_prev_learned_im, k_prev_im, mix_k_prev)
             tap_curr_re = lerp(k_curr_learned_re, k_curr_re, mix_k_curr)
             tap_curr_im = lerp(k_curr_learned_im, k_curr_im, mix_k_curr)
-            tap_prev_re_s[0] = tap_prev_re
-            tap_prev_im_s[0] = tap_prev_im
-            tap_curr_re_s[0] = tap_curr_re
-            tap_curr_im_s[0] = tap_curr_im
+            tap_prev_s[0] = tap_prev_re
+            tap_prev_s[1] = tap_prev_im
+            tap_curr_s[0] = tap_curr_re
+            tap_curr_s[1] = tap_curr_im
 
         cute.arch.barrier()
 
         if tidx < self.n_size:
             n = tidx
-            b_re_v = cutlass.Float32(mBC[bidx, hidx, 0, n]) * inv0_s[0]
-            b_im_v = cutlass.Float32(mBC[bidx, hidx, 1, n]) * inv1_s[0]
-            c_re_v = cutlass.Float32(mBC[bidx, hidx, 2, n]) * inv2_s[0]
-            c_im_v = cutlass.Float32(mBC[bidx, hidx, 3, n]) * inv3_s[0]
+            b_re_v = cutlass.Float32(mBC[bidx, hidx, 0, n]) * inv_s[0]
+            b_im_v = cutlass.Float32(mBC[bidx, hidx, 1, n]) * inv_s[1]
+            c_re_v = cutlass.Float32(mBC[bidx, hidx, 2, n]) * inv_s[2]
+            c_im_v = cutlass.Float32(mBC[bidx, hidx, 3, n]) * inv_s[3]
             if self.normalize_bc:
                 b_re_v = b_re_v * cutlass.Float32(mBScale[hidx, 0, n])
                 b_im_v = b_im_v * cutlass.Float32(mBScale[hidx, 1, n])
@@ -590,14 +584,14 @@ class MixerDecodeStepFwd:
             prev_re = cutlass.Float32(mBPrev[bidx, hidx, 2 * n])
             prev_im = cutlass.Float32(mBPrev[bidx, hidx, 2 * n + 1])
             beta_prev_re_v, beta_prev_im_v = complex_mul(
-                tap_prev_re_s[0],
-                tap_prev_im_s[0],
+                tap_prev_s[0],
+                tap_prev_s[1],
                 prev_re,
                 prev_im,
             )
             beta_curr_re_v, beta_curr_im_v = complex_mul(
-                tap_curr_re_s[0],
-                tap_curr_im_s[0],
+                tap_curr_s[0],
+                tap_curr_s[1],
                 b_re_v,
                 b_im_v,
             )
@@ -613,16 +607,16 @@ class MixerDecodeStepFwd:
         if tidx < self.block_threads:
             worker = tidx // self.p_size
             p = tidx - worker * self.p_size
-            u_prev = cutlass.Float32(mUPrev[bidx, hidx, p])
-            u_curr = cutlass.Float32(mValue[bidx, hidx, p])
+            u_prev = sUPrev[p]
+            u_curr = sValue[p]
             acc = cutlass.Float32(0.0)
-            rho_re = rho_re_s[0]
-            rho_im = rho_im_s[0]
+            rho_re = rho_s[0]
+            rho_im = rho_s[1]
 
             for n_iter in cutlass.range_constexpr(self.n_size // self.workers_per_p):
                 n = worker + n_iter * self.workers_per_p
-                z_re = cutlass.Float32(mState[bidx, hidx, p, 2 * n])
-                z_im = cutlass.Float32(mState[bidx, hidx, p, 2 * n + 1])
+                z_re = cutlass.Float32(sState[2 * n, p])
+                z_im = cutlass.Float32(sState[2 * n + 1, p])
                 mz_re, mz_im = complex_mul(rho_re, rho_im, z_re, z_im)
                 drive_re = u_prev * beta_prev_re[n] + u_curr * beta_curr_re[n]
                 drive_im = u_prev * beta_prev_im[n] + u_curr * beta_curr_im[n]
@@ -649,12 +643,12 @@ class MixerDecodeStepFwd:
             acc = cutlass.Float32(0.0)
             for worker in cutlass.range_constexpr(self.workers_per_p):
                 acc = acc + acc_partial[worker, p]
-            u_curr = cutlass.Float32(mValue[bidx, hidx, p])
-            gate = cutlass.Float32(mGate[bidx, hidx, p])
+            u_curr = sValue[p]
+            gate = sGate[p]
             silu_gate = gate * sigmoid(gate)
-            y = (acc + u_curr * cutlass.Float32(mSkip[hidx, p])) * silu_gate
+            y = (acc + u_curr * sSkip[p]) * silu_gate
             mY[bidx, hidx, p] = y.to(mY.element_type)
-            mULast[bidx, hidx, p] = mValue[bidx, hidx, p]
+            mULast[bidx, hidx, p] = sValue[p].to(mULast.element_type)
 
 
 __all__ = ["MixerDecodeStepFwd"]
