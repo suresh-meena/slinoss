@@ -5,6 +5,7 @@
    "python-numpy@1"
    "python-pytest"
    "python-nvidia-cutlass-dsl"
+   "python-apache-tvm-ffi"
    "python-cuda-python"
    "python-nvtx"
    "python-cupti-python"
