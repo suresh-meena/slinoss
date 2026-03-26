@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from typing import cast
 
 import torch
@@ -749,6 +750,9 @@ class SLinOSSMixer(nn.Module):
         self,
         inputs: MixerDecodeInputs,
         state: ScanState,
+        *,
+        out_proj_weight: torch.Tensor | None = None,
+        projected_out: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ScanState]:
         from slinoss.ops.v2x2ssd.cute.decode import mixer_decode_step_cute
 
@@ -781,13 +785,15 @@ class SLinOSSMixer(nn.Module):
             final_state_out=state.state,
             b_last_out=state.b_prev,
             u_last_out=state.u_prev,
+            out_proj_weight=out_proj_weight,
+            projected_out=projected_out,
         )
         next_state = ScanState(
             state=final_state,
             b_prev=b_last,
             u_prev=u_last,
         )
-        return gated, next_state
+        return (projected_out if projected_out is not None else gated), next_state
 
     def _step_inplace(
         self,
@@ -815,7 +821,34 @@ class SLinOSSMixer(nn.Module):
             gate=gate.view(batch, self.n_heads, self.d_head).contiguous(),
             skip=self.skip.view(self.n_heads, self.d_head),
         )
-        gated, scan_next = self.decode_backend(self, decode_inputs, state.scan)
+        gated: torch.Tensor | None = None
+        fused_out: torch.Tensor | None = None
+        use_fused_outproj = (
+            isinstance(
+                self.decode_backend, (AutoMixerDecodeBackend, CuteMixerDecodeBackend)
+            )
+            and batch == 1
+            and os.getenv("SLINOSS_MIXER_DECODE_FUSE_OUTPROJ", "0") == "1"
+            and self._supports_cute_decode(
+                batch_size=batch,
+                device=x.device,
+                dtype=x.dtype,
+            )
+            and self.out_proj.bias is None
+        )
+        if use_fused_outproj:
+            projected_fp32 = torch.empty(
+                (batch, self.d_model), device=x.device, dtype=torch.float32
+            )
+            _, scan_next = self._decode_step_cute(
+                decode_inputs,
+                state.scan,
+                out_proj_weight=self.out_proj.weight,
+                projected_out=projected_fp32,
+            )
+            fused_out = projected_fp32.to(dtype=x.dtype)
+        else:
+            gated, scan_next = self.decode_backend(self, decode_inputs, state.scan)
         if (
             state.scan.state is None
             or scan_next.state is None
@@ -840,6 +873,10 @@ class SLinOSSMixer(nn.Module):
             state.scan.u_prev = scan_next.u_prev
         elif state.scan.u_prev is not scan_next.u_prev:
             state.scan.u_prev.copy_(scan_next.u_prev)
+        if fused_out is not None:
+            return fused_out
+        if gated is None:
+            raise RuntimeError("CuTe decode path did not produce gated output.")
         return decode_linear(gated, self.out_proj)
 
     def step_cuda_fast(

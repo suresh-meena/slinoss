@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Callable, cast
 
 import cuda.bindings.driver as cuda
@@ -13,6 +14,55 @@ from slinoss.ops.scanprep.cute.common import make_ptr_arg
 from .kernels.decode import MixerDecodeStepFwd
 
 _DECODE_CACHE: dict[tuple[object, ...], object] = {}
+
+
+def _parse_env_int(name: str) -> int | None:
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer when set. Got {raw!r}.") from exc
+
+
+def _select_decode_tuning(
+    *,
+    batch: int,
+    heads: int,
+    p_size: int,
+) -> tuple[int, int, int]:
+    del batch, heads
+    tile_p = 32
+    num_warps = 4
+    vec_n = 4
+    if tile_p > p_size:
+        tile_p = p_size
+    while tile_p > 1 and p_size % tile_p != 0:
+        tile_p //= 2
+    if p_size % tile_p != 0:
+        tile_p = 1
+    tile_p = _parse_env_int("SLINOSS_MIXER_DECODE_TILE_P") or tile_p
+    num_warps = _parse_env_int("SLINOSS_MIXER_DECODE_NUM_WARPS") or num_warps
+    vec_n = _parse_env_int("SLINOSS_MIXER_DECODE_VEC_N") or vec_n
+    return tile_p, num_warps, vec_n
+
+
+def _select_fused_decode_tuning(
+    *,
+    batch: int,
+    heads: int,
+    p_size: int,
+    d_model: int,
+) -> tuple[int, int, int]:
+    del batch, heads, d_model
+    tile_p = 64 if p_size >= 64 else p_size
+    num_warps = 4
+    vec_n = 2
+    tile_p = _parse_env_int("SLINOSS_MIXER_DECODE_FUSED_TILE_P") or tile_p
+    num_warps = _parse_env_int("SLINOSS_MIXER_DECODE_FUSED_NUM_WARPS") or num_warps
+    vec_n = _parse_env_int("SLINOSS_MIXER_DECODE_FUSED_VEC_N") or vec_n
+    return tile_p, num_warps, vec_n
 
 
 def _validate_decode_inputs(
@@ -94,6 +144,8 @@ def mixer_decode_step_cute(
     final_state_out: torch.Tensor | None = None,
     b_last_out: torch.Tensor | None = None,
     u_last_out: torch.Tensor | None = None,
+    out_proj_weight: torch.Tensor | None = None,
+    projected_out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     batch, heads, P, N = _validate_decode_inputs(
         value,
@@ -119,6 +171,11 @@ def mixer_decode_step_cute(
         )
     if b_scale is None or c_scale is None:
         raise ValueError("mixer_decode_step_cute requires normalized BC scales.")
+    fuse_outproj = out_proj_weight is not None or projected_out is not None
+    if fuse_outproj and (out_proj_weight is None or projected_out is None):
+        raise ValueError(
+            "out_proj_weight and projected_out must be provided together for fused projection."
+        )
 
     value_c = value if value.is_contiguous() else value.contiguous()
     params_c = params if params.is_contiguous() else params.contiguous()
@@ -161,6 +218,45 @@ def mixer_decode_step_cute(
         raise ValueError(
             f"u_last_out must be {tuple(u_prev_c.shape)}. Got {tuple(u_last.shape)}."
         )
+    if out_proj_weight is None:
+        out_proj = torch.empty((1, heads, P), device=value.device, dtype=value.dtype)
+        projected = torch.empty((batch, 1, 1), device=value.device, dtype=torch.float32)
+        d_model = 1
+    else:
+        d_model = int(out_proj_weight.shape[0])
+        if out_proj_weight.ndim != 2 or tuple(map(int, out_proj_weight.shape)) != (
+            d_model,
+            heads * P,
+        ):
+            raise ValueError(
+                "out_proj_weight must be (d_model, H*P). "
+                f"Got {tuple(out_proj_weight.shape)} for H*P={heads * P}."
+            )
+        if projected_out is None:
+            raise ValueError(
+                "projected_out must be provided when out projection is fused."
+            )
+        if tuple(map(int, projected_out.shape)) != (batch, d_model):
+            raise ValueError(
+                f"projected_out must be {(batch, d_model)}. Got {tuple(projected_out.shape)}."
+            )
+        if projected_out.dtype != torch.float32:
+            raise ValueError(
+                "projected_out must use float32 for stable fused atomic accumulation."
+            )
+        if projected_out.device != value.device:
+            raise ValueError(
+                "projected_out must live on the same device as decode inputs."
+            )
+        out_proj = (
+            out_proj_weight
+            if out_proj_weight.is_contiguous()
+            else out_proj_weight.contiguous()
+        )
+        projected = torch.empty(
+            (batch, heads, d_model), device=value.device, dtype=torch.float32
+        )
+        projected.zero_()
     state_stride = cast(
         tuple[int, int, int, int],
         tuple(int(v) for v in state_c.stride()),
@@ -189,19 +285,40 @@ def mixer_decode_step_cute(
     c_scale_ptr, c_scale_align = make_ptr_arg(c_scale)
     y_ptr, y_align = make_ptr_arg(y)
     final_state_ptr, final_state_align = make_ptr_arg(final_state)
-    b_last_ptr, b_last_align = make_ptr_arg(b_last)
     u_last_ptr, u_last_align = make_ptr_arg(u_last)
+    out_proj_ptr, out_proj_align = make_ptr_arg(out_proj)
+    projected_ptr, projected_align = make_ptr_arg(projected)
 
     spec = (batch, heads, P, N)
-    if batch * heads <= 16:
-        workers_per_p = 4
-    elif batch * heads <= 32:
-        workers_per_p = 2
+    if fuse_outproj:
+        tile_p, num_warps, vec_n = _select_fused_decode_tuning(
+            batch=batch,
+            heads=heads,
+            p_size=P,
+            d_model=d_model,
+        )
     else:
-        workers_per_p = 1
+        tile_p, num_warps, vec_n = _select_decode_tuning(
+            batch=batch,
+            heads=heads,
+            p_size=P,
+        )
+    p_tiles = (P + tile_p - 1) // tile_p
+    b_prev_aliases_output = (
+        b_last_out is not None and b_last_out.data_ptr() == b_prev_c.data_ptr()
+    )
+    b_last_kernel = (
+        torch.empty_like(b_prev_c) if b_prev_aliases_output and p_tiles > 1 else b_last
+    )
+    b_last_kernel_ptr, b_last_kernel_align = make_ptr_arg(b_last_kernel)
+
     cache_key = (
         spec,
-        workers_per_p,
+        tile_p,
+        num_warps,
+        vec_n,
+        bool(fuse_outproj),
+        int(d_model),
         int(value.device.index or 0),
         value.dtype,
         params_c.dtype,
@@ -215,6 +332,8 @@ def mixer_decode_step_cute(
         final_state.dtype,
         b_last.dtype,
         u_last.dtype,
+        out_proj.dtype,
+        projected.dtype,
         value_align,
         params_align,
         bc_align,
@@ -234,8 +353,10 @@ def mixer_decode_step_cute(
         c_scale_align,
         y_align,
         final_state_align,
-        b_last_align,
+        b_last_kernel_align,
         u_last_align,
+        out_proj_align,
+        projected_align,
         state_stride,
         final_state_stride,
         float(dt_min),
@@ -254,9 +375,14 @@ def mixer_decode_step_cute(
         compiled = cute.compile(
             MixerDecodeStepFwd(
                 spec=spec,
+                d_model=d_model,
+                fuse_outproj=bool(fuse_outproj),
                 state_stride=state_stride,
                 final_state_stride=final_state_stride,
-                workers_per_p=workers_per_p,
+                state_align_bytes=state_align,
+                tile_p=tile_p,
+                num_warps=num_warps,
+                vec_n=vec_n,
                 normalize_bc=True,
                 dt_min=dt_min,
                 dt_max=dt_max,
@@ -285,8 +411,10 @@ def mixer_decode_step_cute(
             c_scale_ptr,
             y_ptr,
             final_state_ptr,
-            b_last_ptr,
+            b_last_kernel_ptr,
             u_last_ptr,
+            out_proj_ptr,
+            projected_ptr,
             current_stream,
         )
         _DECODE_CACHE[cache_key] = compiled
@@ -310,10 +438,16 @@ def mixer_decode_step_cute(
         c_scale_ptr,
         y_ptr,
         final_state_ptr,
-        b_last_ptr,
+        b_last_kernel_ptr,
         u_last_ptr,
+        out_proj_ptr,
+        projected_ptr,
         current_stream,
     )
+    if b_last_kernel is not b_last:
+        b_last.copy_(b_last_kernel)
+    if out_proj_weight is not None:
+        torch.sum(projected, dim=1, out=projected_out)
     y_flat = cast(torch.Tensor, y.reshape(batch, heads * P).contiguous())
     return y_flat, final_state, b_last, u_last
 
