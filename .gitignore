@@ -216,3 +216,10 @@ experiments/PPG_DaLiA/runs
 experiments/throughput_comparison/runs
 
 reference/
+
+# Local example artifacts
+examples/enwik8
+examples/enwik8.zip
+examples/plot_nextchar_runs.py
+examples/run*/
+examples/*_losses.png
