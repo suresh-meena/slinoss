@@ -1,0 +1,16 @@
+# Install from the SLinOSS repo root:
+#   pip install -r experiments/throughput_comparison/requirements.txt
+#
+# This file keeps JAX and Mamba2 dependencies local to the experiment instead of
+# adding them to the repository-wide requirements.
+
+-e .[cuda]
+jax[cuda12]>=0.6.2
+equinox>=0.13.0
+optax>=0.2.5
+jaxtyping>=0.2.36
+sympy>=1.13
+transformers>=4.40,<5
+# mamba-ssm often has no cp312 Linux wheels, so pip/uv falls back to source builds
+# that require a CUDA toolkit (nvcc). Keep it enabled on <3.12 by default.
+mamba-ssm[causal-conv1d]>=2.2.2,<2.3.0; python_version < "3.12"

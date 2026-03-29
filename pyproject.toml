@@ -7,17 +7,24 @@ name = "slinoss"
 version = "0.2.0"
 description = "Selective linear oscillatory state-space models."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11, <3.13"
 license = "MIT"
 dependencies = [
-  "torch==2.10.0",
+  "torch==2.10.0,<2.10",
+  "accelerate>=1.13.0",
   "numpy>=1.26",
+  "tqdm>=4.66",
+  "matplotlib>=3.8",
+  "seaborn>=0.13",
+  "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
 cuda = [
-  "nvidia-cutlass-dsl==4.4.2",
-  "cuda-python==12.9.4",
+  "nvidia-cutlass-dsl>=4.4.0,<4.5",
+  "cuda-python>=12.4,<13.0",
+  "nvidia-cuda-runtime-cu12>=12.1,<12.9",
+  "nvidia-cuda-nvcc-cu12>=12.1,<12.9",
 ]
 dev = [
   "build>=1.2",

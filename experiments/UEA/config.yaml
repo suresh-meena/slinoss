@@ -1,0 +1,125 @@
+experiment:
+  dataset: "EigenWorms"
+  runs_root: "experiments/UEA/runs"
+data:
+  root: experiments/UEA/data
+  val_fraction: 0.15
+  include_time: false
+  normalize: true
+  split_strategy: linoss_701515
+training:
+  seed: 2345
+  seeds: [2345, 3456, 4567, 5678, 6789]
+  num_steps: 100000
+  print_steps: 1000
+  early_stopping_evals: 10
+  mixed_precision: bf16
+  torch_compile: false
+  torch_compile_mode: default
+  batch_size: 32
+  num_workers: 0
+  lr: 0.001
+  weight_decay: 0.05
+  grad_clip: 1.0
+model:
+  d_model: 128
+  n_layers: 2
+  ffn_activation: silu
+  d_state: 64
+  expand: 2
+  d_head: 32
+  d_conv: 4
+  chunk_size: 64
+  dropout: 0.1
+backend:
+  scan_backend: auto
+sweep:
+  metric: val_acc
+  goal: max
+  fixed:
+    d_head: 16
+  grid:
+    lr:
+    - 0.001
+    - 0.0001
+    - 1.0e-05
+    d_model:
+    - 16
+    - 64
+    - 128
+    d_state:
+    - 16
+    - 64
+    - 256
+    n_layers:
+    - 2
+    - 4
+    - 6
+    include_time:
+    - true
+    - false
+datasets:
+  EigenWorms:
+    training:
+      lr: 0.001
+      batch_size: 4
+    model:
+      d_model: 128
+      d_state: 64
+      n_layers: 2
+      ffn_activation: silu
+    data:
+      include_time: false
+  SelfRegulationSCP1:
+    training:
+      lr: 0.0001
+      batch_size: 32
+    model:
+      d_model: 128
+      d_state: 256
+      n_layers: 6
+    data:
+      include_time: true
+  SelfRegulationSCP2:
+    training:
+      lr: 1.0e-05
+      batch_size: 32
+    model:
+      d_model: 64
+      d_state: 256
+      n_layers: 6
+    data:
+      include_time: true
+  EthanolConcentration:
+    training:
+      lr: 1.0e-05
+      batch_size: 32
+    model:
+      d_model: 16
+      d_state: 16
+      n_layers: 4
+      d_head: 16
+    data:
+      include_time: false
+  Heartbeat:
+    training:
+      lr: 0.001
+      batch_size: 32
+    model:
+      d_model: 16
+      d_state: 16
+      n_layers: 6
+      d_head: 16
+    data:
+      include_time: true
+  MotorImagery:
+    training:
+      lr: 1.0e-05
+      batch_size: 32
+    model:
+      d_model: 128
+      d_state: 256
+      n_layers: 2
+      d_head: 16
+    data:
+      include_time: false
